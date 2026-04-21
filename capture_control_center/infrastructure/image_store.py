@@ -18,6 +18,8 @@ class ImageStore:
     def save(self, screenshot: ScreenshotResult) -> SavedCapture:
       safe_name = ''.join(character if character.isalnum() or character in {'-', '_', '.'} else '-' for character in screenshot.file_name)
       file_path = self._images_directory / safe_name
-      image_bytes = base64.b64decode(screenshot.base64_data.encode('utf-8'))
+      image_bytes = screenshot.image_bytes
+      if image_bytes is None:
+          image_bytes = base64.b64decode(screenshot.base64_data.encode('utf-8'))
       file_path.write_bytes(image_bytes)
       return SavedCapture(file_path=file_path, screenshot=screenshot)

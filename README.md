@@ -45,6 +45,7 @@ Popup flow:
 3. The popup stays above the page, can be dragged, resized, minimized into a compact icon, restored, copied from, or closed completely.
 4. Sending again updates the existing popup text instead of creating duplicates.
 5. The Python GUI shows the current popup state reported by the extension: open, minimized, or not present.
+6. You can also press `Alt+P` in Chrome to toggle the popup on the active tab: if it is missing it opens, and if it is already present it closes.
 
 ## Why this capture strategy
 

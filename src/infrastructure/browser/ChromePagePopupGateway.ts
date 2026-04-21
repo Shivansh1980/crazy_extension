@@ -38,6 +38,17 @@ export class ChromePagePopupGateway {
     return this.normalizeStatus(firstResult, tab);
   }
 
+  async close(tab: BrowserTab): Promise<PagePopupStatus> {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: closePopupInPage,
+      args: [tab.id, tab.url]
+    });
+
+    const firstResult = results[0]?.result;
+    return this.normalizeStatus(firstResult, tab);
+  }
+
   private normalizeShowResult(result: unknown, tab: BrowserTab): PagePopupShowResult {
     const normalized = this.normalizeStatus(result, tab);
     const action =
@@ -409,17 +420,19 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
         }
         .controls {
           display: flex;
-          gap: 6px;
+          gap: 5px;
         }
         button.control,
         button.copy,
         button.send {
           border: none;
-          border-radius: 10px;
+          border-radius: 8px;
           background: ${theme.controlBackground};
           color: ${theme.foreground};
-          padding: 6px 10px;
+          padding: 4px 8px;
           font: inherit;
+          font-size: 11px;
+          line-height: 1.2;
           cursor: pointer;
         }
         button.control:hover,
@@ -453,7 +466,7 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
           display: flex;
           align-items: center;
           justify-content: space-between;
-          padding: 10px 12px 12px;
+          padding: 8px 10px 10px;
           gap: 8px;
         }
         .footer-right {
@@ -470,12 +483,12 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
         .opacity-wrap {
           display: inline-flex;
           align-items: center;
-          gap: 6px;
-          font-size: 11px;
+          gap: 5px;
+          font-size: 10px;
           opacity: 0.84;
         }
         .opacity-wrap input {
-          width: 82px;
+          width: 72px;
         }
       </style>
       <div class="shell" data-role="shell">
@@ -660,6 +673,25 @@ function readPopupStatusInPage(tabId: number, pageUrl: string): PagePopupStatus 
   return {
     exists: true,
     state: host.dataset.popupState === 'minimized' ? 'minimized' : 'open',
+    tabId,
+    pageUrl,
+    updatedAt: new Date().toISOString(),
+    textLength
+  };
+}
+
+function closePopupInPage(tabId: number, pageUrl: string): PagePopupStatus {
+  const popupHostId = 'page-signal-capture-popup-host';
+  const host = document.getElementById(popupHostId) as HTMLElement | null;
+  const textLength = host?.shadowRoot?.querySelector<HTMLTextAreaElement>('[data-role="content"]')?.value.length ?? 0;
+
+  if (host) {
+    host.remove();
+  }
+
+  return {
+    exists: false,
+    state: 'closed',
     tabId,
     pageUrl,
     updatedAt: new Date().toISOString(),
