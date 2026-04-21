@@ -121,7 +121,7 @@ reconnectButton?.addEventListener('click', () => {
   void reconnectBridge();
 });
 
-chrome.storage.onChanged.addListener((changes, areaName) => {
+chrome.storage?.onChanged?.addListener((changes, areaName) => {
   if (areaName === 'local' && changes['pageSignalCapture.status']) {
     void runStatusRepository.get().then(renderStatus);
   }

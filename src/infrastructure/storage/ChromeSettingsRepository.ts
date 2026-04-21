@@ -2,16 +2,17 @@ import type { ExtensionSettings } from '../../domain/models/ExtensionSettings';
 import type { SettingsRepository } from '../../domain/ports/SettingsRepository';
 import { normalizeResolverUrl, normalizeWebSocketUrl } from '../../shared/bridgeUrlResolver';
 import { DEFAULT_SETTINGS, SETTINGS_STORAGE_KEY } from '../../shared/constants';
+import { getStorageValue, setStorageValue } from '../../shared/storageAccess';
 
 export class ChromeSettingsRepository implements SettingsRepository {
   async get(): Promise<ExtensionSettings> {
-    const storageResult = await chrome.storage.sync.get(SETTINGS_STORAGE_KEY);
-    return this.normalize({ ...DEFAULT_SETTINGS, ...(storageResult[SETTINGS_STORAGE_KEY] as Partial<ExtensionSettings> | undefined) });
+    const storedValue = await getStorageValue<Partial<ExtensionSettings> | undefined>('sync', SETTINGS_STORAGE_KEY, undefined);
+    return this.normalize({ ...DEFAULT_SETTINGS, ...(storedValue ?? {}) });
   }
 
   async save(patch: Partial<ExtensionSettings>): Promise<ExtensionSettings> {
     const nextValue = this.normalize({ ...(await this.get()), ...patch });
-    await chrome.storage.sync.set({ [SETTINGS_STORAGE_KEY]: nextValue });
+    await setStorageValue('sync', SETTINGS_STORAGE_KEY, nextValue);
     return nextValue;
   }
 

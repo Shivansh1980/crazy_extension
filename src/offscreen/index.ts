@@ -48,6 +48,10 @@ class ExtensionBridgeClient {
   private consecutiveConnectionFailures = 0;
   private startPromise: Promise<void> | null = null;
 
+  constructor() {
+    this.registerRuntimeListeners();
+  }
+
   async start(forceReconnect = false): Promise<void> {
     if (this.startPromise) {
       await this.startPromise;
@@ -364,42 +368,53 @@ class ExtensionBridgeClient {
   }
 
   private async updateStatus(status: CaptureRunStatus): Promise<void> {
-    await this.runStatusRepository.save(status);
+    try {
+      await this.runStatusRepository.save(status);
+    } catch (error) {
+      console.warn('Failed to persist offscreen bridge status.', error);
+    }
+  }
+
+  private registerRuntimeListeners(): void {
+    chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+      if (message?.type === 'bridge-start') {
+        void this.start(false)
+          .then(() => sendResponse({ ok: true }))
+          .catch((error) => {
+            const messageText = error instanceof Error ? error.message : 'Bridge startup failed.';
+            sendResponse({ ok: false, message: messageText });
+          });
+        return true;
+      }
+
+      if (message?.type === 'bridge-reconnect') {
+        void this.start(true)
+          .then(() => sendResponse({ ok: true }))
+          .catch((error) => {
+            const messageText = error instanceof Error ? error.message : 'Bridge reconnect failed.';
+            sendResponse({ ok: false, message: messageText });
+          });
+        return true;
+      }
+
+      return false;
+    });
+
+    const storageOnChanged = chrome.storage?.onChanged;
+    if (storageOnChanged?.addListener) {
+      storageOnChanged.addListener((changes, areaName) => {
+        if (areaName === 'sync' && changes[SETTINGS_STORAGE_KEY]) {
+          void this.start(true).catch((error) => {
+            console.warn('Bridge restart after settings change failed.', error);
+          });
+        }
+      });
+    }
   }
 }
 
 const bridgeClient = new ExtensionBridgeClient();
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type === 'bridge-start') {
-    void bridgeClient
-      .start(false)
-      .then(() => sendResponse({ ok: true }))
-      .catch((error) => {
-        const messageText = error instanceof Error ? error.message : 'Bridge startup failed.';
-        sendResponse({ ok: false, message: messageText });
-      });
-    return true;
-  }
-
-  if (message?.type === 'bridge-reconnect') {
-    void bridgeClient
-      .start(true)
-      .then(() => sendResponse({ ok: true }))
-      .catch((error) => {
-        const messageText = error instanceof Error ? error.message : 'Bridge reconnect failed.';
-        sendResponse({ ok: false, message: messageText });
-      });
-    return true;
-  }
-
-  return false;
+void bridgeClient.start(false).catch((error) => {
+  console.error('Initial offscreen bridge startup failed.', error);
 });
-
-chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName === 'sync' && changes[SETTINGS_STORAGE_KEY]) {
-    void bridgeClient.start(true);
-  }
-});
-
-void bridgeClient.start(false);
