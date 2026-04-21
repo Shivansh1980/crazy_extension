@@ -30,6 +30,14 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 set "VENV_PYTHON=.venv\Scripts\python.exe"
+for /f "tokens=1,* delims==" %%A in (.venv\pyvenv.cfg) do (
+  if /I "%%A"=="home " set "PYTHON_HOME=%%B"
+)
+
+if defined PYTHON_HOME (
+  if exist "%PYTHON_HOME%\tcl\tcl8.6" set "TCL_LIBRARY=%PYTHON_HOME%\tcl\tcl8.6"
+  if exist "%PYTHON_HOME%\tcl\tk8.6" set "TK_LIBRARY=%PYTHON_HOME%\tcl\tk8.6"
+)
 
 echo Checking Python dependencies...
 %VENV_PYTHON% -c "import PIL, websockets" >nul 2>nul

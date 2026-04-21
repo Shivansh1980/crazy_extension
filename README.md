@@ -3,7 +3,7 @@
 Page Signal Capture now consists of two cooperating applications:
 
 - A Manifest V3 Chrome extension that maintains a resilient local WebSocket client in an offscreen document and captures full-page screenshots on demand.
-- A Python desktop control center that exposes the WebSocket server, lets the user trigger captures from a GUI, previews the latest image, and saves each screenshot into an `images` folder under the current working directory.
+- A Python desktop control center that exposes the WebSocket server, lets the user trigger captures from a GUI, previews the latest image, saves each screenshot into an `images` folder under the current working directory, can push raw text or code into the browser clipboard, and can show the same text inside a draggable in-page popup.
 
 ## Architecture
 
@@ -30,6 +30,21 @@ The browser APIs and GUI concerns stay behind focused abstractions so capture qu
 4. The Python server sends a WebSocket request to the extension.
 5. The extension captures the active page with `chrome.debugger` and `Page.captureScreenshot` using `captureBeyondViewport`.
 6. The Python app receives the image, saves it to `images/`, and renders a preview in the GUI.
+
+Clipboard flow:
+
+1. Paste any text or code into the advanced clipboard editor in the Python GUI.
+2. Click **Send text to browser clipboard** or press `Ctrl+Enter`.
+3. The Python server sends the exact raw string to the extension over the existing WebSocket bridge.
+4. The offscreen extension document writes the content into the browser clipboard without trimming or reformatting it.
+
+Popup flow:
+
+1. Use the same advanced editor in the Python GUI and click **Send text to browser popup**.
+2. The extension injects or updates a floating popup on the active page.
+3. The popup stays above the page, can be dragged, resized, minimized into a compact icon, restored, copied from, or closed completely.
+4. Sending again updates the existing popup text instead of creating duplicates.
+5. The Python GUI shows the current popup state reported by the extension: open, minimized, or not present.
 
 ## Why this capture strategy
 

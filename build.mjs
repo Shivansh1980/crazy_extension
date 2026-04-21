@@ -2,6 +2,8 @@ import { mkdir, cp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import * as esbuild from 'esbuild';
 
+import manifest from './src/manifest.json' with { type: 'json' };
+
 const isWatchMode = process.argv.includes('--watch');
 const projectRoot = process.cwd();
 const distDirectory = path.join(projectRoot, 'dist');
@@ -28,6 +30,10 @@ async function runBuild() {
     target: 'chrome128',
     sourcemap: true,
     outdir: distDirectory,
+    define: {
+      __EXTENSION_NAME__: JSON.stringify(manifest.name),
+      __EXTENSION_VERSION__: JSON.stringify(manifest.version)
+    },
     logLevel: 'info'
   };
 

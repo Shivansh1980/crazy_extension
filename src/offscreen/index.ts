@@ -3,18 +3,29 @@ import type { CaptureRunStatus } from '../domain/models/CaptureRunStatus';
 import type { ExtensionSettings } from '../domain/models/ExtensionSettings';
 import { ChromeRunStatusRepository } from '../infrastructure/storage/ChromeRunStatusRepository';
 import { ChromeSettingsRepository } from '../infrastructure/storage/ChromeSettingsRepository';
+import { debugError, debugLog, debugWarn } from '../shared/debug';
 import { resolveBridgeEndpoint, type ResolvedBridgeEndpoint } from '../shared/bridgeUrlResolver';
 import {
   BRIDGE_CLIENT_NAME,
   BRIDGE_RECONNECT_INTERVAL_MS,
-  BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD,
   SETTINGS_STORAGE_KEY
 } from '../shared/constants';
 
-type BridgeInboundMessage = {
-  type: 'capture.request';
-  requestId: string;
-};
+type BridgeInboundMessage =
+  | {
+      type: 'capture.request';
+      requestId: string;
+    }
+  | {
+      type: 'clipboard.write';
+      requestId: string;
+      text: string;
+    }
+  | {
+      type: 'popup.show';
+      requestId: string;
+      text: string;
+    };
 
 type BridgeOutboundMessage =
   | {
@@ -33,6 +44,53 @@ type BridgeOutboundMessage =
       type: 'capture.error';
       requestId: string;
       message: string;
+    }
+  | {
+      type: 'clipboard.result';
+      requestId: string;
+      characterCount: number;
+      lineCount: number;
+    }
+  | {
+      type: 'clipboard.error';
+      requestId: string;
+      message: string;
+    }
+  | {
+      type: 'popup.result';
+      requestId: string;
+      status: {
+        exists: boolean;
+        state: 'open' | 'minimized' | 'closed' | 'unknown';
+        tabId: number | null;
+        pageUrl: string | null;
+        updatedAt: string;
+        textLength: number;
+      };
+      action: 'created' | 'updated' | 'restored';
+    }
+  | {
+      type: 'popup.error';
+      requestId: string;
+      message: string;
+    }
+  | {
+      type: 'popup.status';
+      status: {
+        exists: boolean;
+        state: 'open' | 'minimized' | 'closed' | 'unknown';
+        tabId: number | null;
+        pageUrl: string | null;
+        updatedAt: string;
+        textLength: number;
+      };
+    }
+  | {
+      type: 'popup.message';
+      text: string;
+      pageUrl: string | null;
+      tabId: number | null;
+      sentAt: string;
     };
 
 class ExtensionBridgeClient {
@@ -47,12 +105,16 @@ class ExtensionBridgeClient {
   private resolvedEndpoint: ResolvedBridgeEndpoint | null = null;
   private consecutiveConnectionFailures = 0;
   private startPromise: Promise<void> | null = null;
+  private hasConnectedOnce = false;
+  private pendingBridgeMessages: BridgeOutboundMessage[] = [];
 
   constructor() {
+    debugLog('offscreen', 'Bridge client constructed.');
     this.registerRuntimeListeners();
   }
 
   async start(forceReconnect = false): Promise<void> {
+    debugLog('offscreen', 'Bridge start requested.', { forceReconnect });
     if (this.startPromise) {
       await this.startPromise;
       if (!forceReconnect) {
@@ -71,6 +133,7 @@ class ExtensionBridgeClient {
 
   private async runStart(forceReconnect: boolean): Promise<void> {
     const settings = await this.settingsRepository.get();
+    debugLog('offscreen', 'Loaded bridge settings.', settings);
     const settingsChanged =
       this.currentSettings === null ||
       this.currentSettings.websocketUrl !== settings.websocketUrl ||
@@ -85,6 +148,7 @@ class ExtensionBridgeClient {
     }
 
     if (!settings.enabled) {
+      debugWarn('offscreen', 'Bridge is disabled in settings.');
       await this.closeConnection('Desktop bridge is disabled in extension settings.');
       return;
     }
@@ -106,6 +170,7 @@ class ExtensionBridgeClient {
     const endpoint = await this.resolveEndpoint(settings, settingsChanged);
     this.resolvedTargetUrl = endpoint.targetUrl;
     this.resolvedEndpoint = endpoint;
+    debugLog('offscreen', 'Connecting websocket.', endpoint);
 
     await this.updateStatus({
       state: 'connecting',
@@ -128,14 +193,20 @@ class ExtensionBridgeClient {
       }
 
       this.consecutiveConnectionFailures = 0;
+      this.hasConnectedOnce = true;
+      debugLog('offscreen', 'running...');
+      debugLog('offscreen', 'WebSocket connection opened.', endpoint.targetUrl);
 
       this.send({
         type: 'client.register',
         clientId: this.clientId,
         name: BRIDGE_CLIENT_NAME,
-        version: chrome.runtime.getManifest().version,
+        version: __EXTENSION_VERSION__,
         capabilities: ['capture.full-page']
       });
+      this.flushPendingBridgeMessages();
+      void this.publishPopupStatus();
+      void this.publishPopupMessageHistory();
 
       void this.updateStatus({
         state: 'connected',
@@ -150,24 +221,43 @@ class ExtensionBridgeClient {
     });
 
     socket.addEventListener('message', (event) => {
+      debugLog('offscreen', 'Received websocket message.');
       void this.handleMessage(event.data, endpoint.targetUrl, settings, generation);
     });
 
     socket.addEventListener('error', () => {
+      debugLog('offscreen', 'WebSocket error received; waiting for close event before retry.', {
+        targetUrl: endpoint.targetUrl,
+        readyState: socket.readyState
+      });
       socket.close();
     });
 
-    socket.addEventListener('close', () => {
+    socket.addEventListener('close', (event) => {
       if (generation !== this.connectionGeneration) {
         return;
       }
 
       this.socket = null;
       this.consecutiveConnectionFailures += 1;
-      const refreshHint =
-        this.shouldRefreshResolver()
-          ? ' Refreshing the resolver URL on the next attempt.'
-          : '';
+      const closeDetails = {
+        targetUrl: endpoint.targetUrl,
+        code: event.code,
+        reason: event.reason || null,
+        wasClean: event.wasClean,
+        previouslyConnected: this.hasConnectedOnce,
+        consecutiveConnectionFailures: this.consecutiveConnectionFailures
+      };
+
+      if (this.hasConnectedOnce && event.code !== 1000) {
+        debugWarn('offscreen', 'WebSocket connection closed unexpectedly.', closeDetails);
+      } else {
+        debugLog('offscreen', 'WebSocket connection closed; reconnect will be attempted.', closeDetails);
+      }
+
+      const refreshHint = this.currentSettings?.websocketResolverUrl
+        ? ' Refreshing the resolver URL on the next attempt.'
+        : '';
 
       void this.updateStatus({
         state: 'disconnected',
@@ -196,14 +286,89 @@ class ExtensionBridgeClient {
     try {
       message = JSON.parse(payload) as BridgeInboundMessage;
     } catch {
+      debugWarn('offscreen', 'Ignoring non-JSON websocket payload.');
       return;
     }
 
-    if (message.type !== 'capture.request') {
+    if (message.type === 'clipboard.write') {
+      try {
+        debugLog('offscreen', 'Processing clipboard write request.', {
+          requestId: message.requestId,
+          textLength: message.text.length
+        });
+        await this.writeClipboardText(message.text);
+
+        const lineCount = message.text.length === 0 ? 0 : message.text.split(/\r\n|\r|\n/).length;
+        await this.updateStatus({
+          state: 'success',
+          updatedAt: new Date().toISOString(),
+          message: 'Clipboard content updated from the desktop control center.',
+          lastFileName: null,
+          targetUrl
+        });
+
+        this.send({
+          type: 'clipboard.result',
+          requestId: message.requestId,
+          characterCount: message.text.length,
+          lineCount
+        });
+        debugLog('offscreen', 'Clipboard write completed.', {
+          requestId: message.requestId,
+          lineCount,
+          characterCount: message.text.length
+        });
+      } catch (error) {
+        const messageText = error instanceof Error ? error.message : 'Clipboard write failed.';
+        debugError('offscreen', 'Clipboard write failed.', { requestId: message.requestId, error: messageText });
+        await this.updateStatus({
+          state: 'error',
+          updatedAt: new Date().toISOString(),
+          message: messageText,
+          lastFileName: null,
+          targetUrl
+        });
+        this.send({
+          type: 'clipboard.error',
+          requestId: message.requestId,
+          message: messageText
+        });
+      }
+      return;
+    }
+
+    if (message.type === 'popup.show') {
+      try {
+        debugLog('offscreen', 'Processing popup show request.', {
+          requestId: message.requestId,
+          textLength: message.text.length
+        });
+        const popupResponse = await this.requestPagePopup(message.text);
+        if (!popupResponse.ok || !popupResponse.status) {
+          throw new Error(popupResponse.message || 'The background worker returned an empty popup response.');
+        }
+
+        this.send({
+          type: 'popup.result',
+          requestId: message.requestId,
+          action: popupResponse.action ?? 'updated',
+          status: popupResponse.status
+        });
+        debugLog('offscreen', 'Popup request completed.', popupResponse.status);
+      } catch (error) {
+        const messageText = error instanceof Error ? error.message : 'Popup request failed.';
+        debugError('offscreen', 'Popup request failed.', { requestId: message.requestId, error: messageText });
+        this.send({
+          type: 'popup.error',
+          requestId: message.requestId,
+          message: messageText
+        });
+      }
       return;
     }
 
     try {
+      debugLog('offscreen', 'Processing capture request.', { requestId: message.requestId, targetUrl });
       const response = await this.requestCapture(settings);
       if (!response.ok || !response.capturedPage) {
         throw new Error(response.message || 'The background worker returned an empty capture response.');
@@ -222,8 +387,10 @@ class ExtensionBridgeClient {
         requestId: message.requestId,
         capturedPage: response.capturedPage
       });
+      debugLog('offscreen', 'Capture result sent back to desktop bridge.', message.requestId);
     } catch (error) {
       const messageText = error instanceof Error ? error.message : 'Capture request failed.';
+      debugError('offscreen', 'Capture request failed.', { requestId: message.requestId, error: messageText });
       await this.updateStatus({
         state: 'error',
         updatedAt: new Date().toISOString(),
@@ -242,6 +409,7 @@ class ExtensionBridgeClient {
   private async requestCapture(settings: ExtensionSettings): Promise<{ ok: boolean; capturedPage?: CapturedPage; message?: string }> {
     return new Promise((resolve, reject) => {
       const timeoutHandle = window.setTimeout(() => {
+        debugWarn('offscreen', 'Capture request timed out.', settings.requestTimeoutMs);
         reject(new Error(`Capture request timed out after ${settings.requestTimeoutMs}ms.`));
       }, settings.requestTimeoutMs);
 
@@ -250,10 +418,12 @@ class ExtensionBridgeClient {
 
         const runtimeError = chrome.runtime.lastError;
         if (runtimeError) {
+          debugError('offscreen', 'Background capture request failed.', runtimeError.message);
           reject(new Error(runtimeError.message));
           return;
         }
 
+        debugLog('offscreen', 'Received background capture response.');
         resolve((response ?? { ok: false, message: 'No response from background worker.' }) as {
           ok: boolean;
           capturedPage?: CapturedPage;
@@ -263,12 +433,282 @@ class ExtensionBridgeClient {
     });
   }
 
+  private async requestPagePopup(text: string): Promise<{
+    ok: boolean;
+    status?: {
+      exists: boolean;
+      state: 'open' | 'minimized' | 'closed' | 'unknown';
+      tabId: number | null;
+      pageUrl: string | null;
+      updatedAt: string;
+      textLength: number;
+    };
+    action?: 'created' | 'updated' | 'restored';
+    message?: string;
+  }> {
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({ type: 'bridge-popup-show', text }, (response) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          reject(new Error(runtimeError.message));
+          return;
+        }
+
+        resolve((response ?? { ok: false, message: 'No response from background worker.' }) as {
+          ok: boolean;
+          status?: {
+            exists: boolean;
+            state: 'open' | 'minimized' | 'closed' | 'unknown';
+            tabId: number | null;
+            pageUrl: string | null;
+            updatedAt: string;
+            textLength: number;
+          };
+          action?: 'created' | 'updated' | 'restored';
+          message?: string;
+        });
+      });
+    });
+  }
+
+  private async publishPopupStatus(): Promise<void> {
+    try {
+      const response = await new Promise<{
+        ok: boolean;
+        status?: {
+          exists: boolean;
+          state: 'open' | 'minimized' | 'closed' | 'unknown';
+          tabId: number | null;
+          pageUrl: string | null;
+          updatedAt: string;
+          textLength: number;
+        };
+        message?: string;
+      }>((resolve, reject) => {
+        chrome.runtime.sendMessage({ type: 'popup-status-get' }, (message) => {
+          const runtimeError = chrome.runtime.lastError;
+          if (runtimeError) {
+            reject(new Error(runtimeError.message));
+            return;
+          }
+
+          resolve((message ?? { ok: false }) as {
+            ok: boolean;
+            status?: {
+              exists: boolean;
+              state: 'open' | 'minimized' | 'closed' | 'unknown';
+              tabId: number | null;
+              pageUrl: string | null;
+              updatedAt: string;
+              textLength: number;
+            };
+            message?: string;
+          });
+        });
+      });
+
+      if (response.ok && response.status) {
+        this.sendOrQueueBridgeMessage({ type: 'popup.status', status: response.status });
+      }
+    } catch (error) {
+      debugWarn('offscreen', 'Unable to publish popup status.', error);
+    }
+  }
+
+  private async publishPopupMessageHistory(): Promise<void> {
+    try {
+      const response = await new Promise<{
+        ok: boolean;
+        messages?: Array<{
+          text?: string;
+          pageUrl?: string | null;
+          tabId?: number | null;
+          sentAt?: string;
+        }>;
+      }>((resolve, reject) => {
+        chrome.runtime.sendMessage({ type: 'popup-message-history-get' }, (message) => {
+          const runtimeError = chrome.runtime.lastError;
+          if (runtimeError) {
+            reject(new Error(runtimeError.message));
+            return;
+          }
+
+          resolve((message ?? { ok: false, messages: [] }) as {
+            ok: boolean;
+            messages?: Array<{
+              text?: string;
+              pageUrl?: string | null;
+              tabId?: number | null;
+              sentAt?: string;
+            }>;
+          });
+        });
+      });
+
+      if (!response.ok || !Array.isArray(response.messages)) {
+        return;
+      }
+
+      for (const message of [...response.messages].reverse()) {
+        this.sendOrQueueBridgeMessage({
+          type: 'popup.message',
+          text: typeof message.text === 'string' ? message.text : '',
+          pageUrl: typeof message.pageUrl === 'string' ? message.pageUrl : null,
+          tabId: typeof message.tabId === 'number' ? message.tabId : null,
+          sentAt: typeof message.sentAt === 'string' ? message.sentAt : new Date().toISOString()
+        });
+      }
+    } catch (error) {
+      debugWarn('offscreen', 'Unable to publish popup message history.', error);
+    }
+  }
+
   private send(message: BridgeOutboundMessage): void {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      debugWarn('offscreen', 'Skipping websocket send because socket is not open.', message.type);
       return;
     }
 
+    debugLog('offscreen', 'Sending websocket message.', message.type);
     this.socket.send(JSON.stringify(message));
+  }
+
+  private sendOrQueueBridgeMessage(message: BridgeOutboundMessage): void {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      debugLog('offscreen', 'Queueing bridge message until websocket is open.', message.type);
+      this.pendingBridgeMessages.push(message);
+      if (this.pendingBridgeMessages.length > 20) {
+        this.pendingBridgeMessages.splice(0, this.pendingBridgeMessages.length - 20);
+      }
+      return;
+    }
+
+    this.send(message);
+  }
+
+  private flushPendingBridgeMessages(): void {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN || this.pendingBridgeMessages.length === 0) {
+      return;
+    }
+
+    const queuedMessages = [...this.pendingBridgeMessages];
+    this.pendingBridgeMessages = [];
+    for (const message of queuedMessages) {
+      this.send(message);
+    }
+  }
+
+  private async writeClipboardText(text: string): Promise<void> {
+    if (typeof text !== 'string') {
+      throw new Error('Clipboard payload must be a string.');
+    }
+
+    if (typeof ClipboardItem !== 'undefined' && navigator.clipboard?.write) {
+      try {
+        await navigator.clipboard.write([
+          new ClipboardItem({
+            'text/plain': new Blob([text], { type: 'text/plain' })
+          })
+        ]);
+        return;
+      } catch (error) {
+        debugWarn('offscreen', 'ClipboardItem write failed; falling back to writeText.', error);
+      }
+    }
+
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return;
+      } catch (error) {
+        debugWarn('offscreen', 'navigator.clipboard.writeText failed; falling back to execCommand.', error);
+      }
+    }
+
+    if (this.copyWithTextarea(text)) {
+      return;
+    }
+
+    if (this.copyWithContentEditable(text)) {
+      return;
+    }
+
+    throw new Error('All clipboard write strategies failed in the offscreen document.');
+  }
+
+  private copyWithTextarea(text: string): boolean {
+    const container = document.body ?? document.documentElement;
+    if (!container) {
+      return false;
+    }
+
+    const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', 'true');
+    textarea.setAttribute('aria-hidden', 'true');
+    textarea.style.position = 'fixed';
+    textarea.style.top = '0';
+    textarea.style.left = '0';
+    textarea.style.width = '1px';
+    textarea.style.height = '1px';
+    textarea.style.opacity = '0';
+    textarea.style.pointerEvents = 'none';
+    textarea.style.zIndex = '-1';
+    container.appendChild(textarea);
+
+    try {
+      textarea.focus();
+      textarea.select();
+      textarea.setSelectionRange(0, textarea.value.length);
+      return document.execCommand('copy');
+    } catch {
+      return false;
+    } finally {
+      textarea.remove();
+      activeElement?.focus({ preventScroll: true });
+    }
+  }
+
+  private copyWithContentEditable(text: string): boolean {
+    const container = document.body ?? document.documentElement;
+    if (!container) {
+      return false;
+    }
+
+    const selection = window.getSelection();
+    const existingRanges = selection ? Array.from({ length: selection.rangeCount }, (_, index) => selection.getRangeAt(index).cloneRange()) : [];
+    const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+
+    const editable = document.createElement('div');
+    editable.contentEditable = 'true';
+    editable.setAttribute('aria-hidden', 'true');
+    editable.style.position = 'fixed';
+    editable.style.top = '0';
+    editable.style.left = '0';
+    editable.style.opacity = '0';
+    editable.style.pointerEvents = 'none';
+    editable.style.whiteSpace = 'pre-wrap';
+    editable.textContent = text;
+    container.appendChild(editable);
+
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(editable);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+      editable.focus();
+      return document.execCommand('copy');
+    } catch {
+      return false;
+    } finally {
+      selection?.removeAllRanges();
+      for (const range of existingRanges) {
+        selection?.addRange(range);
+      }
+      editable.remove();
+      activeElement?.focus({ preventScroll: true });
+    }
   }
 
   private scheduleReconnect(): void {
@@ -276,6 +716,7 @@ class ExtensionBridgeClient {
       return;
     }
 
+    debugLog('offscreen', 'Scheduling reconnect.', BRIDGE_RECONNECT_INTERVAL_MS);
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null;
       void this.start(true);
@@ -290,6 +731,7 @@ class ExtensionBridgeClient {
   }
 
   private async closeConnection(message: string): Promise<void> {
+    debugLog('offscreen', 'Closing bridge connection.', message);
     this.clearReconnectTimer();
     this.disposeActiveSocket();
 
@@ -303,7 +745,10 @@ class ExtensionBridgeClient {
   }
 
   private async resolveEndpoint(settings: ExtensionSettings, settingsChanged: boolean): Promise<ResolvedBridgeEndpoint> {
-    const shouldRefreshResolver = settingsChanged || this.resolvedEndpoint === null || this.shouldRefreshResolver();
+    const shouldRefreshResolver =
+      settingsChanged ||
+      this.resolvedEndpoint === null ||
+      Boolean(settings.websocketResolverUrl);
 
     if (!shouldRefreshResolver && this.resolvedEndpoint) {
       return this.resolvedEndpoint;
@@ -311,6 +756,7 @@ class ExtensionBridgeClient {
 
     try {
       const endpoint = await resolveBridgeEndpoint(settings.websocketUrl, settings.websocketResolverUrl);
+      debugLog('offscreen', 'Resolved bridge endpoint.', endpoint);
 
       if (this.resolvedEndpoint && this.resolvedEndpoint.targetUrl !== endpoint.targetUrl) {
         await this.updateStatus({
@@ -325,6 +771,7 @@ class ExtensionBridgeClient {
       return endpoint;
     } catch (error) {
       const messageText = error instanceof Error ? error.message : 'Unknown resolver failure.';
+      debugWarn('offscreen', 'Resolver failed; using fallback endpoint.', messageText);
       const fallbackEndpoint = this.resolvedEndpoint ?? {
         targetUrl: settings.websocketUrl,
         source: 'direct' as const,
@@ -343,15 +790,8 @@ class ExtensionBridgeClient {
     }
   }
 
-  private shouldRefreshResolver(): boolean {
-    return (
-      Boolean(this.currentSettings?.websocketResolverUrl) &&
-      this.consecutiveConnectionFailures > 0 &&
-      this.consecutiveConnectionFailures % BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD === 0
-    );
-  }
-
   private invalidateResolvedEndpoint(): void {
+    debugLog('offscreen', 'Invalidating resolved endpoint cache.');
     this.resolvedEndpoint = null;
     this.resolvedTargetUrl = null;
     this.consecutiveConnectionFailures = 0;
@@ -362,6 +802,7 @@ class ExtensionBridgeClient {
       return;
     }
 
+    debugLog('offscreen', 'Disposing active websocket socket.');
     this.connectionGeneration += 1;
     this.socket.close();
     this.socket = null;
@@ -371,17 +812,19 @@ class ExtensionBridgeClient {
     try {
       await this.runStatusRepository.save(status);
     } catch (error) {
-      console.warn('Failed to persist offscreen bridge status.', error);
+      debugWarn('offscreen', 'Failed to persist offscreen bridge status.', error);
     }
   }
 
   private registerRuntimeListeners(): void {
     chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+      debugLog('offscreen', 'Received runtime message.', message?.type ?? 'unknown');
       if (message?.type === 'bridge-start') {
         void this.start(false)
           .then(() => sendResponse({ ok: true }))
           .catch((error) => {
             const messageText = error instanceof Error ? error.message : 'Bridge startup failed.';
+            debugError('offscreen', 'Bridge start request failed.', messageText);
             sendResponse({ ok: false, message: messageText });
           });
         return true;
@@ -392,8 +835,35 @@ class ExtensionBridgeClient {
           .then(() => sendResponse({ ok: true }))
           .catch((error) => {
             const messageText = error instanceof Error ? error.message : 'Bridge reconnect failed.';
+            debugError('offscreen', 'Bridge reconnect request failed.', messageText);
             sendResponse({ ok: false, message: messageText });
           });
+        return true;
+      }
+
+      if (message?.type === 'popup-status-changed') {
+        debugLog('offscreen', 'Received popup status update from background.', message.status);
+        if (message.status) {
+          this.sendOrQueueBridgeMessage({ type: 'popup.status', status: message.status });
+        }
+        sendResponse({ ok: true });
+        return true;
+      }
+
+      if (message?.type === 'popup-page-message') {
+        const payload = {
+          text: typeof message.payload?.text === 'string' ? message.payload.text : '',
+          pageUrl: typeof message.payload?.pageUrl === 'string' ? message.payload.pageUrl : null,
+          tabId: typeof message.payload?.tabId === 'number' ? message.payload.tabId : null,
+          sentAt: typeof message.payload?.sentAt === 'string' ? message.payload.sentAt : new Date().toISOString()
+        };
+        debugLog('offscreen', 'Forwarding popup text message to desktop bridge.', {
+          tabId: payload.tabId,
+          pageUrl: payload.pageUrl,
+          characters: payload.text.length
+        });
+        this.sendOrQueueBridgeMessage({ type: 'popup.message', ...payload });
+        sendResponse({ ok: true });
         return true;
       }
 
@@ -404,8 +874,9 @@ class ExtensionBridgeClient {
     if (storageOnChanged?.addListener) {
       storageOnChanged.addListener((changes, areaName) => {
         if (areaName === 'sync' && changes[SETTINGS_STORAGE_KEY]) {
+          debugLog('offscreen', 'Observed storage change for settings; restarting bridge.');
           void this.start(true).catch((error) => {
-            console.warn('Bridge restart after settings change failed.', error);
+            debugWarn('offscreen', 'Bridge restart after settings change failed.', error);
           });
         }
       });
@@ -416,5 +887,5 @@ class ExtensionBridgeClient {
 const bridgeClient = new ExtensionBridgeClient();
 
 void bridgeClient.start(false).catch((error) => {
-  console.error('Initial offscreen bridge startup failed.', error);
+  debugError('offscreen', 'Initial offscreen bridge startup failed.', error);
 });

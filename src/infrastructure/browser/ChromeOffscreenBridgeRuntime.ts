@@ -29,8 +29,8 @@ export class ChromeOffscreenBridgeRuntime implements BridgeRuntime {
     try {
       await chrome.offscreen.createDocument({
         url: OFFSCREEN_DOCUMENT_PATH,
-        reasons: [chrome.offscreen.Reason.BLOBS],
-        justification: 'Maintain a resilient local WebSocket bridge for desktop-driven screenshot capture.'
+        reasons: [chrome.offscreen.Reason.BLOBS, chrome.offscreen.Reason.CLIPBOARD],
+        justification: 'Maintain a resilient local WebSocket bridge for desktop-driven screenshot capture and clipboard sync.'
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : '';

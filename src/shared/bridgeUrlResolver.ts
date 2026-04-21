@@ -20,7 +20,8 @@ export function normalizeResolverUrl(value: string): string {
 
   try {
     const parsedUrl = new URL(withProtocol);
-    if (parsedUrl.hostname === 'pastebin.com') {
+    const hostname = parsedUrl.hostname.toLowerCase();
+    if (hostname === 'pastebin.com' || hostname.endsWith('.pastebin.com')) {
       const pasteId = extractPastebinId(parsedUrl.pathname);
       if (pasteId) {
         return `https://pastebin.com/raw/${pasteId}`;
