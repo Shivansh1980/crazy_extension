@@ -2,6 +2,7 @@ import type { CaptureRunStatus } from '../domain/models/CaptureRunStatus';
 import type { ExtensionSettings } from '../domain/models/ExtensionSettings';
 import { ChromeRunStatusRepository } from '../infrastructure/storage/ChromeRunStatusRepository';
 import { ChromeSettingsRepository } from '../infrastructure/storage/ChromeSettingsRepository';
+import { DEFAULT_WEBSOCKET_RESOLVER_URL } from '../shared/constants';
 
 const settingsRepository = new ChromeSettingsRepository();
 const runStatusRepository = new ChromeRunStatusRepository();
@@ -35,7 +36,7 @@ function renderSettings(settings: ExtensionSettings): void {
 
   enabledInput.checked = settings.enabled;
   websocketUrlInput.value = settings.websocketUrl;
-  websocketResolverUrlInput.value = settings.websocketResolverUrl;
+  websocketResolverUrlInput.value = DEFAULT_WEBSOCKET_RESOLVER_URL;
   fileNamePrefixInput.value = settings.fileNamePrefix;
   requestTimeoutInput.value = String(settings.requestTimeoutMs);
 }
@@ -66,7 +67,7 @@ async function saveSettings(event: SubmitEvent): Promise<void> {
     const settings = await settingsRepository.save({
       enabled: enabledInput.checked,
       websocketUrl: websocketUrlInput.value,
-      websocketResolverUrl: websocketResolverUrlInput.value,
+      websocketResolverUrl: DEFAULT_WEBSOCKET_RESOLVER_URL,
       fileNamePrefix: fileNamePrefixInput.value,
       requestTimeoutMs: Number(requestTimeoutInput.value)
     });

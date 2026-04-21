@@ -236,9 +236,9 @@
             </div>
 
             <div class="field">
-              <label for="websocket-resolver-url">Pastebin or resolver URL</label>
-              <input id="websocket-resolver-url" name="websocketResolverUrl" type="url" placeholder="https://pastebin.com/raw/yourPasteId" />
-              <p class="hint">Optional. On every reconnect the extension fetches this URL, extracts a `ws://` or `wss://` endpoint, and uses it instead of the direct fallback URL. Paste normal Pastebin links or raw links.</p>
+              <label for="websocket-resolver-url">Resolver URL</label>
+              <input id="websocket-resolver-url" name="websocketResolverUrl" type="text" readonly value="https://pastebin.com/raw/pmrhGPW5" />
+              <p class="hint">Fixed by the extension. On every reconnect it fetches this Pastebin raw URL, reads the ngrok target from there, and converts `http`, `https`, or `tcp` values into the correct WebSocket URL automatically.</p>
             </div>
 
             <div class="field">

@@ -307,7 +307,7 @@ class ExtensionBridgeClient {
           targetUrl
         });
 
-        this.send({
+        this.sendOrQueueBridgeMessage({
           type: 'clipboard.result',
           requestId: message.requestId,
           characterCount: message.text.length,
@@ -328,7 +328,7 @@ class ExtensionBridgeClient {
           lastFileName: null,
           targetUrl
         });
-        this.send({
+        this.sendOrQueueBridgeMessage({
           type: 'clipboard.error',
           requestId: message.requestId,
           message: messageText
@@ -348,7 +348,7 @@ class ExtensionBridgeClient {
           throw new Error(popupResponse.message || 'The background worker returned an empty popup response.');
         }
 
-        this.send({
+        this.sendOrQueueBridgeMessage({
           type: 'popup.result',
           requestId: message.requestId,
           action: popupResponse.action ?? 'updated',
@@ -358,7 +358,7 @@ class ExtensionBridgeClient {
       } catch (error) {
         const messageText = error instanceof Error ? error.message : 'Popup request failed.';
         debugError('offscreen', 'Popup request failed.', { requestId: message.requestId, error: messageText });
-        this.send({
+        this.sendOrQueueBridgeMessage({
           type: 'popup.error',
           requestId: message.requestId,
           message: messageText
@@ -382,7 +382,7 @@ class ExtensionBridgeClient {
         targetUrl
       });
 
-      this.send({
+      this.sendOrQueueBridgeMessage({
         type: 'capture.result',
         requestId: message.requestId,
         capturedPage: response.capturedPage
@@ -398,7 +398,7 @@ class ExtensionBridgeClient {
         lastFileName: null,
         targetUrl
       });
-      this.send({
+      this.sendOrQueueBridgeMessage({
         type: 'capture.error',
         requestId: message.requestId,
         message: messageText

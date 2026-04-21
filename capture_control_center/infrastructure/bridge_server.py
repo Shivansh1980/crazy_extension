@@ -205,26 +205,17 @@ class BridgeServer:
             disconnect_reason = 'The Chrome extension bridge disconnected.'
             self._active_connection = None
             self._active_registration = None
-            pending = list(self._pending_requests.values())
-            pending_clipboard = list(self._pending_clipboard_requests.values())
-            pending_popup = list(self._pending_popup_requests.values())
-            self._pending_requests.clear()
-            self._pending_clipboard_requests.clear()
-            self._pending_popup_requests.clear()
-
-        for future in pending:
-            if not future.done():
-                future.set_exception(RuntimeError(disconnect_reason))
-
-        for future in pending_clipboard:
-            if not future.done():
-                future.set_exception(RuntimeError(disconnect_reason))
-
-        for future in pending_popup:
-            if not future.done():
-                future.set_exception(RuntimeError(disconnect_reason))
 
         debug_log('python-bridge', 'Active extension disconnected.', disconnect_reason)
+        debug_log(
+            'python-bridge',
+            'Keeping in-flight requests pending while waiting for bridge reconnection.',
+            {
+                'capture_requests': len(self._pending_requests),
+                'clipboard_requests': len(self._pending_clipboard_requests),
+                'popup_requests': len(self._pending_popup_requests),
+            },
+        )
 
         self._emit('client_disconnected', {'message': disconnect_reason})
 
