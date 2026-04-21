@@ -1,0 +1,27 @@
+{
+  "name": "crazy_extension",
+  "version": "1.0.0",
+  "description": "Chrome extension that connects to a local Python GUI over WebSocket and captures high-quality full-page screenshots on demand.",
+  "scripts": {
+    "build": "node build.mjs",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "dev": "node build.mjs --watch",
+    "gui": ".venv\\Scripts\\python.exe -m capture_control_center.app",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "chrome-extension",
+    "manifest-v3",
+    "screenshot",
+    "typescript"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@types/chrome": "^0.1.40",
+    "@types/node": "^25.6.0",
+    "esbuild": "^0.28.0",
+    "typescript": "^6.0.3"
+  }
+}
