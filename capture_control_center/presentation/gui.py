@@ -31,6 +31,11 @@ class CaptureControlWindow:
         self._popup_message_keys: deque[tuple[str, str, str]] = deque(maxlen=8)
         self._scroll_canvas: tk.Canvas | None = None
         self._scroll_content_window: int | None = None
+        self._toast_frame: ttk.Frame | None = None
+        self._toast_label: ttk.Label | None = None
+        self._toast_hide_job: str | None = None
+        self._toast_queue: deque[str] = deque()
+        self._toast_visible = False
 
         self._root.title('Capture Control Center')
         self._root.geometry('1280x860')
@@ -54,11 +59,17 @@ class CaptureControlWindow:
         style.theme_use('clam')
         style.configure('Title.TLabel', font=('Segoe UI', 24, 'bold'))
         style.configure('Card.TLabelframe', padding=0)
+        style.configure('Toast.TFrame', background='#102a43')
+        style.configure('Toast.TLabel', background='#102a43', foreground='#f0f4f8', font=('Segoe UI', 10, 'bold'))
 
         root_shell = ttk.Frame(self._root)
         root_shell.pack(fill=tk.BOTH, expand=True)
         root_shell.columnconfigure(0, weight=1)
         root_shell.rowconfigure(0, weight=1)
+
+        self._toast_frame = ttk.Frame(root_shell, style='Toast.TFrame', padding=(18, 10))
+        self._toast_label = ttk.Label(self._toast_frame, style='Toast.TLabel', text='')
+        self._toast_label.pack()
 
         self._scroll_canvas = tk.Canvas(root_shell, highlightthickness=0, borderwidth=0)
         vertical_scrollbar = ttk.Scrollbar(root_shell, orient=tk.VERTICAL, command=self._scroll_canvas.yview)
@@ -389,6 +400,51 @@ class CaptureControlWindow:
         self._popup_message_two.set(history[1] if len(history) > 1 else 'Waiting for the next popup message.')
         self._set_readonly_text(self._popup_message_box_one, self._popup_message_one.get())
         self._set_readonly_text(self._popup_message_box_two, self._popup_message_two.get())
+        self._show_message_toast(text)
+
+    def _show_message_toast(self, message_text: str) -> None:
+        if self._toast_frame is None or self._toast_label is None:
+            return
+
+        self._toast_queue.append(message_text)
+        if self._toast_visible:
+            return
+
+        self._show_next_message_toast()
+
+    def _show_next_message_toast(self) -> None:
+        if self._toast_frame is None or self._toast_label is None:
+            return
+
+        if not self._toast_queue:
+            self._toast_visible = False
+            return
+
+        message_text = self._toast_queue.popleft()
+
+        preview = message_text.replace('\n', ' ').strip()
+        if len(preview) > 90:
+            preview = f'{preview[:87]}...'
+
+        self._toast_label.configure(text=f'New message arrived: {preview}')
+        self._toast_frame.place(relx=0.5, y=14, anchor='n')
+        self._toast_frame.lift()
+        self._toast_visible = True
+
+        if self._toast_hide_job is not None:
+            self._root.after_cancel(self._toast_hide_job)
+
+        self._toast_hide_job = self._root.after(4000, self._hide_message_toast)
+
+    def _hide_message_toast(self) -> None:
+        self._toast_hide_job = None
+        if self._toast_frame is None:
+            return
+
+        self._toast_frame.place_forget()
+        self._toast_visible = False
+        if self._toast_queue:
+            self._show_next_message_toast()
 
     def _set_readonly_text(self, widget: tk.Text, text: str) -> None:
         widget.configure(state=tk.NORMAL)
