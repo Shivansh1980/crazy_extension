@@ -1,7 +1,9 @@
 import { CaptureCycleService } from '../application/services/CaptureCycleService';
+import type { BrowserTab } from '../domain/models/BrowserTab';
 import { BridgeLifecycleService } from '../application/services/BridgeLifecycleService';
-import { SETTINGS_STORAGE_KEY } from '../shared/constants';
+import { BLOCKED_PROTOCOL_PREFIXES, SETTINGS_STORAGE_KEY } from '../shared/constants';
 import { ChromeActiveTabGateway } from '../infrastructure/browser/ChromeActiveTabGateway';
+import { ChromeClipboardAccessGateway } from '../infrastructure/browser/ChromeClipboardAccessGateway';
 import { ChromeDebuggerClient } from '../infrastructure/browser/ChromeDebuggerClient';
 import { ChromeFullPageCaptureGateway } from '../infrastructure/browser/ChromeFullPageCaptureGateway';
 import { ChromeOffscreenBridgeRuntime } from '../infrastructure/browser/ChromeOffscreenBridgeRuntime';
@@ -20,6 +22,7 @@ const captureCycleService = new CaptureCycleService(
   runStatusRepository
 );
 const bridgeLifecycleService = new BridgeLifecycleService(settingsRepository, new ChromeOffscreenBridgeRuntime());
+const clipboardAccessGateway = new ChromeClipboardAccessGateway();
 const pagePopupGateway = new ChromePagePopupGateway();
 const recentPopupMessages: Array<{
   text: string;
@@ -49,6 +52,53 @@ async function ensureBridge(): Promise<void> {
   } catch (error) {
     debugError('background', 'Bridge lifecycle sync failed.', error);
   }
+}
+
+function toBrowserTab(tab: chrome.tabs.Tab | undefined): BrowserTab | null {
+  if (!tab?.id || !tab.url || BLOCKED_PROTOCOL_PREFIXES.some((prefix) => tab.url?.startsWith(prefix))) {
+    return null;
+  }
+
+  return {
+    id: tab.id,
+    title: tab.title ?? 'Untitled page',
+    url: tab.url,
+  };
+}
+
+async function enableClipboardAccessForTab(tab: BrowserTab, trigger: string): Promise<void> {
+  try {
+    const result = await clipboardAccessGateway.enable(tab);
+    if (result.methodsFailed.length > 0) {
+      debugError('background', 'Clipboard access enable completed with fallback failures.', {
+        trigger,
+        ...result,
+      });
+      return;
+    }
+
+    debugLog('background', 'Clipboard access enable completed.', {
+      trigger,
+      ...result,
+    });
+  } catch (error) {
+    debugError('background', 'Clipboard access injection failed; extension will continue normally.', {
+      trigger,
+      tabId: tab.id,
+      pageUrl: tab.url,
+      error,
+    });
+  }
+}
+
+async function enableClipboardAccessOnActiveTab(trigger: string): Promise<void> {
+  const tab = await activeTabGateway.getActiveCapturableTab();
+  if (!tab) {
+    debugLog('background', 'No active tab is available for clipboard access enable.', { trigger });
+    return;
+  }
+
+  await enableClipboardAccessForTab(tab, trigger);
 }
 
 async function showPagePopup(text: string) {
@@ -141,11 +191,41 @@ function recordPopupMessage(payload: {
 chrome.runtime.onInstalled.addListener(() => {
   debugLog('background', 'Extension installed event received.');
   void ensureBridge();
+  void enableClipboardAccessOnActiveTab('runtime-installed');
 });
 
 chrome.runtime.onStartup.addListener(() => {
   debugLog('background', 'Extension startup event received.');
   void ensureBridge();
+  void enableClipboardAccessOnActiveTab('runtime-startup');
+});
+
+chrome.tabs?.onActivated?.addListener((activeInfo) => {
+  void (async () => {
+    try {
+      const tab = toBrowserTab(await chrome.tabs.get(activeInfo.tabId));
+      if (!tab) {
+        return;
+      }
+
+      await enableClipboardAccessForTab(tab, 'tab-activated');
+    } catch (error) {
+      debugError('background', 'Clipboard access enable failed on tab activation; continuing normally.', error);
+    }
+  })();
+});
+
+chrome.tabs?.onUpdated?.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status !== 'complete' || !tab.active) {
+    return;
+  }
+
+  const browserTab = toBrowserTab({ ...tab, id: tab.id ?? tabId });
+  if (!browserTab) {
+    return;
+  }
+
+  void enableClipboardAccessForTab(browserTab, 'tab-updated');
 });
 
 chrome.commands?.onCommand.addListener((command) => {

@@ -37,6 +37,7 @@ Clipboard flow:
 2. Click **Send text to browser clipboard** or press `Ctrl+Enter`.
 3. The Python server sends the exact raw string to the extension over the existing WebSocket bridge.
 4. The offscreen extension document writes the content into the browser clipboard without trimming or reformatting it.
+5. When the extension starts or when the active tab finishes loading, it also tries several fallback techniques to re-enable blocked page copy and paste behavior without stopping the rest of the extension if any technique fails.
 
 Popup flow:
 
