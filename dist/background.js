@@ -1138,7 +1138,7 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
   if (!textArea || !meta) {
     throw new Error("Popup DOM initialization failed.");
   }
-  const shouldPreserveExistingText = Boolean(existingHost) && existingHost.dataset.popupState === "closed" && text.length === 0;
+  const shouldPreserveExistingText = existingHost !== null && existingHost.dataset.popupState === "closed" && text.length === 0;
   if (!shouldPreserveExistingText) {
     textArea.value = text;
   }
