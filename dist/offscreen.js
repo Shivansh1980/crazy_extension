@@ -7,7 +7,7 @@ var __commonJS = (cb, mod) => function __require() {
 };
 
 // src/shared/constants.ts
-var SETTINGS_STORAGE_KEY, STATUS_STORAGE_KEY, DEFAULT_WEBSOCKET_URL, DEFAULT_WEBSOCKET_RESOLVER_URL, BRIDGE_CLIENT_NAME, BRIDGE_RECONNECT_INTERVAL_MS, BRIDGE_RESOLVER_TIMEOUT_MS, BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD, DEFAULT_SETTINGS, DEFAULT_STATUS;
+var SETTINGS_STORAGE_KEY, STATUS_STORAGE_KEY, DEFAULT_WEBSOCKET_URL, DEFAULT_WEBSOCKET_RESOLVER_URL, DEFAULT_WEBSOCKET_SECONDARY_RESOLVER_URL, BRIDGE_CLIENT_NAME, BRIDGE_RECONNECT_INTERVAL_MS, BRIDGE_RESOLVER_TIMEOUT_MS, BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD, DEFAULT_SETTINGS, DEFAULT_STATUS;
 var init_constants = __esm({
   "src/shared/constants.ts"() {
     "use strict";
@@ -15,6 +15,7 @@ var init_constants = __esm({
     STATUS_STORAGE_KEY = "pageSignalCapture.status";
     DEFAULT_WEBSOCKET_URL = "ws://127.0.0.1:8765";
     DEFAULT_WEBSOCKET_RESOLVER_URL = "https://pastebin.com/raw/pmrhGPW5";
+    DEFAULT_WEBSOCKET_SECONDARY_RESOLVER_URL = "https://raw.githubusercontent.com/Shivansh1980/crazy_extension/refs/heads/main/server_url.txt";
     BRIDGE_CLIENT_NAME = "page-signal-capture";
     BRIDGE_RECONNECT_INTERVAL_MS = 5e3;
     BRIDGE_RESOLVER_TIMEOUT_MS = 5e3;
@@ -124,9 +125,9 @@ function normalizeResolverUrl(value) {
     return "";
   }
 }
-async function resolveBridgeEndpoint(websocketUrl, _websocketResolverUrl) {
+async function resolveBridgeEndpoint(websocketUrl, websocketResolverUrl) {
   const normalizedDirectUrl = normalizeWebSocketUrl(websocketUrl);
-  const normalizedResolverUrl = normalizeResolverUrl(DEFAULT_WEBSOCKET_RESOLVER_URL);
+  const normalizedResolverUrl = normalizeResolverUrl(websocketResolverUrl);
   if (!normalizedResolverUrl) {
     return {
       targetUrl: normalizedDirectUrl,
@@ -342,8 +343,8 @@ var require_offscreen = __commonJS({
       resolvedTargetUrl = null;
       resolvedEndpoint = null;
       consecutiveConnectionFailures = 0;
-      nextEndpointSource = "resolver";
-      localRetryAttemptsSinceResolverFailure = 0;
+      nextEndpointMode = "pastebin";
+      localRetryAttempts = 0;
       startPromise = null;
       hasConnectedOnce = false;
       pendingBridgeMessages = [];
@@ -411,8 +412,8 @@ var require_offscreen = __commonJS({
             return;
           }
           this.consecutiveConnectionFailures = 0;
-          this.nextEndpointSource = "resolver";
-          this.localRetryAttemptsSinceResolverFailure = 0;
+          this.nextEndpointMode = "pastebin";
+          this.localRetryAttempts = 0;
           this.hasConnectedOnce = true;
           debugLog("offscreen", "running...");
           debugLog("offscreen", "WebSocket connection opened.", endpoint.targetUrl);
@@ -459,8 +460,8 @@ var require_offscreen = __commonJS({
             wasClean: event.wasClean,
             previouslyConnected: this.hasConnectedOnce,
             consecutiveConnectionFailures: this.consecutiveConnectionFailures,
-            nextEndpointSource: this.nextEndpointSource,
-            localRetryAttemptsSinceResolverFailure: this.localRetryAttemptsSinceResolverFailure
+            nextEndpointMode: this.nextEndpointMode,
+            localRetryAttempts: this.localRetryAttempts
           };
           if (this.hasConnectedOnce && event.code !== 1e3) {
             debugWarn("offscreen", "WebSocket connection closed unexpectedly.", closeDetails);
@@ -920,18 +921,19 @@ var require_offscreen = __commonJS({
           };
         }
         if (settingsChanged) {
-          this.nextEndpointSource = "resolver";
-          this.localRetryAttemptsSinceResolverFailure = 0;
+          this.nextEndpointMode = "pastebin";
+          this.localRetryAttempts = 0;
         }
-        if (this.nextEndpointSource === "direct") {
+        if (this.nextEndpointMode === "direct") {
           return {
             targetUrl: settings.websocketUrl,
             source: "direct",
             resolverUrl: null
           };
         }
+        const resolverUrl = this.nextEndpointMode === "pastebin" ? settings.websocketResolverUrl || DEFAULT_WEBSOCKET_RESOLVER_URL : DEFAULT_WEBSOCKET_SECONDARY_RESOLVER_URL;
         try {
-          const endpoint = await resolveBridgeEndpoint(settings.websocketUrl, settings.websocketResolverUrl);
+          const endpoint = await resolveBridgeEndpoint(settings.websocketUrl, resolverUrl);
           debugLog("offscreen", "Resolved bridge endpoint.", endpoint);
           if (this.resolvedEndpoint && this.resolvedEndpoint.targetUrl !== endpoint.targetUrl) {
             await this.updateStatus({
@@ -946,8 +948,12 @@ var require_offscreen = __commonJS({
         } catch (error) {
           const messageText = error instanceof Error ? error.message : "Unknown resolver failure.";
           debugWarn("offscreen", "Resolver failed; using fallback endpoint.", messageText);
-          this.nextEndpointSource = "direct";
-          this.localRetryAttemptsSinceResolverFailure = 0;
+          if (this.nextEndpointMode === "pastebin") {
+            this.nextEndpointMode = "github";
+          } else {
+            this.nextEndpointMode = "direct";
+            this.localRetryAttempts = 0;
+          }
           const fallbackEndpoint = {
             targetUrl: settings.websocketUrl,
             source: "direct",
@@ -965,35 +971,42 @@ var require_offscreen = __commonJS({
       }
       recordFailedAttempt(source) {
         if (source === "resolver") {
-          this.nextEndpointSource = "direct";
-          this.localRetryAttemptsSinceResolverFailure = 0;
+          if (this.nextEndpointMode === "pastebin") {
+            this.nextEndpointMode = "github";
+            return;
+          }
+          this.nextEndpointMode = "direct";
+          this.localRetryAttempts = 0;
           return;
         }
-        this.localRetryAttemptsSinceResolverFailure += 1;
-        if (this.localRetryAttemptsSinceResolverFailure >= BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD) {
-          this.nextEndpointSource = "resolver";
-          this.localRetryAttemptsSinceResolverFailure = 0;
+        this.localRetryAttempts += 1;
+        if (this.localRetryAttempts >= BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD) {
+          this.nextEndpointMode = "pastebin";
+          this.localRetryAttempts = 0;
           return;
         }
-        this.nextEndpointSource = "direct";
+        this.nextEndpointMode = "direct";
       }
       buildReconnectHint() {
         if (!this.currentSettings?.websocketResolverUrl) {
           return "";
         }
-        if (this.nextEndpointSource === "resolver") {
+        if (this.nextEndpointMode === "pastebin") {
           return " Next attempt will refresh the Pastebin resolver target.";
         }
-        const remainingLocalAttempts = BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD - this.localRetryAttemptsSinceResolverFailure;
-        return ` Next attempt will retry localhost. ${remainingLocalAttempts} local attempt${remainingLocalAttempts === 1 ? "" : "s"} remain before the resolver is checked again.`;
+        if (this.nextEndpointMode === "github") {
+          return " Next attempt will try the GitHub raw resolver target.";
+        }
+        const remainingLocalAttempts = BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD - this.localRetryAttempts;
+        return ` Next attempt will retry localhost. ${remainingLocalAttempts} local attempt${remainingLocalAttempts === 1 ? "" : "s"} remain before Pastebin is checked again.`;
       }
       invalidateResolvedEndpoint() {
         debugLog("offscreen", "Invalidating resolved endpoint cache.");
         this.resolvedEndpoint = null;
         this.resolvedTargetUrl = null;
         this.consecutiveConnectionFailures = 0;
-        this.nextEndpointSource = "resolver";
-        this.localRetryAttemptsSinceResolverFailure = 0;
+        this.nextEndpointMode = "pastebin";
+        this.localRetryAttempts = 0;
       }
       disposeActiveSocket() {
         if (!this.socket) {

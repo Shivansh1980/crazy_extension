@@ -24,8 +24,9 @@ The browser APIs and GUI concerns stay behind focused abstractions so capture qu
 
 1. Start the Python GUI server.
 2. The extension offscreen document checks the configured Pastebin resolver first and tries the latest resolved tunnel endpoint before anything else.
-	If that resolver lookup or tunnel connection fails, it falls back to `ws://127.0.0.1:8765` and retries localhost every 5 seconds.
-	After 10 consecutive localhost connection failures, it checks the resolver again to detect a rotated ngrok URL, then repeats the same resolver-first fallback cycle.
+	If that resolver lookup or tunnel connection fails, it tries the GitHub raw fallback at `https://raw.githubusercontent.com/Shivansh1980/crazy_extension/refs/heads/main/server_url.txt`.
+	If that also fails, it falls back to `ws://127.0.0.1:8765` and retries localhost every 5 seconds for up to 10 attempts.
+	After those 10 localhost failures, it repeats the same cycle: Pastebin, then GitHub raw, then localhost.
 3. The user clicks **Capture screenshot** in the Python GUI.
 4. The Python server sends a WebSocket request to the extension.
 5. The extension captures the active page with `chrome.debugger` and `Page.captureScreenshot` using `captureBeyondViewport`.
@@ -94,7 +95,7 @@ build_extension.bat
 ## Runtime behavior
 
 - The extension keeps a persistent offscreen WebSocket client and retries every 5 seconds if the Python server restarts or the tunnel changes.
-- The extension uses a resolver-first reconnect strategy: it checks Pastebin first, falls back to localhost for up to 10 attempts if that fails, then checks Pastebin again.
+- The extension uses a resolver-first reconnect strategy: it checks Pastebin first, then the GitHub raw fallback, then localhost for up to 10 attempts, and repeats that cycle until a bridge endpoint comes back.
 - The Python server uses WebSocket heartbeats and request timeouts so failures surface cleanly instead of hanging forever.
 - Restricted browser pages such as `chrome://` are skipped.
 - Captures are saved into an `images` directory under the directory where the Python GUI process is started.

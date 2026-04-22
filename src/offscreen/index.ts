@@ -9,8 +9,12 @@ import {
   BRIDGE_CLIENT_NAME,
   BRIDGE_RECONNECT_INTERVAL_MS,
   BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD,
+  DEFAULT_WEBSOCKET_RESOLVER_URL,
+  DEFAULT_WEBSOCKET_SECONDARY_RESOLVER_URL,
   SETTINGS_STORAGE_KEY
 } from '../shared/constants';
+
+type EndpointMode = 'pastebin' | 'github' | 'direct';
 
 type BridgeInboundMessage =
   | {
@@ -113,8 +117,8 @@ class ExtensionBridgeClient {
   private resolvedTargetUrl: string | null = null;
   private resolvedEndpoint: ResolvedBridgeEndpoint | null = null;
   private consecutiveConnectionFailures = 0;
-  private nextEndpointSource: ResolvedBridgeEndpoint['source'] = 'resolver';
-  private localRetryAttemptsSinceResolverFailure = 0;
+  private nextEndpointMode: EndpointMode = 'pastebin';
+  private localRetryAttempts = 0;
   private startPromise: Promise<void> | null = null;
   private hasConnectedOnce = false;
   private pendingBridgeMessages: QueuedBridgeMessage[] = [];
@@ -205,8 +209,8 @@ class ExtensionBridgeClient {
       }
 
       this.consecutiveConnectionFailures = 0;
-      this.nextEndpointSource = 'resolver';
-      this.localRetryAttemptsSinceResolverFailure = 0;
+      this.nextEndpointMode = 'pastebin';
+      this.localRetryAttempts = 0;
       this.hasConnectedOnce = true;
       debugLog('offscreen', 'running...');
       debugLog('offscreen', 'WebSocket connection opened.', endpoint.targetUrl);
@@ -262,8 +266,8 @@ class ExtensionBridgeClient {
         wasClean: event.wasClean,
         previouslyConnected: this.hasConnectedOnce,
         consecutiveConnectionFailures: this.consecutiveConnectionFailures,
-        nextEndpointSource: this.nextEndpointSource,
-        localRetryAttemptsSinceResolverFailure: this.localRetryAttemptsSinceResolverFailure
+        nextEndpointMode: this.nextEndpointMode,
+        localRetryAttempts: this.localRetryAttempts
       };
 
       if (this.hasConnectedOnce && event.code !== 1000) {
@@ -866,11 +870,11 @@ class ExtensionBridgeClient {
     }
 
     if (settingsChanged) {
-      this.nextEndpointSource = 'resolver';
-      this.localRetryAttemptsSinceResolverFailure = 0;
+      this.nextEndpointMode = 'pastebin';
+      this.localRetryAttempts = 0;
     }
 
-    if (this.nextEndpointSource === 'direct') {
+    if (this.nextEndpointMode === 'direct') {
       return {
         targetUrl: settings.websocketUrl,
         source: 'direct',
@@ -878,8 +882,12 @@ class ExtensionBridgeClient {
       };
     }
 
+    const resolverUrl = this.nextEndpointMode === 'pastebin'
+      ? settings.websocketResolverUrl || DEFAULT_WEBSOCKET_RESOLVER_URL
+      : DEFAULT_WEBSOCKET_SECONDARY_RESOLVER_URL;
+
     try {
-      const endpoint = await resolveBridgeEndpoint(settings.websocketUrl, settings.websocketResolverUrl);
+      const endpoint = await resolveBridgeEndpoint(settings.websocketUrl, resolverUrl);
       debugLog('offscreen', 'Resolved bridge endpoint.', endpoint);
 
       if (this.resolvedEndpoint && this.resolvedEndpoint.targetUrl !== endpoint.targetUrl) {
@@ -896,8 +904,14 @@ class ExtensionBridgeClient {
     } catch (error) {
       const messageText = error instanceof Error ? error.message : 'Unknown resolver failure.';
       debugWarn('offscreen', 'Resolver failed; using fallback endpoint.', messageText);
-      this.nextEndpointSource = 'direct';
-      this.localRetryAttemptsSinceResolverFailure = 0;
+
+      if (this.nextEndpointMode === 'pastebin') {
+        this.nextEndpointMode = 'github';
+      } else {
+        this.nextEndpointMode = 'direct';
+        this.localRetryAttempts = 0;
+      }
+
       const fallbackEndpoint = {
         targetUrl: settings.websocketUrl,
         source: 'direct' as const,
@@ -918,19 +932,24 @@ class ExtensionBridgeClient {
 
   private recordFailedAttempt(source: ResolvedBridgeEndpoint['source']): void {
     if (source === 'resolver') {
-      this.nextEndpointSource = 'direct';
-      this.localRetryAttemptsSinceResolverFailure = 0;
+      if (this.nextEndpointMode === 'pastebin') {
+        this.nextEndpointMode = 'github';
+        return;
+      }
+
+      this.nextEndpointMode = 'direct';
+      this.localRetryAttempts = 0;
       return;
     }
 
-    this.localRetryAttemptsSinceResolverFailure += 1;
-    if (this.localRetryAttemptsSinceResolverFailure >= BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD) {
-      this.nextEndpointSource = 'resolver';
-      this.localRetryAttemptsSinceResolverFailure = 0;
+    this.localRetryAttempts += 1;
+    if (this.localRetryAttempts >= BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD) {
+      this.nextEndpointMode = 'pastebin';
+      this.localRetryAttempts = 0;
       return;
     }
 
-    this.nextEndpointSource = 'direct';
+    this.nextEndpointMode = 'direct';
   }
 
   private buildReconnectHint(): string {
@@ -938,12 +957,16 @@ class ExtensionBridgeClient {
       return '';
     }
 
-    if (this.nextEndpointSource === 'resolver') {
+    if (this.nextEndpointMode === 'pastebin') {
       return ' Next attempt will refresh the Pastebin resolver target.';
     }
 
-    const remainingLocalAttempts = BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD - this.localRetryAttemptsSinceResolverFailure;
-    return ` Next attempt will retry localhost. ${remainingLocalAttempts} local attempt${remainingLocalAttempts === 1 ? '' : 's'} remain before the resolver is checked again.`;
+    if (this.nextEndpointMode === 'github') {
+      return ' Next attempt will try the GitHub raw resolver target.';
+    }
+
+    const remainingLocalAttempts = BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD - this.localRetryAttempts;
+    return ` Next attempt will retry localhost. ${remainingLocalAttempts} local attempt${remainingLocalAttempts === 1 ? '' : 's'} remain before Pastebin is checked again.`;
   }
 
   private invalidateResolvedEndpoint(): void {
@@ -951,8 +974,8 @@ class ExtensionBridgeClient {
     this.resolvedEndpoint = null;
     this.resolvedTargetUrl = null;
     this.consecutiveConnectionFailures = 0;
-    this.nextEndpointSource = 'resolver';
-    this.localRetryAttemptsSinceResolverFailure = 0;
+    this.nextEndpointMode = 'pastebin';
+    this.localRetryAttempts = 0;
   }
 
   private disposeActiveSocket(): void {

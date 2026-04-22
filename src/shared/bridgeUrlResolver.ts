@@ -1,4 +1,4 @@
-import { BRIDGE_RESOLVER_TIMEOUT_MS, DEFAULT_WEBSOCKET_RESOLVER_URL, DEFAULT_WEBSOCKET_URL } from './constants';
+import { BRIDGE_RESOLVER_TIMEOUT_MS, DEFAULT_WEBSOCKET_URL } from './constants';
 
 export interface ResolvedBridgeEndpoint {
   targetUrl: string;
@@ -40,10 +40,10 @@ export function normalizeResolverUrl(value: string): string {
 
 export async function resolveBridgeEndpoint(
   websocketUrl: string,
-  _websocketResolverUrl: string
+  websocketResolverUrl: string
 ): Promise<ResolvedBridgeEndpoint> {
   const normalizedDirectUrl = normalizeWebSocketUrl(websocketUrl);
-  const normalizedResolverUrl = normalizeResolverUrl(DEFAULT_WEBSOCKET_RESOLVER_URL);
+  const normalizedResolverUrl = normalizeResolverUrl(websocketResolverUrl);
 
   if (!normalizedResolverUrl) {
     return {
