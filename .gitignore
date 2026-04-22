@@ -1,6 +1,5 @@
 node_modules/
 .venv/
-dist/
 images/
 .vscode/
 __pycache__/

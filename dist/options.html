@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Page Signal Capture</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --surface: #f4f7fb;
+        --card: rgba(255, 255, 255, 0.9);
+        --border: rgba(19, 34, 53, 0.1);
+        --text: #102033;
+        --muted: #5a6a7f;
+        --accent: #0057d9;
+        --accent-soft: rgba(0, 87, 217, 0.12);
+        --success: #1b7f4c;
+        --error: #b42318;
+        --shadow: 0 20px 60px rgba(16, 32, 51, 0.12);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "Segoe UI Variable Display", "Aptos", sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at top left, rgba(0, 87, 217, 0.14), transparent 30%),
+          radial-gradient(circle at bottom right, rgba(42, 157, 143, 0.16), transparent 28%),
+          var(--surface);
+      }
+
+      main {
+        width: min(920px, calc(100vw - 32px));
+        margin: 32px auto;
+        display: grid;
+        gap: 20px;
+      }
+
+      .hero,
+      .panel {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 24px;
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(18px);
+      }
+
+      .hero {
+        padding: 28px;
+        display: grid;
+        gap: 12px;
+      }
+
+      .eyebrow {
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        color: var(--accent);
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(28px, 5vw, 42px);
+        line-height: 1.05;
+      }
+
+      .hero p,
+      .hint,
+      .status-meta {
+        margin: 0;
+        color: var(--muted);
+      }
+
+      .layout {
+        display: grid;
+        gap: 20px;
+        grid-template-columns: 1.2fr 0.8fr;
+      }
+
+      .panel {
+        padding: 24px;
+      }
+
+      form {
+        display: grid;
+        gap: 16px;
+      }
+
+      .field {
+        display: grid;
+        gap: 8px;
+      }
+
+      label {
+        font-weight: 600;
+      }
+
+      input,
+      button {
+        font: inherit;
+      }
+
+      input[type='text'],
+      input[type='url'],
+      input[type='number'] {
+        width: 100%;
+        padding: 14px 16px;
+        border-radius: 16px;
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.92);
+        color: var(--text);
+      }
+
+      .toggle {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 14px 16px;
+        border-radius: 18px;
+        background: var(--accent-soft);
+      }
+
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+      }
+
+      button {
+        border: 0;
+        border-radius: 999px;
+        padding: 12px 18px;
+        cursor: pointer;
+        transition: transform 120ms ease, opacity 120ms ease;
+      }
+
+      button:hover {
+        transform: translateY(-1px);
+      }
+
+      button:disabled {
+        cursor: progress;
+        opacity: 0.6;
+      }
+
+      .primary {
+        background: var(--accent);
+        color: white;
+      }
+
+      .secondary {
+        background: white;
+        color: var(--text);
+        border: 1px solid var(--border);
+      }
+
+      .status-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        width: fit-content;
+        padding: 8px 12px;
+        border-radius: 999px;
+        background: var(--accent-soft);
+        color: var(--accent);
+        font-weight: 700;
+        text-transform: capitalize;
+      }
+
+      .status-pill[data-state='success'] {
+        background: rgba(27, 127, 76, 0.12);
+        color: var(--success);
+      }
+
+      .status-pill[data-state='error'] {
+        background: rgba(180, 35, 24, 0.12);
+        color: var(--error);
+      }
+
+      .status-pill[data-state='skipped'] {
+        background: rgba(90, 106, 127, 0.14);
+        color: var(--muted);
+      }
+
+      .status-block {
+        display: grid;
+        gap: 12px;
+      }
+
+      .status-card {
+        padding: 16px;
+        border-radius: 18px;
+        background: rgba(16, 32, 51, 0.04);
+      }
+
+      @media (max-width: 760px) {
+        .layout {
+          grid-template-columns: 1fr;
+        }
+
+        main {
+          width: min(100vw - 20px, 920px);
+          margin: 20px auto;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="hero">
+        <div class="eyebrow">Chrome Extension</div>
+        <h1>Page Signal Capture</h1>
+        <p>Maintains a resilient local WebSocket bridge to a Python GUI, captures a full-page PNG on demand, and returns the image for local saving and analysis.</p>
+      </section>
+
+      <section class="layout">
+        <section class="panel">
+          <form id="settings-form">
+            <div class="field">
+              <label class="toggle" for="enabled">
+                <input id="enabled" name="enabled" type="checkbox" />
+                <span>Enable the desktop bridge and allow on-demand capture requests</span>
+              </label>
+            </div>
+
+            <div class="field">
+              <label for="websocket-url">Desktop bridge WebSocket URL</label>
+              <input id="websocket-url" name="websocketUrl" type="text" placeholder="ws://127.0.0.1:8765" />
+              <p class="hint">Used as the direct fallback bridge target. Keep this as your local server unless you want a different default.</p>
+            </div>
+
+            <div class="field">
+              <label for="websocket-resolver-url">Resolver URL</label>
+              <input id="websocket-resolver-url" name="websocketResolverUrl" type="text" readonly value="https://pastebin.com/raw/pmrhGPW5" />
+              <p class="hint">Fixed by the extension. On every reconnect it fetches this Pastebin raw URL, reads the ngrok target from there, and converts `http`, `https`, or `tcp` values into the correct WebSocket URL automatically.</p>
+            </div>
+
+            <div class="field">
+              <label for="file-name-prefix">File name prefix</label>
+              <input id="file-name-prefix" name="fileNamePrefix" type="text" placeholder="ui-capture" />
+            </div>
+
+            <div class="field">
+              <label for="request-timeout-ms">Request timeout in milliseconds</label>
+              <input id="request-timeout-ms" name="requestTimeoutMs" type="number" min="1000" step="1000" />
+            </div>
+
+            <div class="actions">
+              <button class="primary" id="save-button" type="submit">Save settings</button>
+              <button class="secondary" id="reconnect-button" type="button">Reconnect bridge</button>
+              <button class="secondary" id="capture-button" type="button">Run capture now</button>
+            </div>
+          </form>
+        </section>
+
+        <aside class="panel status-block">
+          <div class="status-pill" data-state="idle" id="status-state">idle</div>
+          <div class="status-card">
+            <strong>Last message</strong>
+            <p class="status-meta" id="status-message">Awaiting first capture cycle.</p>
+          </div>
+          <div class="status-card">
+            <strong>Last update</strong>
+            <p class="status-meta" id="status-updated-at">Never</p>
+          </div>
+          <div class="status-card">
+            <strong>Last file</strong>
+            <p class="status-meta" id="status-file-name">Not available</p>
+          </div>
+          <div class="status-card">
+            <strong>Bridge target</strong>
+            <p class="status-meta" id="status-target">Not configured</p>
+          </div>
+        </aside>
+      </section>
+    </main>
+
+    <script type="module" src="options.js"></script>
+  </body>
+</html>
