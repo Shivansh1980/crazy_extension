@@ -63,6 +63,38 @@ async function showPagePopup(text: string) {
   return result;
 }
 
+async function closePagePopup() {
+  const tab = await activeTabGateway.getActiveCapturableTab();
+  if (!tab) {
+    latestPopupStatus = {
+      exists: false,
+      state: 'closed',
+      tabId: null,
+      pageUrl: null,
+      updatedAt: new Date().toISOString(),
+      textLength: 0
+    };
+    notifyPopupStatusChanged(latestPopupStatus);
+    return latestPopupStatus;
+  }
+
+  const result = await pagePopupGateway.close(tab);
+  latestPopupStatus = result;
+  notifyPopupStatusChanged(result);
+  return result;
+}
+
+async function togglePagePopup() {
+  const status = await readPopupStatus();
+  if (status.exists) {
+    debugLog('background', 'Popup already exists on active tab; closing it from keyboard command.', status);
+    return closePagePopup();
+  }
+
+  debugLog('background', 'Popup is not present on active tab; opening it from keyboard command.');
+  return showPagePopup('');
+}
+
 async function readPopupStatus() {
   const tab = await activeTabGateway.getActiveCapturableTab();
   if (!tab) {
@@ -114,6 +146,21 @@ chrome.runtime.onInstalled.addListener(() => {
 chrome.runtime.onStartup.addListener(() => {
   debugLog('background', 'Extension startup event received.');
   void ensureBridge();
+});
+
+chrome.commands?.onCommand.addListener((command) => {
+  void (async () => {
+    try {
+      await ensureBridge();
+
+      if (command === 'toggle-popup') {
+        debugLog('background', 'Keyboard command received for popup toggle.');
+        await togglePagePopup();
+      }
+    } catch (error) {
+      debugError('background', 'Keyboard popup toggle failed.', error);
+    }
+  })();
 });
 
 chrome.storage?.onChanged?.addListener((changes, areaName) => {
@@ -191,7 +238,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.type === 'bridge-popup-show') {
     void showPagePopup(String(message.text ?? ''))
-      .then((status) => sendResponse({ ok: true, status }))
+      .then((status) => sendResponse({ ok: true, status, action: status.action }))
       .catch((error) => {
         const messageText = error instanceof Error ? error.message : 'Popup creation failed.';
         debugError('background', 'Bridge popup request failed.', messageText);

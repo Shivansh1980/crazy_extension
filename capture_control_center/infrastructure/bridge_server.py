@@ -129,6 +129,10 @@ class BridgeServer:
         try:
             async for raw_message in websocket:
                 debug_log('python-bridge', 'Received websocket payload.', raw_message)
+                if isinstance(raw_message, bytes):
+                    self._resolve_pending_binary_capture(raw_message)
+                    continue
+
                 payload = json.loads(raw_message)
                 message_type = payload.get('type')
 
@@ -254,6 +258,7 @@ class BridgeServer:
             file_name=str(captured_page.get('fileName', 'capture.png')),
             mime_type=str(captured_page.get('mimeType', 'image/png')),
             base64_data=str(captured_page.get('base64Data', '')),
+            image_bytes=None,
             captured_at=str(captured_page.get('capturedAt', '')),
             page_url=str(captured_page.get('tab', {}).get('url', '')),
             page_title=str(captured_page.get('tab', {}).get('title', '')),
@@ -275,6 +280,58 @@ class BridgeServer:
         future.set_exception(RuntimeError(message))
         debug_log('python-bridge', 'Capture response returned an error.', {'request_id': request_id, 'message': message})
         self._emit('capture_failed', {'request_id': request_id, 'message': message})
+
+    def _resolve_pending_binary_capture(self, raw_message: bytes) -> None:
+        if len(raw_message) < 5:
+            debug_log('python-bridge', 'Ignoring malformed binary capture payload.', {'length': len(raw_message)})
+            return
+
+        metadata_length = int.from_bytes(raw_message[:4], byteorder='big', signed=False)
+        if metadata_length <= 0 or len(raw_message) < 4 + metadata_length:
+            debug_log(
+                'python-bridge',
+                'Ignoring binary capture payload with invalid metadata length.',
+                {'length': len(raw_message), 'metadata_length': metadata_length},
+            )
+            return
+
+        try:
+            metadata = json.loads(raw_message[4 : 4 + metadata_length].decode('utf-8'))
+        except Exception as error:
+            debug_log('python-bridge', 'Ignoring binary capture payload with invalid JSON metadata.', str(error))
+            return
+
+        if metadata.get('type') != 'capture.result.binary':
+            debug_log('python-bridge', 'Ignoring unknown binary websocket payload type.', metadata.get('type'))
+            return
+
+        request_id = str(metadata.get('requestId', ''))
+        future = self._pending_requests.pop(request_id, None)
+        if future is None or future.done():
+            return
+
+        captured_page = metadata.get('capturedPage', {})
+        image_bytes = raw_message[4 + metadata_length :]
+        result = ScreenshotResult(
+            request_id=request_id,
+            file_name=str(captured_page.get('fileName', 'capture.png')),
+            mime_type=str(captured_page.get('mimeType', 'image/png')),
+            base64_data='',
+            image_bytes=image_bytes,
+            captured_at=str(captured_page.get('capturedAt', '')),
+            page_url=str(captured_page.get('tab', {}).get('url', '')),
+            page_title=str(captured_page.get('tab', {}).get('title', '')),
+            width_css_px=int(captured_page.get('widthCssPx', 0)),
+            height_css_px=int(captured_page.get('heightCssPx', 0)),
+            scale=float(captured_page.get('scale', 1)),
+        )
+        future.set_result(result)
+        debug_log(
+            'python-bridge',
+            'Binary capture response resolved successfully.',
+            {'request_id': request_id, 'file_name': result.file_name, 'bytes': len(image_bytes)},
+        )
+        self._emit('capture_received', {'request_id': request_id, 'file_name': result.file_name})
 
     def _resolve_pending_clipboard_request(self, payload: dict[str, Any]) -> None:
         request_id = str(payload.get('requestId', ''))

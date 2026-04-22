@@ -17,6 +17,7 @@ class ScreenshotResult:
     file_name: str
     mime_type: str
     base64_data: str
+    image_bytes: bytes | None
     captured_at: str
     page_url: str
     page_title: str
