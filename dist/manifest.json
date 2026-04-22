@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Page Signal Capture",
+  "version": "1.0.0",
+  "description": "Connects to a local Python GUI bridge and captures high-quality full-page screenshots on demand.",
+  "permissions": ["debugger", "offscreen", "storage", "tabs", "scripting", "clipboardWrite"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' http: https: ws: wss: ws://127.0.0.1:* ws://localhost:*"
+  },
+  "options_page": "options.html",
+  "action": {
+    "default_title": "Page Signal Capture"
+  },
+  "commands": {
+    "toggle-popup": {
+      "suggested_key": {
+        "default": "Alt+P",
+        "mac": "Command+Shift+P"
+      },
+      "description": "Toggle the in-page popup on the active tab"
+    }
+  },
+  "minimum_chrome_version": "128"
+}
