@@ -344,6 +344,7 @@ var require_offscreen = __commonJS({
       startPromise = null;
       hasConnectedOnce = false;
       pendingBridgeMessages = [];
+      lastPublishedPopupStatusKey = null;
       constructor() {
         debugLog("offscreen", "Bridge client constructed.");
         this.registerRuntimeListeners();
@@ -566,11 +567,7 @@ var require_offscreen = __commonJS({
             lastFileName: response.capturedPage.fileName,
             targetUrl
           });
-          this.sendOrQueueBridgeMessage({
-            type: "capture.result",
-            requestId: message.requestId,
-            capturedPage: response.capturedPage
-          });
+          this.sendOrQueueBinaryCaptureResult(message.requestId, response.capturedPage);
           debugLog("offscreen", "Capture result sent back to desktop bridge.", message.requestId);
         } catch (error) {
           const messageText = error instanceof Error ? error.message : "Capture request failed.";
@@ -633,11 +630,26 @@ var require_offscreen = __commonJS({
             });
           });
           if (response.ok && response.status) {
-            this.sendOrQueueBridgeMessage({ type: "popup.status", status: response.status });
+            this.publishPopupStatusIfChanged(response.status);
           }
         } catch (error) {
           debugWarn("offscreen", "Unable to publish popup status.", error);
         }
+      }
+      publishPopupStatusIfChanged(status) {
+        const statusKey = JSON.stringify({
+          exists: status.exists,
+          state: status.state,
+          tabId: status.tabId,
+          pageUrl: status.pageUrl,
+          textLength: status.textLength
+        });
+        if (this.lastPublishedPopupStatusKey === statusKey) {
+          debugLog("offscreen", "Skipping duplicate popup status publish.", status);
+          return;
+        }
+        this.lastPublishedPopupStatusKey = statusKey;
+        this.sendOrQueueBridgeMessage({ type: "popup.status", status });
       }
       async publishPopupMessageHistory() {
         try {
@@ -686,6 +698,25 @@ var require_offscreen = __commonJS({
         }
         this.send(message);
       }
+      sendOrQueueBinaryCaptureResult(requestId, capturedPage) {
+        const queuedMessage = {
+          type: "capture.result.binary",
+          requestId,
+          capturedPage
+        };
+        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+          debugLog("offscreen", "Queueing binary capture result until websocket is open.", {
+            requestId,
+            fileName: capturedPage.fileName
+          });
+          this.pendingBridgeMessages.push(queuedMessage);
+          if (this.pendingBridgeMessages.length > 20) {
+            this.pendingBridgeMessages.splice(0, this.pendingBridgeMessages.length - 20);
+          }
+          return;
+        }
+        this.sendBinaryCaptureResult(requestId, capturedPage);
+      }
       flushPendingBridgeMessages() {
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN || this.pendingBridgeMessages.length === 0) {
           return;
@@ -693,8 +724,55 @@ var require_offscreen = __commonJS({
         const queuedMessages = [...this.pendingBridgeMessages];
         this.pendingBridgeMessages = [];
         for (const message of queuedMessages) {
+          if (message.type === "capture.result.binary") {
+            this.sendBinaryCaptureResult(message.requestId, message.capturedPage);
+            continue;
+          }
           this.send(message);
         }
+      }
+      sendBinaryCaptureResult(requestId, capturedPage) {
+        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+          debugWarn("offscreen", "Skipping binary capture send because socket is not open.", requestId);
+          return;
+        }
+        const imageBytes = this.base64ToBytes(capturedPage.base64Data);
+        const metadataBytes = new TextEncoder().encode(
+          JSON.stringify({
+            type: "capture.result.binary",
+            requestId,
+            capturedPage: {
+              tab: capturedPage.tab,
+              mimeType: capturedPage.mimeType,
+              fileName: capturedPage.fileName,
+              capturedAt: capturedPage.capturedAt,
+              widthCssPx: capturedPage.widthCssPx,
+              heightCssPx: capturedPage.heightCssPx,
+              scale: capturedPage.scale
+            }
+          })
+        );
+        const envelope = new Uint8Array(4 + metadataBytes.length + imageBytes.length);
+        const view = new DataView(envelope.buffer);
+        view.setUint32(0, metadataBytes.length);
+        envelope.set(metadataBytes, 4);
+        envelope.set(imageBytes, 4 + metadataBytes.length);
+        debugLog("offscreen", "Sending binary capture result.", {
+          requestId,
+          fileName: capturedPage.fileName,
+          bytes: imageBytes.length,
+          metadataBytes: metadataBytes.length
+        });
+        this.socket.send(envelope.buffer);
+      }
+      base64ToBytes(base64Data) {
+        const normalizedBase64 = base64Data.replace(/\s+/g, "");
+        const binaryString = atob(normalizedBase64);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let index = 0; index < binaryString.length; index += 1) {
+          bytes[index] = binaryString.charCodeAt(index);
+        }
+        return bytes;
       }
       async writeClipboardText(text) {
         if (typeof text !== "string") {
@@ -904,7 +982,7 @@ var require_offscreen = __commonJS({
           if (message?.type === "popup-status-changed") {
             debugLog("offscreen", "Received popup status update from background.", message.status);
             if (message.status) {
-              this.sendOrQueueBridgeMessage({ type: "popup.status", status: message.status });
+              this.publishPopupStatusIfChanged(message.status);
             }
             sendResponse({ ok: true });
             return true;

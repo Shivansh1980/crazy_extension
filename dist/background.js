@@ -641,17 +641,19 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
         }
         .controls {
           display: flex;
-          gap: 6px;
+          gap: 5px;
         }
         button.control,
         button.copy,
         button.send {
           border: none;
-          border-radius: 10px;
+          border-radius: 8px;
           background: ${theme.controlBackground};
           color: ${theme.foreground};
-          padding: 6px 10px;
+          padding: 4px 8px;
           font: inherit;
+          font-size: 11px;
+          line-height: 1.2;
           cursor: pointer;
         }
         button.control:hover,
@@ -685,7 +687,7 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
           display: flex;
           align-items: center;
           justify-content: space-between;
-          padding: 10px 12px 12px;
+          padding: 8px 10px 10px;
           gap: 8px;
         }
         .footer-right {
@@ -702,12 +704,12 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
         .opacity-wrap {
           display: inline-flex;
           align-items: center;
-          gap: 6px;
-          font-size: 11px;
+          gap: 5px;
+          font-size: 10px;
           opacity: 0.84;
         }
         .opacity-wrap input {
-          width: 82px;
+          width: 72px;
         }
       </style>
       <div class="shell" data-role="shell">
@@ -872,6 +874,22 @@ function readPopupStatusInPage(tabId, pageUrl) {
     textLength
   };
 }
+function closePopupInPage(tabId, pageUrl) {
+  const popupHostId = "page-signal-capture-popup-host";
+  const host = document.getElementById(popupHostId);
+  const textLength = host?.shadowRoot?.querySelector('[data-role="content"]')?.value.length ?? 0;
+  if (host) {
+    host.remove();
+  }
+  return {
+    exists: false,
+    state: "closed",
+    tabId,
+    pageUrl,
+    updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    textLength
+  };
+}
 var ChromePagePopupGateway;
 var init_ChromePagePopupGateway = __esm({
   "src/infrastructure/browser/ChromePagePopupGateway.ts"() {
@@ -890,6 +908,15 @@ var init_ChromePagePopupGateway = __esm({
         const results = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           func: readPopupStatusInPage,
+          args: [tab.id, tab.url]
+        });
+        const firstResult = results[0]?.result;
+        return this.normalizeStatus(firstResult, tab);
+      }
+      async close(tab) {
+        const results = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: closePopupInPage,
           args: [tab.id, tab.url]
         });
         const firstResult = results[0]?.result;
@@ -1198,6 +1225,34 @@ var require_main = __commonJS({
       notifyPopupStatusChanged(result);
       return result;
     }
+    async function closePagePopup() {
+      const tab = await activeTabGateway.getActiveCapturableTab();
+      if (!tab) {
+        latestPopupStatus = {
+          exists: false,
+          state: "closed",
+          tabId: null,
+          pageUrl: null,
+          updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+          textLength: 0
+        };
+        notifyPopupStatusChanged(latestPopupStatus);
+        return latestPopupStatus;
+      }
+      const result = await pagePopupGateway.close(tab);
+      latestPopupStatus = result;
+      notifyPopupStatusChanged(result);
+      return result;
+    }
+    async function togglePagePopup() {
+      const status = await readPopupStatus();
+      if (status.exists) {
+        debugLog("background", "Popup already exists on active tab; closing it from keyboard command.", status);
+        return closePagePopup();
+      }
+      debugLog("background", "Popup is not present on active tab; opening it from keyboard command.");
+      return showPagePopup("");
+    }
     async function readPopupStatus() {
       const tab = await activeTabGateway.getActiveCapturableTab();
       if (!tab) {
@@ -1233,6 +1288,19 @@ var require_main = __commonJS({
     chrome.runtime.onStartup.addListener(() => {
       debugLog("background", "Extension startup event received.");
       void ensureBridge();
+    });
+    chrome.commands?.onCommand.addListener((command) => {
+      void (async () => {
+        try {
+          await ensureBridge();
+          if (command === "toggle-popup") {
+            debugLog("background", "Keyboard command received for popup toggle.");
+            await togglePagePopup();
+          }
+        } catch (error) {
+          debugError("background", "Keyboard popup toggle failed.", error);
+        }
+      })();
     });
     chrome.storage?.onChanged?.addListener((changes, areaName) => {
       if (areaName === "sync" && changes[SETTINGS_STORAGE_KEY]) {
@@ -1295,7 +1363,7 @@ var require_main = __commonJS({
         return true;
       }
       if (message?.type === "bridge-popup-show") {
-        void showPagePopup(String(message.text ?? "")).then((status) => sendResponse({ ok: true, status })).catch((error) => {
+        void showPagePopup(String(message.text ?? "")).then((status) => sendResponse({ ok: true, status, action: status.action })).catch((error) => {
           const messageText = error instanceof Error ? error.message : "Popup creation failed.";
           debugError("background", "Bridge popup request failed.", messageText);
           sendResponse({ ok: false, message: messageText });
