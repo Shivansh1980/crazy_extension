@@ -63,18 +63,14 @@ function enableClipboardAccessInPage(): FrameClipboardAccessEnableResult {
     [stateKey]?: {
       installed: boolean;
       observerInstalled: boolean;
-      preventDefaultPatched: boolean;
-      addEventListenerPatched: boolean;
+      captureInterceptorsInstalled: boolean;
       rootPropsProtected: boolean;
       domReadyListenerInstalled: boolean;
       styleElementId: string;
       protectedEventTypes: string[];
       protectedHandlerProps: string[];
-      listenerWrappers: WeakMap<object, EventListenerOrEventListenerObject>;
+      popupHostId: string;
     };
-    __pageSignalOriginalPreventDefault?: Event['preventDefault'];
-    __pageSignalOriginalAddEventListener?: EventTarget['addEventListener'];
-    __pageSignalOriginalRemoveEventListener?: EventTarget['removeEventListener'];
   };
 
   const state =
@@ -82,11 +78,11 @@ function enableClipboardAccessInPage(): FrameClipboardAccessEnableResult {
     (win[stateKey] = {
       installed: false,
       observerInstalled: false,
-      preventDefaultPatched: false,
-      addEventListenerPatched: false,
+      captureInterceptorsInstalled: false,
       rootPropsProtected: false,
       domReadyListenerInstalled: false,
       styleElementId: 'page-signal-clipboard-access-style',
+      popupHostId: 'page-signal-capture-popup-host',
       protectedEventTypes: [
         'copy',
         'cut',
@@ -107,8 +103,7 @@ function enableClipboardAccessInPage(): FrameClipboardAccessEnableResult {
         'onselectstart',
         'oncontextmenu',
         'ondragstart'
-      ],
-      listenerWrappers: new WeakMap<object, EventListenerOrEventListenerObject>()
+      ]
     });
 
   const alreadyInstalled = state.installed;
@@ -131,6 +126,19 @@ function enableClipboardAccessInPage(): FrameClipboardAccessEnableResult {
   };
 
   const isProtectedEvent = (event: Event): boolean => protectedEventTypes.has(event.type) || isClipboardShortcutEvent(event);
+
+  const isInsidePopup = (target: EventTarget | null): boolean => {
+    if (!(target instanceof Node)) {
+      return false;
+    }
+
+    const rootNode = target.getRootNode();
+    if (rootNode instanceof ShadowRoot && rootNode.host instanceof HTMLElement && rootNode.host.id === state.popupHostId) {
+      return true;
+    }
+
+    return target instanceof Element && Boolean(target.closest(`#${state.popupHostId}`));
+  };
 
   const applyMethod = (name: string, action: () => void): void => {
     try {
@@ -278,116 +286,30 @@ function enableClipboardAccessInPage(): FrameClipboardAccessEnableResult {
     }
   };
 
-  const ensurePreventDefaultPatch = (): void => {
-    if (state.preventDefaultPatched) {
+  const ensureCaptureInterceptors = (): void => {
+    if (state.captureInterceptorsInstalled) {
       return;
     }
 
-    const originalPreventDefault = win.__pageSignalOriginalPreventDefault ?? Event.prototype.preventDefault;
-    win.__pageSignalOriginalPreventDefault = originalPreventDefault;
-    Event.prototype.preventDefault = function patchedPreventDefault(this: Event): void {
-      if (isProtectedEvent(this)) {
+    const intercept = (event: Event): void => {
+      if (!isProtectedEvent(event) || isInsidePopup(event.target)) {
         return;
       }
 
-      originalPreventDefault.call(this);
-    };
-    state.preventDefaultPatched = true;
-  };
-
-  const ensureAddEventListenerPatch = (): void => {
-    if (state.addEventListenerPatched) {
-      return;
-    }
-
-    const originalAddEventListener = win.__pageSignalOriginalAddEventListener ?? EventTarget.prototype.addEventListener;
-    const originalRemoveEventListener = win.__pageSignalOriginalRemoveEventListener ?? EventTarget.prototype.removeEventListener;
-    win.__pageSignalOriginalAddEventListener = originalAddEventListener;
-    win.__pageSignalOriginalRemoveEventListener = originalRemoveEventListener;
-
-    const invokeWrappedListener = (
-      listener: EventListenerOrEventListenerObject,
-      context: unknown,
-      event: Event
-    ): unknown => {
-      if (!isProtectedEvent(event)) {
-        if (typeof listener === 'function') {
-          return listener.call(context, event);
-        }
-
-        return listener.handleEvent.call(listener, event);
-      }
-
-      const originalPreventDefault = event.preventDefault.bind(event);
-      try {
-        Object.defineProperty(event, 'preventDefault', {
-          configurable: true,
-          value: () => undefined,
-        });
-      } catch {
-        // Ignore if the event instance cannot be redefined.
-      }
-
-      try {
-        if (typeof listener === 'function') {
-          return listener.call(context, event);
-        }
-
-        return listener.handleEvent.call(listener, event);
-      } finally {
-        try {
-          Object.defineProperty(event, 'preventDefault', {
-            configurable: true,
-            value: originalPreventDefault,
-          });
-        } catch {
-          // Ignore if the event instance cannot be restored.
-        }
-      }
+      event.stopImmediatePropagation();
+      event.stopPropagation();
     };
 
-    EventTarget.prototype.addEventListener = function patchedAddEventListener(
-      this: EventTarget,
-      type: string,
-      listener: EventListenerOrEventListenerObject | null,
-      options?: boolean | AddEventListenerOptions
-    ): void {
-      if (!listener || (!protectedEventTypes.has(type) && type !== 'keydown')) {
-        originalAddEventListener.call(this, type, listener, options);
-        return;
-      }
-
-      const wrappedListener: EventListenerOrEventListenerObject =
-        typeof listener === 'function'
-          ? function wrappedClipboardListener(this: EventTarget, event: Event): unknown {
-              return invokeWrappedListener(listener, this, event);
-            }
-          : {
-              handleEvent(event: Event): unknown {
-                return invokeWrappedListener(listener, listener, event);
-              }
-            };
-
-      state.listenerWrappers.set(listener as object, wrappedListener);
-      originalAddEventListener.call(this, type, wrappedListener, options);
-    };
-
-    EventTarget.prototype.removeEventListener = function patchedRemoveEventListener(
-      this: EventTarget,
-      type: string,
-      listener: EventListenerOrEventListenerObject | null,
-      options?: boolean | EventListenerOptions
-    ): void {
-      if (!listener) {
-        originalRemoveEventListener.call(this, type, listener, options);
-        return;
-      }
-
-      const wrappedListener = state.listenerWrappers.get(listener as object) ?? listener;
-      originalRemoveEventListener.call(this, type, wrappedListener, options);
-    };
-
-    state.addEventListenerPatched = true;
+    window.addEventListener('copy', intercept, true);
+    window.addEventListener('cut', intercept, true);
+    window.addEventListener('paste', intercept, true);
+    window.addEventListener('beforecopy', intercept, true);
+    window.addEventListener('beforecut', intercept, true);
+    window.addEventListener('beforepaste', intercept, true);
+    window.addEventListener('selectstart', intercept, true);
+    window.addEventListener('contextmenu', intercept, true);
+    window.addEventListener('keydown', intercept, true);
+    state.captureInterceptorsInstalled = true;
   };
 
   const ensureMutationObserver = (): void => {
@@ -442,8 +364,7 @@ function enableClipboardAccessInPage(): FrameClipboardAccessEnableResult {
   applyMethod('style-override', ensureStyleOverride);
   applyMethod('root-handler-protection', protectRootHandlerProps);
   applyMethod('dom-cleanup', () => refreshDocumentNodes(document));
-  applyMethod('prevent-default-patch', ensurePreventDefaultPatch);
-  applyMethod('future-listener-patch', ensureAddEventListenerPatch);
+  applyMethod('capture-interceptors', ensureCaptureInterceptors);
   applyMethod('mutation-observer', ensureMutationObserver);
   applyMethod('dom-ready-refresh', ensureDomReadyRefresh);
 

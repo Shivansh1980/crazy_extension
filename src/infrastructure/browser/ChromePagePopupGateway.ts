@@ -97,6 +97,11 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
   const minimumSizePx = 160;
   const defaultOpacity = 0.5;
 
+  function updateMeta(textArea: HTMLTextAreaElement, meta: HTMLElement): void {
+    const lineCount = textArea.value.length === 0 ? 0 : textArea.value.split(/\r\n|\r|\n/).length;
+    meta.textContent = `${textArea.value.length} chars · ${lineCount} line${lineCount === 1 ? '' : 's'}`;
+  }
+
   function sendRuntimeMessage(message: unknown): void {
     try {
       void chrome.runtime.sendMessage(message).catch(() => undefined);
@@ -215,9 +220,14 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
   }
 
   function buildPopupStatus(host: HTMLElement, popupTabId: number | null, popupPageUrl: string, textLength: number): PagePopupStatus {
-    const state = host.dataset.popupState === 'minimized' ? 'minimized' : 'open';
+    const state =
+      host.dataset.popupState === 'minimized'
+        ? 'minimized'
+        : host.dataset.popupState === 'closed'
+          ? 'closed'
+          : 'open';
     return {
-      exists: true,
+      exists: state !== 'closed',
       state,
       tabId: popupTabId,
       pageUrl: popupPageUrl,
@@ -235,7 +245,7 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
 
   function setPopupState(
     host: HTMLElement,
-    state: 'open' | 'minimized',
+    state: 'open' | 'minimized' | 'closed',
     detail?: { tabId?: number; pageUrl?: string; textLength?: number }
   ): void {
     const shell = host.shadowRoot?.querySelector<HTMLElement>('[data-role="shell"]');
@@ -244,6 +254,7 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
     }
 
     host.dataset.popupState = state;
+    host.style.display = state === 'closed' ? 'none' : 'block';
     if (state === 'minimized') {
       shell.classList.add('minimized');
     } else {
@@ -254,6 +265,7 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
   }
 
   function restorePopup(host: HTMLElement, shell: HTMLElement): void {
+    host.style.display = 'block';
     host.style.width = `${defaultSizePx}px`;
     host.style.height = `${defaultSizePx}px`;
     host.style.minWidth = `${minimumSizePx}px`;
@@ -529,8 +541,9 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
     const sendButton = shadowRoot.querySelector<HTMLButtonElement>('[data-role="send"]');
     const opacityInput = shadowRoot.querySelector<HTMLInputElement>('[data-role="opacity"]');
     const textArea = shadowRoot.querySelector<HTMLTextAreaElement>('[data-role="content"]');
+    const meta = shadowRoot.querySelector<HTMLElement>('[data-role="meta"]');
 
-    if (!shell || !dragHandle || !minimizeButton || !closeButton || !launcher || !copyButton || !sendButton || !opacityInput || !textArea) {
+    if (!shell || !dragHandle || !minimizeButton || !closeButton || !launcher || !copyButton || !sendButton || !opacityInput || !textArea || !meta) {
       throw new Error('Popup controls could not be initialized.');
     }
 
@@ -557,17 +570,7 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
     });
 
     closeButton.addEventListener('click', () => {
-      const detail = buildPopupStatus(host, null, location.href, textArea.value.length);
-      host.remove();
-      sendRuntimeMessage({
-        type: 'popup-status-update',
-        status: {
-          ...detail,
-          exists: false,
-          state: 'closed',
-          updatedAt: new Date().toISOString(),
-        }
-      });
+      setPopupState(host, 'closed', { tabId, pageUrl: location.href, textLength: textArea.value.length });
     });
 
     copyButton.addEventListener('click', async () => {
@@ -613,11 +616,22 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
     opacityInput.addEventListener('input', () => {
       host.style.opacity = opacityInput.value;
     });
+
+    textArea.addEventListener('input', () => {
+      updateMeta(textArea, meta);
+      sendPopupStatus(host, tabId, location.href, textArea.value.length);
+    });
+
+    textArea.addEventListener('keydown', (event) => {
+      if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'a') {
+        event.stopPropagation();
+      }
+    });
   }
 
   const existingHost = document.getElementById(popupHostId) as HTMLElement | null;
   const action: PagePopupShowResult['action'] = existingHost
-    ? existingHost.dataset.popupState === 'minimized'
+    ? existingHost.dataset.popupState === 'minimized' || existingHost.dataset.popupState === 'closed'
       ? 'restored'
       : 'updated'
     : 'created';
@@ -635,23 +649,25 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
     throw new Error('Popup DOM initialization failed.');
   }
 
-  textArea.value = text;
-  const lineCount = text.length === 0 ? 0 : text.split(/\r\n|\r|\n/).length;
-  meta.textContent = `${text.length} chars · ${lineCount} line${lineCount === 1 ? '' : 's'}`;
+  const shouldPreserveExistingText = existingHost !== null && existingHost.dataset.popupState === 'closed' && text.length === 0;
+  if (!shouldPreserveExistingText) {
+    textArea.value = text;
+  }
+  updateMeta(textArea, meta);
 
   if (!existingHost) {
     document.documentElement.appendChild(host);
   }
 
   if (action === 'restored' || action === 'created') {
-    setPopupState(host, 'open', { tabId, pageUrl, textLength: text.length });
+    setPopupState(host, 'open', { tabId, pageUrl, textLength: textArea.value.length });
   } else {
-    sendPopupStatus(host, tabId, pageUrl, text.length);
+    sendPopupStatus(host, tabId, pageUrl, textArea.value.length);
   }
 
   return {
     action,
-    ...buildPopupStatus(host, tabId, pageUrl, text.length)
+    ...buildPopupStatus(host, tabId, pageUrl, textArea.value.length)
   };
 }
 
@@ -671,8 +687,8 @@ function readPopupStatusInPage(tabId: number, pageUrl: string): PagePopupStatus 
 
   const textLength = host.shadowRoot?.querySelector<HTMLTextAreaElement>('[data-role="content"]')?.value.length ?? 0;
   return {
-    exists: true,
-    state: host.dataset.popupState === 'minimized' ? 'minimized' : 'open',
+    exists: host.dataset.popupState !== 'closed',
+    state: host.dataset.popupState === 'minimized' ? 'minimized' : host.dataset.popupState === 'closed' ? 'closed' : 'open',
     tabId,
     pageUrl,
     updatedAt: new Date().toISOString(),
@@ -686,7 +702,8 @@ function closePopupInPage(tabId: number, pageUrl: string): PagePopupStatus {
   const textLength = host?.shadowRoot?.querySelector<HTMLTextAreaElement>('[data-role="content"]')?.value.length ?? 0;
 
   if (host) {
-    host.remove();
+    host.dataset.popupState = 'closed';
+    host.style.display = 'none';
   }
 
   return {

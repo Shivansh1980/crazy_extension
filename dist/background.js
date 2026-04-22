@@ -177,11 +177,11 @@ function enableClipboardAccessInPage() {
   const state = win[stateKey] ?? (win[stateKey] = {
     installed: false,
     observerInstalled: false,
-    preventDefaultPatched: false,
-    addEventListenerPatched: false,
+    captureInterceptorsInstalled: false,
     rootPropsProtected: false,
     domReadyListenerInstalled: false,
     styleElementId: "page-signal-clipboard-access-style",
+    popupHostId: "page-signal-capture-popup-host",
     protectedEventTypes: [
       "copy",
       "cut",
@@ -202,8 +202,7 @@ function enableClipboardAccessInPage() {
       "onselectstart",
       "oncontextmenu",
       "ondragstart"
-    ],
-    listenerWrappers: /* @__PURE__ */ new WeakMap()
+    ]
   });
   const alreadyInstalled = state.installed;
   const methodsApplied = [];
@@ -221,6 +220,16 @@ function enableClipboardAccessInPage() {
     return event.shiftKey && key === "insert";
   };
   const isProtectedEvent = (event) => protectedEventTypes.has(event.type) || isClipboardShortcutEvent(event);
+  const isInsidePopup = (target) => {
+    if (!(target instanceof Node)) {
+      return false;
+    }
+    const rootNode = target.getRootNode();
+    if (rootNode instanceof ShadowRoot && rootNode.host instanceof HTMLElement && rootNode.host.id === state.popupHostId) {
+      return true;
+    }
+    return target instanceof Element && Boolean(target.closest(`#${state.popupHostId}`));
+  };
   const applyMethod = (name, action) => {
     try {
       action();
@@ -344,82 +353,27 @@ function enableClipboardAccessInPage() {
       cleanupElement(element);
     }
   };
-  const ensurePreventDefaultPatch = () => {
-    if (state.preventDefaultPatched) {
+  const ensureCaptureInterceptors = () => {
+    if (state.captureInterceptorsInstalled) {
       return;
     }
-    const originalPreventDefault = win.__pageSignalOriginalPreventDefault ?? Event.prototype.preventDefault;
-    win.__pageSignalOriginalPreventDefault = originalPreventDefault;
-    Event.prototype.preventDefault = function patchedPreventDefault() {
-      if (isProtectedEvent(this)) {
+    const intercept = (event) => {
+      if (!isProtectedEvent(event) || isInsidePopup(event.target)) {
         return;
       }
-      originalPreventDefault.call(this);
+      event.stopImmediatePropagation();
+      event.stopPropagation();
     };
-    state.preventDefaultPatched = true;
-  };
-  const ensureAddEventListenerPatch = () => {
-    if (state.addEventListenerPatched) {
-      return;
-    }
-    const originalAddEventListener = win.__pageSignalOriginalAddEventListener ?? EventTarget.prototype.addEventListener;
-    const originalRemoveEventListener = win.__pageSignalOriginalRemoveEventListener ?? EventTarget.prototype.removeEventListener;
-    win.__pageSignalOriginalAddEventListener = originalAddEventListener;
-    win.__pageSignalOriginalRemoveEventListener = originalRemoveEventListener;
-    const invokeWrappedListener = (listener, context, event) => {
-      if (!isProtectedEvent(event)) {
-        if (typeof listener === "function") {
-          return listener.call(context, event);
-        }
-        return listener.handleEvent.call(listener, event);
-      }
-      const originalPreventDefault = event.preventDefault.bind(event);
-      try {
-        Object.defineProperty(event, "preventDefault", {
-          configurable: true,
-          value: () => void 0
-        });
-      } catch {
-      }
-      try {
-        if (typeof listener === "function") {
-          return listener.call(context, event);
-        }
-        return listener.handleEvent.call(listener, event);
-      } finally {
-        try {
-          Object.defineProperty(event, "preventDefault", {
-            configurable: true,
-            value: originalPreventDefault
-          });
-        } catch {
-        }
-      }
-    };
-    EventTarget.prototype.addEventListener = function patchedAddEventListener(type, listener, options) {
-      if (!listener || !protectedEventTypes.has(type) && type !== "keydown") {
-        originalAddEventListener.call(this, type, listener, options);
-        return;
-      }
-      const wrappedListener = typeof listener === "function" ? function wrappedClipboardListener(event) {
-        return invokeWrappedListener(listener, this, event);
-      } : {
-        handleEvent(event) {
-          return invokeWrappedListener(listener, listener, event);
-        }
-      };
-      state.listenerWrappers.set(listener, wrappedListener);
-      originalAddEventListener.call(this, type, wrappedListener, options);
-    };
-    EventTarget.prototype.removeEventListener = function patchedRemoveEventListener(type, listener, options) {
-      if (!listener) {
-        originalRemoveEventListener.call(this, type, listener, options);
-        return;
-      }
-      const wrappedListener = state.listenerWrappers.get(listener) ?? listener;
-      originalRemoveEventListener.call(this, type, wrappedListener, options);
-    };
-    state.addEventListenerPatched = true;
+    window.addEventListener("copy", intercept, true);
+    window.addEventListener("cut", intercept, true);
+    window.addEventListener("paste", intercept, true);
+    window.addEventListener("beforecopy", intercept, true);
+    window.addEventListener("beforecut", intercept, true);
+    window.addEventListener("beforepaste", intercept, true);
+    window.addEventListener("selectstart", intercept, true);
+    window.addEventListener("contextmenu", intercept, true);
+    window.addEventListener("keydown", intercept, true);
+    state.captureInterceptorsInstalled = true;
   };
   const ensureMutationObserver = () => {
     if (state.observerInstalled || !document.documentElement) {
@@ -465,8 +419,7 @@ function enableClipboardAccessInPage() {
   applyMethod("style-override", ensureStyleOverride);
   applyMethod("root-handler-protection", protectRootHandlerProps);
   applyMethod("dom-cleanup", () => refreshDocumentNodes(document));
-  applyMethod("prevent-default-patch", ensurePreventDefaultPatch);
-  applyMethod("future-listener-patch", ensureAddEventListenerPatch);
+  applyMethod("capture-interceptors", ensureCaptureInterceptors);
   applyMethod("mutation-observer", ensureMutationObserver);
   applyMethod("dom-ready-refresh", ensureDomReadyRefresh);
   state.installed = true;
@@ -699,6 +652,10 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
   const defaultSizePx = 200;
   const minimumSizePx = 160;
   const defaultOpacity = 0.5;
+  function updateMeta(textArea2, meta2) {
+    const lineCount = textArea2.value.length === 0 ? 0 : textArea2.value.split(/\r\n|\r|\n/).length;
+    meta2.textContent = `${textArea2.value.length} chars \xB7 ${lineCount} line${lineCount === 1 ? "" : "s"}`;
+  }
   function sendRuntimeMessage2(message) {
     try {
       void chrome.runtime.sendMessage(message).catch(() => void 0);
@@ -801,9 +758,9 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
     return host2.shadowRoot?.querySelector('[data-role="content"]')?.value.length ?? 0;
   }
   function buildPopupStatus(host2, popupTabId, popupPageUrl, textLength) {
-    const state = host2.dataset.popupState === "minimized" ? "minimized" : "open";
+    const state = host2.dataset.popupState === "minimized" ? "minimized" : host2.dataset.popupState === "closed" ? "closed" : "open";
     return {
-      exists: true,
+      exists: state !== "closed",
       state,
       tabId: popupTabId,
       pageUrl: popupPageUrl,
@@ -823,6 +780,7 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
       return;
     }
     host2.dataset.popupState = state;
+    host2.style.display = state === "closed" ? "none" : "block";
     if (state === "minimized") {
       shell.classList.add("minimized");
     } else {
@@ -831,6 +789,7 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
     sendPopupStatus(host2, detail?.tabId ?? null, detail?.pageUrl ?? location.href, detail?.textLength);
   }
   function restorePopup(host2, shell) {
+    host2.style.display = "block";
     host2.style.width = `${defaultSizePx}px`;
     host2.style.height = `${defaultSizePx}px`;
     host2.style.minWidth = `${minimumSizePx}px`;
@@ -1093,7 +1052,8 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
     const sendButton = shadowRoot2.querySelector('[data-role="send"]');
     const opacityInput = shadowRoot2.querySelector('[data-role="opacity"]');
     const textArea2 = shadowRoot2.querySelector('[data-role="content"]');
-    if (!shell || !dragHandle || !minimizeButton || !closeButton || !launcher || !copyButton || !sendButton || !opacityInput || !textArea2) {
+    const meta2 = shadowRoot2.querySelector('[data-role="meta"]');
+    if (!shell || !dragHandle || !minimizeButton || !closeButton || !launcher || !copyButton || !sendButton || !opacityInput || !textArea2 || !meta2) {
       throw new Error("Popup controls could not be initialized.");
     }
     attachDrag(dragHandle, host2);
@@ -1115,17 +1075,7 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
       restorePopup(host2, shell);
     });
     closeButton.addEventListener("click", () => {
-      const detail = buildPopupStatus(host2, null, location.href, textArea2.value.length);
-      host2.remove();
-      sendRuntimeMessage2({
-        type: "popup-status-update",
-        status: {
-          ...detail,
-          exists: false,
-          state: "closed",
-          updatedAt: (/* @__PURE__ */ new Date()).toISOString()
-        }
-      });
+      setPopupState(host2, "closed", { tabId, pageUrl: location.href, textLength: textArea2.value.length });
     });
     copyButton.addEventListener("click", async () => {
       const originalLabel = copyButton.textContent ?? "Copy";
@@ -1166,9 +1116,18 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
     opacityInput.addEventListener("input", () => {
       host2.style.opacity = opacityInput.value;
     });
+    textArea2.addEventListener("input", () => {
+      updateMeta(textArea2, meta2);
+      sendPopupStatus(host2, tabId, location.href, textArea2.value.length);
+    });
+    textArea2.addEventListener("keydown", (event) => {
+      if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "a") {
+        event.stopPropagation();
+      }
+    });
   }
   const existingHost = document.getElementById(popupHostId);
-  const action = existingHost ? existingHost.dataset.popupState === "minimized" ? "restored" : "updated" : "created";
+  const action = existingHost ? existingHost.dataset.popupState === "minimized" || existingHost.dataset.popupState === "closed" ? "restored" : "updated" : "created";
   const host = existingHost ?? createPopupHost();
   const shadowRoot = host.shadowRoot ?? host.attachShadow({ mode: "open" });
   if (!shadowRoot.hasChildNodes()) {
@@ -1179,20 +1138,22 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
   if (!textArea || !meta) {
     throw new Error("Popup DOM initialization failed.");
   }
-  textArea.value = text;
-  const lineCount = text.length === 0 ? 0 : text.split(/\r\n|\r|\n/).length;
-  meta.textContent = `${text.length} chars \xB7 ${lineCount} line${lineCount === 1 ? "" : "s"}`;
+  const shouldPreserveExistingText = Boolean(existingHost) && existingHost.dataset.popupState === "closed" && text.length === 0;
+  if (!shouldPreserveExistingText) {
+    textArea.value = text;
+  }
+  updateMeta(textArea, meta);
   if (!existingHost) {
     document.documentElement.appendChild(host);
   }
   if (action === "restored" || action === "created") {
-    setPopupState(host, "open", { tabId, pageUrl, textLength: text.length });
+    setPopupState(host, "open", { tabId, pageUrl, textLength: textArea.value.length });
   } else {
-    sendPopupStatus(host, tabId, pageUrl, text.length);
+    sendPopupStatus(host, tabId, pageUrl, textArea.value.length);
   }
   return {
     action,
-    ...buildPopupStatus(host, tabId, pageUrl, text.length)
+    ...buildPopupStatus(host, tabId, pageUrl, textArea.value.length)
   };
 }
 function readPopupStatusInPage(tabId, pageUrl) {
@@ -1210,8 +1171,8 @@ function readPopupStatusInPage(tabId, pageUrl) {
   }
   const textLength = host.shadowRoot?.querySelector('[data-role="content"]')?.value.length ?? 0;
   return {
-    exists: true,
-    state: host.dataset.popupState === "minimized" ? "minimized" : "open",
+    exists: host.dataset.popupState !== "closed",
+    state: host.dataset.popupState === "minimized" ? "minimized" : host.dataset.popupState === "closed" ? "closed" : "open",
     tabId,
     pageUrl,
     updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
@@ -1223,7 +1184,8 @@ function closePopupInPage(tabId, pageUrl) {
   const host = document.getElementById(popupHostId);
   const textLength = host?.shadowRoot?.querySelector('[data-role="content"]')?.value.length ?? 0;
   if (host) {
-    host.remove();
+    host.dataset.popupState = "closed";
+    host.style.display = "none";
   }
   return {
     exists: false,
