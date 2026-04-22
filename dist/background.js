@@ -170,6 +170,303 @@ var init_ChromeActiveTabGateway = __esm({
   }
 });
 
+// src/infrastructure/browser/ChromeClipboardAccessGateway.ts
+function enableClipboardAccessInPage() {
+  const stateKey = "__pageSignalClipboardAccessState";
+  const win = window;
+  const state = win[stateKey] ?? (win[stateKey] = {
+    installed: false,
+    observerInstalled: false,
+    captureInterceptorsInstalled: false,
+    rootPropsProtected: false,
+    domReadyListenerInstalled: false,
+    styleElementId: "page-signal-clipboard-access-style",
+    popupHostId: "page-signal-capture-popup-host",
+    protectedEventTypes: [
+      "copy",
+      "cut",
+      "paste",
+      "beforecopy",
+      "beforecut",
+      "beforepaste",
+      "selectstart",
+      "contextmenu"
+    ],
+    protectedHandlerProps: [
+      "oncopy",
+      "oncut",
+      "onpaste",
+      "onbeforecopy",
+      "onbeforecut",
+      "onbeforepaste",
+      "onselectstart",
+      "oncontextmenu",
+      "ondragstart"
+    ]
+  });
+  const alreadyInstalled = state.installed;
+  const methodsApplied = [];
+  const methodsFailed = [];
+  const protectedEventTypes = new Set(state.protectedEventTypes);
+  const protectedShortcutKeys = /* @__PURE__ */ new Set(["a", "c", "v", "x", "insert"]);
+  const isClipboardShortcutEvent = (event) => {
+    if (!(event instanceof KeyboardEvent)) {
+      return false;
+    }
+    const key = event.key.toLowerCase();
+    if ((event.ctrlKey || event.metaKey) && !event.altKey && protectedShortcutKeys.has(key)) {
+      return true;
+    }
+    return event.shiftKey && key === "insert";
+  };
+  const isProtectedEvent = (event) => protectedEventTypes.has(event.type) || isClipboardShortcutEvent(event);
+  const isInsidePopup = (target) => {
+    if (!(target instanceof Node)) {
+      return false;
+    }
+    const rootNode = target.getRootNode();
+    if (rootNode instanceof ShadowRoot && rootNode.host instanceof HTMLElement && rootNode.host.id === state.popupHostId) {
+      return true;
+    }
+    return target instanceof Element && Boolean(target.closest(`#${state.popupHostId}`));
+  };
+  const applyMethod = (name, action) => {
+    try {
+      action();
+      methodsApplied.push(name);
+    } catch (error) {
+      methodsFailed.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+  const protectRootHandlerProps = () => {
+    if (state.rootPropsProtected) {
+      return;
+    }
+    const targets = [window, document, document.documentElement, document.body].filter(
+      (target) => target !== null && target !== void 0
+    );
+    for (const target of targets) {
+      for (const prop of state.protectedHandlerProps) {
+        try {
+          target[prop] = null;
+        } catch {
+        }
+        try {
+          const descriptor = Object.getOwnPropertyDescriptor(target, prop);
+          if (descriptor?.configurable === false) {
+            continue;
+          }
+          Object.defineProperty(target, prop, {
+            configurable: true,
+            enumerable: descriptor?.enumerable ?? false,
+            get: () => null,
+            set: () => void 0
+          });
+        } catch {
+        }
+      }
+    }
+    state.rootPropsProtected = true;
+  };
+  const ensureStyleOverride = () => {
+    const container = document.head ?? document.documentElement;
+    if (!container) {
+      throw new Error("No document container is available for stylesheet injection.");
+    }
+    let styleElement = document.getElementById(state.styleElementId);
+    if (!styleElement) {
+      styleElement = document.createElement("style");
+      styleElement.id = state.styleElementId;
+      container.appendChild(styleElement);
+    }
+    styleElement.textContent = `
+      html, body, body * {
+        user-select: text !important;
+        -webkit-user-select: text !important;
+        -webkit-touch-callout: default !important;
+      }
+      input, textarea, [contenteditable], [role="textbox"] {
+        caret-color: auto !important;
+        -webkit-user-modify: read-write !important;
+      }
+      input[disabled], textarea[disabled] {
+        pointer-events: auto !important;
+        opacity: 1 !important;
+      }
+    `;
+  };
+  const cleanupElement = (element) => {
+    if (!(element instanceof HTMLElement)) {
+      return;
+    }
+    for (const prop of state.protectedHandlerProps) {
+      if (element.hasAttribute(prop)) {
+        element.removeAttribute(prop);
+      }
+      try {
+        element[prop] = null;
+      } catch {
+      }
+    }
+    element.style.setProperty("user-select", "text", "important");
+    element.style.setProperty("-webkit-user-select", "text", "important");
+    element.style.setProperty("-webkit-touch-callout", "default", "important");
+    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+      element.disabled = false;
+      element.readOnly = false;
+      element.removeAttribute("disabled");
+      element.removeAttribute("readonly");
+      return;
+    }
+    if (element.getAttribute("role") === "textbox" || element.hasAttribute("contenteditable")) {
+      if (element.getAttribute("contenteditable") === "false" || !element.isContentEditable) {
+        element.setAttribute("contenteditable", "plaintext-only");
+      }
+    }
+  };
+  const refreshDocumentNodes = (root = document) => {
+    const selector = [
+      "input",
+      "textarea",
+      "[contenteditable]",
+      '[contenteditable="false"]',
+      '[role="textbox"]',
+      ...state.protectedHandlerProps.map((prop) => `[${prop}]`)
+    ].join(",");
+    const elements = /* @__PURE__ */ new Set();
+    if (root instanceof Document) {
+      if (root.documentElement) {
+        elements.add(root.documentElement);
+      }
+      if (root.body) {
+        elements.add(root.body);
+      }
+    } else if (root instanceof Element) {
+      elements.add(root);
+    }
+    if ("querySelectorAll" in root) {
+      for (const element of root.querySelectorAll(selector)) {
+        elements.add(element);
+      }
+    }
+    for (const element of elements) {
+      cleanupElement(element);
+    }
+  };
+  const ensureCaptureInterceptors = () => {
+    if (state.captureInterceptorsInstalled) {
+      return;
+    }
+    const intercept = (event) => {
+      if (!isProtectedEvent(event) || isInsidePopup(event.target)) {
+        return;
+      }
+      event.stopImmediatePropagation();
+      event.stopPropagation();
+    };
+    window.addEventListener("copy", intercept, true);
+    window.addEventListener("cut", intercept, true);
+    window.addEventListener("paste", intercept, true);
+    window.addEventListener("beforecopy", intercept, true);
+    window.addEventListener("beforecut", intercept, true);
+    window.addEventListener("beforepaste", intercept, true);
+    window.addEventListener("selectstart", intercept, true);
+    window.addEventListener("contextmenu", intercept, true);
+    window.addEventListener("keydown", intercept, true);
+    state.captureInterceptorsInstalled = true;
+  };
+  const ensureMutationObserver = () => {
+    if (state.observerInstalled || !document.documentElement) {
+      return;
+    }
+    const observer = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        if (mutation.type === "attributes" && mutation.target instanceof Element) {
+          cleanupElement(mutation.target);
+        }
+        for (const node of mutation.addedNodes) {
+          if (node instanceof Element) {
+            refreshDocumentNodes(node);
+          }
+        }
+      }
+    });
+    observer.observe(document.documentElement, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: [...state.protectedHandlerProps, "disabled", "readonly", "style", "contenteditable"]
+    });
+    state.observerInstalled = true;
+  };
+  const ensureDomReadyRefresh = () => {
+    if (state.domReadyListenerInstalled) {
+      return;
+    }
+    document.addEventListener(
+      "DOMContentLoaded",
+      () => {
+        try {
+          refreshDocumentNodes(document);
+          protectRootHandlerProps();
+        } catch {
+        }
+      },
+      { capture: true, once: true }
+    );
+    state.domReadyListenerInstalled = true;
+  };
+  applyMethod("style-override", ensureStyleOverride);
+  applyMethod("root-handler-protection", protectRootHandlerProps);
+  applyMethod("dom-cleanup", () => refreshDocumentNodes(document));
+  applyMethod("capture-interceptors", ensureCaptureInterceptors);
+  applyMethod("mutation-observer", ensureMutationObserver);
+  applyMethod("dom-ready-refresh", ensureDomReadyRefresh);
+  state.installed = true;
+  return {
+    pageUrl: location.href,
+    alreadyInstalled,
+    methodsApplied,
+    methodsFailed
+  };
+}
+var ChromeClipboardAccessGateway;
+var init_ChromeClipboardAccessGateway = __esm({
+  "src/infrastructure/browser/ChromeClipboardAccessGateway.ts"() {
+    "use strict";
+    ChromeClipboardAccessGateway = class {
+      async enable(tab) {
+        const results = await chrome.scripting.executeScript({
+          target: { tabId: tab.id, allFrames: true },
+          world: "MAIN",
+          func: enableClipboardAccessInPage
+        });
+        const normalizedResults = results.map((result) => this.normalizeFrameResult(result.result, tab.url)).filter((result) => result !== null);
+        return {
+          tabId: tab.id,
+          pageUrl: tab.url,
+          frameCount: normalizedResults.length,
+          alreadyInstalled: normalizedResults.length > 0 && normalizedResults.every((result) => result.alreadyInstalled),
+          methodsApplied: Array.from(new Set(normalizedResults.flatMap((result) => result.methodsApplied))),
+          methodsFailed: normalizedResults.flatMap((result) => result.methodsFailed)
+        };
+      }
+      normalizeFrameResult(result, fallbackUrl) {
+        if (typeof result !== "object" || result === null) {
+          return null;
+        }
+        const record = result;
+        return {
+          pageUrl: typeof record.pageUrl === "string" ? record.pageUrl : fallbackUrl,
+          alreadyInstalled: Boolean(record.alreadyInstalled),
+          methodsApplied: Array.isArray(record.methodsApplied) ? record.methodsApplied.filter((value) => typeof value === "string") : [],
+          methodsFailed: Array.isArray(record.methodsFailed) ? record.methodsFailed.filter((value) => typeof value === "string") : []
+        };
+      }
+    };
+  }
+});
+
 // src/infrastructure/browser/ChromeDebuggerClient.ts
 var ChromeDebuggerClient;
 var init_ChromeDebuggerClient = __esm({
@@ -355,6 +652,10 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
   const defaultSizePx = 200;
   const minimumSizePx = 160;
   const defaultOpacity = 0.5;
+  function updateMeta(textArea2, meta2) {
+    const lineCount = textArea2.value.length === 0 ? 0 : textArea2.value.split(/\r\n|\r|\n/).length;
+    meta2.textContent = `${textArea2.value.length} chars \xB7 ${lineCount} line${lineCount === 1 ? "" : "s"}`;
+  }
   function sendRuntimeMessage2(message) {
     try {
       void chrome.runtime.sendMessage(message).catch(() => void 0);
@@ -457,9 +758,9 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
     return host2.shadowRoot?.querySelector('[data-role="content"]')?.value.length ?? 0;
   }
   function buildPopupStatus(host2, popupTabId, popupPageUrl, textLength) {
-    const state = host2.dataset.popupState === "minimized" ? "minimized" : "open";
+    const state = host2.dataset.popupState === "minimized" ? "minimized" : host2.dataset.popupState === "closed" ? "closed" : "open";
     return {
-      exists: true,
+      exists: state !== "closed",
       state,
       tabId: popupTabId,
       pageUrl: popupPageUrl,
@@ -479,6 +780,7 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
       return;
     }
     host2.dataset.popupState = state;
+    host2.style.display = state === "closed" ? "none" : "block";
     if (state === "minimized") {
       shell.classList.add("minimized");
     } else {
@@ -487,6 +789,7 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
     sendPopupStatus(host2, detail?.tabId ?? null, detail?.pageUrl ?? location.href, detail?.textLength);
   }
   function restorePopup(host2, shell) {
+    host2.style.display = "block";
     host2.style.width = `${defaultSizePx}px`;
     host2.style.height = `${defaultSizePx}px`;
     host2.style.minWidth = `${minimumSizePx}px`;
@@ -749,7 +1052,8 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
     const sendButton = shadowRoot2.querySelector('[data-role="send"]');
     const opacityInput = shadowRoot2.querySelector('[data-role="opacity"]');
     const textArea2 = shadowRoot2.querySelector('[data-role="content"]');
-    if (!shell || !dragHandle || !minimizeButton || !closeButton || !launcher || !copyButton || !sendButton || !opacityInput || !textArea2) {
+    const meta2 = shadowRoot2.querySelector('[data-role="meta"]');
+    if (!shell || !dragHandle || !minimizeButton || !closeButton || !launcher || !copyButton || !sendButton || !opacityInput || !textArea2 || !meta2) {
       throw new Error("Popup controls could not be initialized.");
     }
     attachDrag(dragHandle, host2);
@@ -771,17 +1075,7 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
       restorePopup(host2, shell);
     });
     closeButton.addEventListener("click", () => {
-      const detail = buildPopupStatus(host2, null, location.href, textArea2.value.length);
-      host2.remove();
-      sendRuntimeMessage2({
-        type: "popup-status-update",
-        status: {
-          ...detail,
-          exists: false,
-          state: "closed",
-          updatedAt: (/* @__PURE__ */ new Date()).toISOString()
-        }
-      });
+      setPopupState(host2, "closed", { tabId, pageUrl: location.href, textLength: textArea2.value.length });
     });
     copyButton.addEventListener("click", async () => {
       const originalLabel = copyButton.textContent ?? "Copy";
@@ -822,9 +1116,18 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
     opacityInput.addEventListener("input", () => {
       host2.style.opacity = opacityInput.value;
     });
+    textArea2.addEventListener("input", () => {
+      updateMeta(textArea2, meta2);
+      sendPopupStatus(host2, tabId, location.href, textArea2.value.length);
+    });
+    textArea2.addEventListener("keydown", (event) => {
+      if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "a") {
+        event.stopPropagation();
+      }
+    });
   }
   const existingHost = document.getElementById(popupHostId);
-  const action = existingHost ? existingHost.dataset.popupState === "minimized" ? "restored" : "updated" : "created";
+  const action = existingHost ? existingHost.dataset.popupState === "minimized" || existingHost.dataset.popupState === "closed" ? "restored" : "updated" : "created";
   const host = existingHost ?? createPopupHost();
   const shadowRoot = host.shadowRoot ?? host.attachShadow({ mode: "open" });
   if (!shadowRoot.hasChildNodes()) {
@@ -835,20 +1138,22 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
   if (!textArea || !meta) {
     throw new Error("Popup DOM initialization failed.");
   }
-  textArea.value = text;
-  const lineCount = text.length === 0 ? 0 : text.split(/\r\n|\r|\n/).length;
-  meta.textContent = `${text.length} chars \xB7 ${lineCount} line${lineCount === 1 ? "" : "s"}`;
+  const shouldPreserveExistingText = existingHost !== null && existingHost.dataset.popupState === "closed" && text.length === 0;
+  if (!shouldPreserveExistingText) {
+    textArea.value = text;
+  }
+  updateMeta(textArea, meta);
   if (!existingHost) {
     document.documentElement.appendChild(host);
   }
   if (action === "restored" || action === "created") {
-    setPopupState(host, "open", { tabId, pageUrl, textLength: text.length });
+    setPopupState(host, "open", { tabId, pageUrl, textLength: textArea.value.length });
   } else {
-    sendPopupStatus(host, tabId, pageUrl, text.length);
+    sendPopupStatus(host, tabId, pageUrl, textArea.value.length);
   }
   return {
     action,
-    ...buildPopupStatus(host, tabId, pageUrl, text.length)
+    ...buildPopupStatus(host, tabId, pageUrl, textArea.value.length)
   };
 }
 function readPopupStatusInPage(tabId, pageUrl) {
@@ -866,8 +1171,8 @@ function readPopupStatusInPage(tabId, pageUrl) {
   }
   const textLength = host.shadowRoot?.querySelector('[data-role="content"]')?.value.length ?? 0;
   return {
-    exists: true,
-    state: host.dataset.popupState === "minimized" ? "minimized" : "open",
+    exists: host.dataset.popupState !== "closed",
+    state: host.dataset.popupState === "minimized" ? "minimized" : host.dataset.popupState === "closed" ? "closed" : "open",
     tabId,
     pageUrl,
     updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
@@ -879,7 +1184,8 @@ function closePopupInPage(tabId, pageUrl) {
   const host = document.getElementById(popupHostId);
   const textLength = host?.shadowRoot?.querySelector('[data-role="content"]')?.value.length ?? 0;
   if (host) {
-    host.remove();
+    host.dataset.popupState = "closed";
+    host.style.display = "none";
   }
   return {
     exists: false,
@@ -1175,6 +1481,7 @@ var require_main = __commonJS({
     init_BridgeLifecycleService();
     init_constants();
     init_ChromeActiveTabGateway();
+    init_ChromeClipboardAccessGateway();
     init_ChromeDebuggerClient();
     init_ChromeFullPageCaptureGateway();
     init_ChromeOffscreenBridgeRuntime();
@@ -1192,6 +1499,7 @@ var require_main = __commonJS({
       runStatusRepository
     );
     var bridgeLifecycleService = new BridgeLifecycleService(settingsRepository, new ChromeOffscreenBridgeRuntime());
+    var clipboardAccessGateway = new ChromeClipboardAccessGateway();
     var pagePopupGateway = new ChromePagePopupGateway();
     var recentPopupMessages = [];
     var latestPopupStatus = {
@@ -1214,6 +1522,47 @@ var require_main = __commonJS({
       } catch (error) {
         debugError("background", "Bridge lifecycle sync failed.", error);
       }
+    }
+    function toBrowserTab(tab) {
+      if (!tab?.id || !tab.url || BLOCKED_PROTOCOL_PREFIXES.some((prefix) => tab.url?.startsWith(prefix))) {
+        return null;
+      }
+      return {
+        id: tab.id,
+        title: tab.title ?? "Untitled page",
+        url: tab.url
+      };
+    }
+    async function enableClipboardAccessForTab(tab, trigger) {
+      try {
+        const result = await clipboardAccessGateway.enable(tab);
+        if (result.methodsFailed.length > 0) {
+          debugError("background", "Clipboard access enable completed with fallback failures.", {
+            trigger,
+            ...result
+          });
+          return;
+        }
+        debugLog("background", "Clipboard access enable completed.", {
+          trigger,
+          ...result
+        });
+      } catch (error) {
+        debugError("background", "Clipboard access injection failed; extension will continue normally.", {
+          trigger,
+          tabId: tab.id,
+          pageUrl: tab.url,
+          error
+        });
+      }
+    }
+    async function enableClipboardAccessOnActiveTab(trigger) {
+      const tab = await activeTabGateway.getActiveCapturableTab();
+      if (!tab) {
+        debugLog("background", "No active tab is available for clipboard access enable.", { trigger });
+        return;
+      }
+      await enableClipboardAccessForTab(tab, trigger);
     }
     async function showPagePopup(text) {
       const tab = await activeTabGateway.getActiveCapturableTab();
@@ -1284,10 +1633,35 @@ var require_main = __commonJS({
     chrome.runtime.onInstalled.addListener(() => {
       debugLog("background", "Extension installed event received.");
       void ensureBridge();
+      void enableClipboardAccessOnActiveTab("runtime-installed");
     });
     chrome.runtime.onStartup.addListener(() => {
       debugLog("background", "Extension startup event received.");
       void ensureBridge();
+      void enableClipboardAccessOnActiveTab("runtime-startup");
+    });
+    chrome.tabs?.onActivated?.addListener((activeInfo) => {
+      void (async () => {
+        try {
+          const tab = toBrowserTab(await chrome.tabs.get(activeInfo.tabId));
+          if (!tab) {
+            return;
+          }
+          await enableClipboardAccessForTab(tab, "tab-activated");
+        } catch (error) {
+          debugError("background", "Clipboard access enable failed on tab activation; continuing normally.", error);
+        }
+      })();
+    });
+    chrome.tabs?.onUpdated?.addListener((tabId, changeInfo, tab) => {
+      if (changeInfo.status !== "complete" || !tab.active) {
+        return;
+      }
+      const browserTab = toBrowserTab({ ...tab, id: tab.id ?? tabId });
+      if (!browserTab) {
+        return;
+      }
+      void enableClipboardAccessForTab(browserTab, "tab-updated");
     });
     chrome.commands?.onCommand.addListener((command) => {
       void (async () => {

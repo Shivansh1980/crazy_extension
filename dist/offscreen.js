@@ -7,7 +7,7 @@ var __commonJS = (cb, mod) => function __require() {
 };
 
 // src/shared/constants.ts
-var SETTINGS_STORAGE_KEY, STATUS_STORAGE_KEY, DEFAULT_WEBSOCKET_URL, DEFAULT_WEBSOCKET_RESOLVER_URL, BRIDGE_CLIENT_NAME, BRIDGE_RECONNECT_INTERVAL_MS, BRIDGE_RESOLVER_TIMEOUT_MS, DEFAULT_SETTINGS, DEFAULT_STATUS;
+var SETTINGS_STORAGE_KEY, STATUS_STORAGE_KEY, DEFAULT_WEBSOCKET_URL, DEFAULT_WEBSOCKET_RESOLVER_URL, BRIDGE_CLIENT_NAME, BRIDGE_RECONNECT_INTERVAL_MS, BRIDGE_RESOLVER_TIMEOUT_MS, BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD, DEFAULT_SETTINGS, DEFAULT_STATUS;
 var init_constants = __esm({
   "src/shared/constants.ts"() {
     "use strict";
@@ -18,6 +18,7 @@ var init_constants = __esm({
     BRIDGE_CLIENT_NAME = "page-signal-capture";
     BRIDGE_RECONNECT_INTERVAL_MS = 5e3;
     BRIDGE_RESOLVER_TIMEOUT_MS = 5e3;
+    BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD = 10;
     DEFAULT_SETTINGS = {
       enabled: true,
       websocketUrl: DEFAULT_WEBSOCKET_URL,
@@ -341,6 +342,8 @@ var require_offscreen = __commonJS({
       resolvedTargetUrl = null;
       resolvedEndpoint = null;
       consecutiveConnectionFailures = 0;
+      nextEndpointSource = "resolver";
+      localRetryAttemptsSinceResolverFailure = 0;
       startPromise = null;
       hasConnectedOnce = false;
       pendingBridgeMessages = [];
@@ -408,6 +411,8 @@ var require_offscreen = __commonJS({
             return;
           }
           this.consecutiveConnectionFailures = 0;
+          this.nextEndpointSource = "resolver";
+          this.localRetryAttemptsSinceResolverFailure = 0;
           this.hasConnectedOnce = true;
           debugLog("offscreen", "running...");
           debugLog("offscreen", "WebSocket connection opened.", endpoint.targetUrl);
@@ -446,24 +451,27 @@ var require_offscreen = __commonJS({
           }
           this.socket = null;
           this.consecutiveConnectionFailures += 1;
+          this.recordFailedAttempt(endpoint.source);
           const closeDetails = {
             targetUrl: endpoint.targetUrl,
             code: event.code,
             reason: event.reason || null,
             wasClean: event.wasClean,
             previouslyConnected: this.hasConnectedOnce,
-            consecutiveConnectionFailures: this.consecutiveConnectionFailures
+            consecutiveConnectionFailures: this.consecutiveConnectionFailures,
+            nextEndpointSource: this.nextEndpointSource,
+            localRetryAttemptsSinceResolverFailure: this.localRetryAttemptsSinceResolverFailure
           };
           if (this.hasConnectedOnce && event.code !== 1e3) {
             debugWarn("offscreen", "WebSocket connection closed unexpectedly.", closeDetails);
           } else {
             debugLog("offscreen", "WebSocket connection closed; reconnect will be attempted.", closeDetails);
           }
-          const refreshHint = this.currentSettings?.websocketResolverUrl ? " Refreshing the resolver URL on the next attempt." : "";
+          const retryHint = this.buildReconnectHint();
           void this.updateStatus({
             state: "disconnected",
             updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
-            message: `Bridge connection closed. Retrying ${endpoint.targetUrl} in 5 seconds. Failure count: ${this.consecutiveConnectionFailures}.${refreshHint}`,
+            message: `Bridge connection closed. Retrying ${endpoint.targetUrl} in 5 seconds. Failure count: ${this.consecutiveConnectionFailures}.${retryHint}`,
             lastFileName: null,
             targetUrl: endpoint.targetUrl
           });
@@ -903,9 +911,24 @@ var require_offscreen = __commonJS({
         });
       }
       async resolveEndpoint(settings, settingsChanged) {
-        const shouldRefreshResolver = settingsChanged || this.resolvedEndpoint === null || Boolean(settings.websocketResolverUrl);
-        if (!shouldRefreshResolver && this.resolvedEndpoint) {
-          return this.resolvedEndpoint;
+        const hasResolver = Boolean(settings.websocketResolverUrl);
+        if (!hasResolver) {
+          return {
+            targetUrl: settings.websocketUrl,
+            source: "direct",
+            resolverUrl: null
+          };
+        }
+        if (settingsChanged) {
+          this.nextEndpointSource = "resolver";
+          this.localRetryAttemptsSinceResolverFailure = 0;
+        }
+        if (this.nextEndpointSource === "direct") {
+          return {
+            targetUrl: settings.websocketUrl,
+            source: "direct",
+            resolverUrl: null
+          };
         }
         try {
           const endpoint = await resolveBridgeEndpoint(settings.websocketUrl, settings.websocketResolverUrl);
@@ -923,7 +946,9 @@ var require_offscreen = __commonJS({
         } catch (error) {
           const messageText = error instanceof Error ? error.message : "Unknown resolver failure.";
           debugWarn("offscreen", "Resolver failed; using fallback endpoint.", messageText);
-          const fallbackEndpoint = this.resolvedEndpoint ?? {
+          this.nextEndpointSource = "direct";
+          this.localRetryAttemptsSinceResolverFailure = 0;
+          const fallbackEndpoint = {
             targetUrl: settings.websocketUrl,
             source: "direct",
             resolverUrl: null
@@ -938,11 +963,37 @@ var require_offscreen = __commonJS({
           return fallbackEndpoint;
         }
       }
+      recordFailedAttempt(source) {
+        if (source === "resolver") {
+          this.nextEndpointSource = "direct";
+          this.localRetryAttemptsSinceResolverFailure = 0;
+          return;
+        }
+        this.localRetryAttemptsSinceResolverFailure += 1;
+        if (this.localRetryAttemptsSinceResolverFailure >= BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD) {
+          this.nextEndpointSource = "resolver";
+          this.localRetryAttemptsSinceResolverFailure = 0;
+          return;
+        }
+        this.nextEndpointSource = "direct";
+      }
+      buildReconnectHint() {
+        if (!this.currentSettings?.websocketResolverUrl) {
+          return "";
+        }
+        if (this.nextEndpointSource === "resolver") {
+          return " Next attempt will refresh the Pastebin resolver target.";
+        }
+        const remainingLocalAttempts = BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD - this.localRetryAttemptsSinceResolverFailure;
+        return ` Next attempt will retry localhost. ${remainingLocalAttempts} local attempt${remainingLocalAttempts === 1 ? "" : "s"} remain before the resolver is checked again.`;
+      }
       invalidateResolvedEndpoint() {
         debugLog("offscreen", "Invalidating resolved endpoint cache.");
         this.resolvedEndpoint = null;
         this.resolvedTargetUrl = null;
         this.consecutiveConnectionFailures = 0;
+        this.nextEndpointSource = "resolver";
+        this.localRetryAttemptsSinceResolverFailure = 0;
       }
       disposeActiveSocket() {
         if (!this.socket) {
