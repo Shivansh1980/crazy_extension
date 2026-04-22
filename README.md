@@ -23,9 +23,9 @@ The browser APIs and GUI concerns stay behind focused abstractions so capture qu
 ## Capture flow
 
 1. Start the Python GUI server.
-2. The extension offscreen document connects to `ws://127.0.0.1:8765` by default and keeps retrying every 5 seconds if the server is unavailable.
-	If a resolver URL is configured, it fetches the latest tunnel endpoint once and keeps retrying that cached target.
-	After 10 consecutive connection failures, it fetches the resolver again to detect a rotated ngrok URL and then continues with the updated target if it changed.
+2. The extension offscreen document checks the configured Pastebin resolver first and tries the latest resolved tunnel endpoint before anything else.
+	If that resolver lookup or tunnel connection fails, it falls back to `ws://127.0.0.1:8765` and retries localhost every 5 seconds.
+	After 10 consecutive localhost connection failures, it checks the resolver again to detect a rotated ngrok URL, then repeats the same resolver-first fallback cycle.
 3. The user clicks **Capture screenshot** in the Python GUI.
 4. The Python server sends a WebSocket request to the extension.
 5. The extension captures the active page with `chrome.debugger` and `Page.captureScreenshot` using `captureBeyondViewport`.
@@ -93,7 +93,7 @@ build_extension.bat
 ## Runtime behavior
 
 - The extension keeps a persistent offscreen WebSocket client and retries every 5 seconds if the Python server restarts or the tunnel changes.
-- The extension caches the last resolved ngrok target, retries it every 5 seconds, and refreshes the resolver only after 10 consecutive failures or when settings change.
+- The extension uses a resolver-first reconnect strategy: it checks Pastebin first, falls back to localhost for up to 10 attempts if that fails, then checks Pastebin again.
 - The Python server uses WebSocket heartbeats and request timeouts so failures surface cleanly instead of hanging forever.
 - Restricted browser pages such as `chrome://` are skipped.
 - Captures are saved into an `images` directory under the directory where the Python GUI process is started.

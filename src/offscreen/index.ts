@@ -8,6 +8,7 @@ import { resolveBridgeEndpoint, type ResolvedBridgeEndpoint } from '../shared/br
 import {
   BRIDGE_CLIENT_NAME,
   BRIDGE_RECONNECT_INTERVAL_MS,
+  BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD,
   SETTINGS_STORAGE_KEY
 } from '../shared/constants';
 
@@ -112,6 +113,8 @@ class ExtensionBridgeClient {
   private resolvedTargetUrl: string | null = null;
   private resolvedEndpoint: ResolvedBridgeEndpoint | null = null;
   private consecutiveConnectionFailures = 0;
+  private nextEndpointSource: ResolvedBridgeEndpoint['source'] = 'resolver';
+  private localRetryAttemptsSinceResolverFailure = 0;
   private startPromise: Promise<void> | null = null;
   private hasConnectedOnce = false;
   private pendingBridgeMessages: QueuedBridgeMessage[] = [];
@@ -202,6 +205,8 @@ class ExtensionBridgeClient {
       }
 
       this.consecutiveConnectionFailures = 0;
+      this.nextEndpointSource = 'resolver';
+      this.localRetryAttemptsSinceResolverFailure = 0;
       this.hasConnectedOnce = true;
       debugLog('offscreen', 'running...');
       debugLog('offscreen', 'WebSocket connection opened.', endpoint.targetUrl);
@@ -249,13 +254,16 @@ class ExtensionBridgeClient {
 
       this.socket = null;
       this.consecutiveConnectionFailures += 1;
+      this.recordFailedAttempt(endpoint.source);
       const closeDetails = {
         targetUrl: endpoint.targetUrl,
         code: event.code,
         reason: event.reason || null,
         wasClean: event.wasClean,
         previouslyConnected: this.hasConnectedOnce,
-        consecutiveConnectionFailures: this.consecutiveConnectionFailures
+        consecutiveConnectionFailures: this.consecutiveConnectionFailures,
+        nextEndpointSource: this.nextEndpointSource,
+        localRetryAttemptsSinceResolverFailure: this.localRetryAttemptsSinceResolverFailure
       };
 
       if (this.hasConnectedOnce && event.code !== 1000) {
@@ -264,14 +272,12 @@ class ExtensionBridgeClient {
         debugLog('offscreen', 'WebSocket connection closed; reconnect will be attempted.', closeDetails);
       }
 
-      const refreshHint = this.currentSettings?.websocketResolverUrl
-        ? ' Refreshing the resolver URL on the next attempt.'
-        : '';
+      const retryHint = this.buildReconnectHint();
 
       void this.updateStatus({
         state: 'disconnected',
         updatedAt: new Date().toISOString(),
-        message: `Bridge connection closed. Retrying ${endpoint.targetUrl} in 5 seconds. Failure count: ${this.consecutiveConnectionFailures}.${refreshHint}`,
+        message: `Bridge connection closed. Retrying ${endpoint.targetUrl} in 5 seconds. Failure count: ${this.consecutiveConnectionFailures}.${retryHint}`,
         lastFileName: null,
         targetUrl: endpoint.targetUrl
       });
@@ -849,13 +855,27 @@ class ExtensionBridgeClient {
   }
 
   private async resolveEndpoint(settings: ExtensionSettings, settingsChanged: boolean): Promise<ResolvedBridgeEndpoint> {
-    const shouldRefreshResolver =
-      settingsChanged ||
-      this.resolvedEndpoint === null ||
-      Boolean(settings.websocketResolverUrl);
+    const hasResolver = Boolean(settings.websocketResolverUrl);
 
-    if (!shouldRefreshResolver && this.resolvedEndpoint) {
-      return this.resolvedEndpoint;
+    if (!hasResolver) {
+      return {
+        targetUrl: settings.websocketUrl,
+        source: 'direct',
+        resolverUrl: null
+      };
+    }
+
+    if (settingsChanged) {
+      this.nextEndpointSource = 'resolver';
+      this.localRetryAttemptsSinceResolverFailure = 0;
+    }
+
+    if (this.nextEndpointSource === 'direct') {
+      return {
+        targetUrl: settings.websocketUrl,
+        source: 'direct',
+        resolverUrl: null
+      };
     }
 
     try {
@@ -876,7 +896,9 @@ class ExtensionBridgeClient {
     } catch (error) {
       const messageText = error instanceof Error ? error.message : 'Unknown resolver failure.';
       debugWarn('offscreen', 'Resolver failed; using fallback endpoint.', messageText);
-      const fallbackEndpoint = this.resolvedEndpoint ?? {
+      this.nextEndpointSource = 'direct';
+      this.localRetryAttemptsSinceResolverFailure = 0;
+      const fallbackEndpoint = {
         targetUrl: settings.websocketUrl,
         source: 'direct' as const,
         resolverUrl: null
@@ -894,11 +916,43 @@ class ExtensionBridgeClient {
     }
   }
 
+  private recordFailedAttempt(source: ResolvedBridgeEndpoint['source']): void {
+    if (source === 'resolver') {
+      this.nextEndpointSource = 'direct';
+      this.localRetryAttemptsSinceResolverFailure = 0;
+      return;
+    }
+
+    this.localRetryAttemptsSinceResolverFailure += 1;
+    if (this.localRetryAttemptsSinceResolverFailure >= BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD) {
+      this.nextEndpointSource = 'resolver';
+      this.localRetryAttemptsSinceResolverFailure = 0;
+      return;
+    }
+
+    this.nextEndpointSource = 'direct';
+  }
+
+  private buildReconnectHint(): string {
+    if (!this.currentSettings?.websocketResolverUrl) {
+      return '';
+    }
+
+    if (this.nextEndpointSource === 'resolver') {
+      return ' Next attempt will refresh the Pastebin resolver target.';
+    }
+
+    const remainingLocalAttempts = BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD - this.localRetryAttemptsSinceResolverFailure;
+    return ` Next attempt will retry localhost. ${remainingLocalAttempts} local attempt${remainingLocalAttempts === 1 ? '' : 's'} remain before the resolver is checked again.`;
+  }
+
   private invalidateResolvedEndpoint(): void {
     debugLog('offscreen', 'Invalidating resolved endpoint cache.');
     this.resolvedEndpoint = null;
     this.resolvedTargetUrl = null;
     this.consecutiveConnectionFailures = 0;
+    this.nextEndpointSource = 'resolver';
+    this.localRetryAttemptsSinceResolverFailure = 0;
   }
 
   private disposeActiveSocket(): void {
