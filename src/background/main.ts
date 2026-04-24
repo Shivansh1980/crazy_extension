@@ -2,34 +2,37 @@ import { CaptureCycleService } from '../application/services/CaptureCycleService
 import type { BrowserTab } from '../domain/models/BrowserTab';
 import { BridgeLifecycleService } from '../application/services/BridgeLifecycleService';
 import { BLOCKED_PROTOCOL_PREFIXES, SETTINGS_STORAGE_KEY } from '../shared/constants';
+import { getUnsupportedCapabilitiesSummary } from '../shared/browserCapabilities';
 import { ChromeActiveTabGateway } from '../infrastructure/browser/ChromeActiveTabGateway';
 import { ChromeClipboardAccessGateway } from '../infrastructure/browser/ChromeClipboardAccessGateway';
-import { ChromeDebuggerClient } from '../infrastructure/browser/ChromeDebuggerClient';
-import { ChromeFullPageCaptureGateway } from '../infrastructure/browser/ChromeFullPageCaptureGateway';
-import { ChromeOffscreenBridgeRuntime } from '../infrastructure/browser/ChromeOffscreenBridgeRuntime';
 import { ChromePagePopupGateway, type PagePopupStatus } from '../infrastructure/browser/ChromePagePopupGateway';
+import { ChromeScreenShareGateway, type ScreenShareStatus } from '../infrastructure/browser/ChromeScreenShareGateway';
+import { createBrowserPlatformAdapters } from '../infrastructure/browser/createBrowserPlatformAdapters';
 import { ChromeRunStatusRepository } from '../infrastructure/storage/ChromeRunStatusRepository';
 import { ChromeSettingsRepository } from '../infrastructure/storage/ChromeSettingsRepository';
 import { debugError, debugLog } from '../shared/debug';
 
+const browserPlatform = createBrowserPlatformAdapters();
 const activeTabGateway = new ChromeActiveTabGateway();
 const settingsRepository = new ChromeSettingsRepository();
 const runStatusRepository = new ChromeRunStatusRepository();
 const captureCycleService = new CaptureCycleService(
   settingsRepository,
   activeTabGateway,
-  new ChromeFullPageCaptureGateway(new ChromeDebuggerClient()),
+  browserPlatform.fullPageCaptureGateway,
   runStatusRepository
 );
-const bridgeLifecycleService = new BridgeLifecycleService(settingsRepository, new ChromeOffscreenBridgeRuntime());
+const bridgeLifecycleService = new BridgeLifecycleService(settingsRepository, browserPlatform.bridgeRuntime);
 const clipboardAccessGateway = new ChromeClipboardAccessGateway();
 const pagePopupGateway = new ChromePagePopupGateway();
+const screenShareGateway = new ChromeScreenShareGateway();
 const recentPopupMessages: Array<{
   text: string;
   pageUrl: string | null;
   tabId: number | null;
   sentAt: string;
 }> = [];
+const SCREEN_SHARE_STOP_OVERLAY_ID = 'page-signal-screen-share-stop';
 let latestPopupStatus: PagePopupStatus = {
   exists: false,
   state: 'closed',
@@ -38,6 +41,18 @@ let latestPopupStatus: PagePopupStatus = {
   updatedAt: new Date().toISOString(),
   textLength: 0
 };
+let latestScreenShareStatus: ScreenShareStatus = screenShareGateway.getStatus();
+let latestScreenShareOverlayTabId: number | null = null;
+
+debugLog('background', 'Detected browser capabilities.', {
+  browser: browserPlatform.browserIdentity,
+  capabilities: browserPlatform.capabilities,
+});
+
+const unsupportedCapabilities = getUnsupportedCapabilitiesSummary();
+if (unsupportedCapabilities.length > 0) {
+  debugError('background', 'Some browser capabilities are unavailable. Related features will degrade gracefully.', unsupportedCapabilities);
+}
 
 async function runCaptureCycle() {
   debugLog('background', 'Running capture cycle.');
@@ -113,6 +128,33 @@ async function showPagePopup(text: string) {
   return result;
 }
 
+async function startScreenShare() {
+  const result = await screenShareGateway.start();
+  latestScreenShareStatus = result;
+  notifyScreenShareStatusChanged(result);
+  return result;
+}
+
+async function requestScreenShareStop() {
+  const response = await new Promise<{ ok?: boolean; message?: string }>((resolve) => {
+    chrome.runtime.sendMessage({ type: 'screen-share-force-stop' }, (result) => {
+      const runtimeError = chrome.runtime.lastError;
+      if (runtimeError) {
+        resolve({ ok: false, message: runtimeError.message });
+        return;
+      }
+
+      resolve((result ?? { ok: true }) as { ok?: boolean; message?: string });
+    });
+  });
+
+  if (response.ok === false) {
+    throw new Error(response.message || 'Screen share stop request failed.');
+  }
+
+  return latestScreenShareStatus;
+}
+
 async function closePagePopup() {
   const tab = await activeTabGateway.getActiveCapturableTab();
   if (!tab) {
@@ -167,6 +209,10 @@ function notifyPopupStatusChanged(status: PagePopupStatus): void {
   void chrome.runtime.sendMessage({ type: 'popup-status-changed', status }).catch(() => undefined);
 }
 
+function notifyScreenShareStatusChanged(status: ScreenShareStatus): void {
+  void chrome.runtime.sendMessage({ type: 'screen-share-status-changed', status }).catch(() => undefined);
+}
+
 function notifyPopupMessage(payload: {
   text: string;
   pageUrl: string | null;
@@ -186,6 +232,77 @@ function recordPopupMessage(payload: {
   if (recentPopupMessages.length > 2) {
     recentPopupMessages.length = 2;
   }
+}
+
+async function syncScreenShareClientControls(status: ScreenShareStatus): Promise<void> {
+  if (status.active) {
+    const tab = await activeTabGateway.getActiveCapturableTab();
+    if (!tab) {
+      return;
+    }
+
+    latestScreenShareOverlayTabId = tab.id;
+    await injectScreenShareStopOverlay(tab.id);
+    return;
+  }
+
+  if (latestScreenShareOverlayTabId !== null) {
+    await removeScreenShareStopOverlay(latestScreenShareOverlayTabId);
+    latestScreenShareOverlayTabId = null;
+  }
+}
+
+async function injectScreenShareStopOverlay(tabId: number): Promise<void> {
+  if (!chrome.scripting?.executeScript) {
+    return;
+  }
+
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (overlayId: string) => {
+      const existing = document.getElementById(overlayId);
+      if (existing) {
+        return;
+      }
+
+      const button = document.createElement('button');
+      button.id = overlayId;
+      button.type = 'button';
+      button.textContent = 'Stop Sharing';
+      button.style.position = 'fixed';
+      button.style.top = '14px';
+      button.style.right = '14px';
+      button.style.zIndex = '2147483647';
+      button.style.border = '1px solid rgba(15, 23, 42, 0.18)';
+      button.style.borderRadius = '999px';
+      button.style.padding = '10px 16px';
+      button.style.background = 'linear-gradient(135deg, #dc2626, #ef4444)';
+      button.style.color = '#fff';
+      button.style.font = '600 13px Segoe UI, system-ui, sans-serif';
+      button.style.boxShadow = '0 18px 32px rgba(15, 23, 42, 0.28)';
+      button.style.cursor = 'pointer';
+      button.style.pointerEvents = 'auto';
+      button.addEventListener('click', () => {
+        void chrome.runtime.sendMessage({ type: 'screen-share-stop-request' }).catch(() => undefined);
+      });
+      document.documentElement.appendChild(button);
+    },
+    args: [SCREEN_SHARE_STOP_OVERLAY_ID],
+  });
+}
+
+async function removeScreenShareStopOverlay(tabId: number): Promise<void> {
+  if (!chrome.scripting?.executeScript) {
+    return;
+  }
+
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (overlayId: string) => {
+      document.getElementById(overlayId)?.remove();
+    },
+    args: [SCREEN_SHARE_STOP_OVERLAY_ID],
+  }).catch(() => undefined);
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -226,6 +343,16 @@ chrome.tabs?.onUpdated?.addListener((tabId, changeInfo, tab) => {
   }
 
   void enableClipboardAccessForTab(browserTab, 'tab-updated');
+});
+
+chrome.windows?.onRemoved?.addListener((windowId) => {
+  const status = screenShareGateway.handleViewerWindowRemoved(windowId);
+  if (!status) {
+    return;
+  }
+
+  latestScreenShareStatus = status;
+  notifyScreenShareStatusChanged(status);
 });
 
 chrome.commands?.onCommand.addListener((command) => {
@@ -327,6 +454,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === 'bridge-screen-share-start') {
+    void startScreenShare()
+      .then((status) => sendResponse({ ok: true, status }))
+      .catch((error) => {
+        const messageText = error instanceof Error ? error.message : 'Screen share start failed.';
+        debugError('background', 'Bridge screen share request failed.', messageText);
+        sendResponse({ ok: false, message: messageText, status: latestScreenShareStatus });
+      });
+    return true;
+  }
+
+  if (message?.type === 'bridge-screen-share-stop') {
+    void requestScreenShareStop()
+      .then((status) => sendResponse({ ok: true, status }))
+      .catch((error) => {
+        const messageText = error instanceof Error ? error.message : 'Screen share stop failed.';
+        debugError('background', 'Bridge screen share stop request failed.', messageText);
+        sendResponse({ ok: false, message: messageText, status: latestScreenShareStatus });
+      });
+    return true;
+  }
+
   if (message?.type === 'popup-status-get') {
     void readPopupStatus()
       .then((status) => sendResponse({ ok: true, status }))
@@ -376,6 +525,60 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     recordPopupMessage(payload);
     notifyPopupMessage(payload);
     sendResponse({ ok: true });
+    return true;
+  }
+
+  if (message?.type === 'screen-share-status-get') {
+    sendResponse({ ok: true, status: latestScreenShareStatus });
+    return true;
+  }
+
+  if (message?.type === 'screen-share-viewer-ready') {
+    sendResponse({ ok: true, status: latestScreenShareStatus });
+    return true;
+  }
+
+  if (message?.type === 'screen-share-stream-endpoint-get') {
+    void (async () => {
+      try {
+        const runStatus = await runStatusRepository.get();
+        sendResponse({ ok: true, targetUrl: runStatus.targetUrl });
+      } catch (error) {
+        const messageText = error instanceof Error ? error.message : 'Screen share stream endpoint lookup failed.';
+        debugError('background', 'Screen share stream endpoint lookup failed.', messageText);
+        sendResponse({ ok: false, message: messageText });
+      }
+    })();
+    return true;
+  }
+
+  if (message?.type === 'screen-share-viewer-status') {
+    latestScreenShareStatus = screenShareGateway.updateStatus({
+      state:
+        message.status?.state === 'idle' ||
+        message.status?.state === 'launching' ||
+        message.status?.state === 'active' ||
+        message.status?.state === 'ended' ||
+        message.status?.state === 'error'
+          ? message.status.state
+          : 'error',
+      active: Boolean(message.status?.active),
+      viewerWindowId: typeof message.status?.viewerWindowId === 'number' ? message.status.viewerWindowId : latestScreenShareStatus.viewerWindowId,
+      sourceLabel: typeof message.status?.sourceLabel === 'string' ? message.status.sourceLabel : null,
+      updatedAt: typeof message.status?.updatedAt === 'string' ? message.status.updatedAt : new Date().toISOString(),
+      message: typeof message.status?.message === 'string' ? message.status.message : 'Screen share status updated.'
+    });
+    void syncScreenShareClientControls(latestScreenShareStatus);
+    notifyScreenShareStatusChanged(latestScreenShareStatus);
+    sendResponse({ ok: true, status: latestScreenShareStatus });
+    return true;
+  }
+
+  if (message?.type === 'screen-share-stop-request') {
+    void requestScreenShareStop().catch((error) => {
+      debugError('background', 'Screen share stop request from page failed.', error);
+    });
+    sendResponse({ ok: true, status: latestScreenShareStatus });
     return true;
   }
 

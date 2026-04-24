@@ -96,6 +96,8 @@ build_extension.bat
 
 - The extension keeps a persistent offscreen WebSocket client and retries every 5 seconds if the Python server restarts or the tunnel changes.
 - The extension uses a resolver-first reconnect strategy: it checks Pastebin first, then the GitHub raw fallback, then localhost for up to 10 attempts, and repeats that cycle until a bridge endpoint comes back.
+- Browser support is capability-based: Chrome, Edge, and Brave share the same Chromium path when the required APIs exist, and unsupported features degrade independently instead of taking down the whole extension.
+- Full-page screenshot capture remains debugger-based; if a browser does not expose the required debugger APIs, popup, clipboard, and bridge features continue to work while capture reports that it is unavailable.
 - The Python server uses WebSocket heartbeats and request timeouts so failures surface cleanly instead of hanging forever.
 - Restricted browser pages such as `chrome://` are skipped.
 - Captures are saved into an `images` directory under the directory where the Python GUI process is started.

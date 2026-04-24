@@ -13,6 +13,7 @@ async function ensureStaticAssets() {
   await cp(path.join(projectRoot, 'src', 'manifest.json'), path.join(distDirectory, 'manifest.json'));
   await cp(path.join(projectRoot, 'src', 'options', 'index.html'), path.join(distDirectory, 'options.html'));
   await cp(path.join(projectRoot, 'src', 'offscreen', 'index.html'), path.join(distDirectory, 'offscreen.html'));
+  await cp(path.join(projectRoot, 'src', 'screen-share', 'index.html'), path.join(distDirectory, 'screen-share.html'));
 }
 
 async function runBuild() {
@@ -23,7 +24,8 @@ async function runBuild() {
     entryPoints: {
       background: path.join(projectRoot, 'src', 'background', 'main.ts'),
       options: path.join(projectRoot, 'src', 'options', 'index.ts'),
-      offscreen: path.join(projectRoot, 'src', 'offscreen', 'index.ts')
+      offscreen: path.join(projectRoot, 'src', 'offscreen', 'index.ts'),
+      'screen-share': path.join(projectRoot, 'src', 'screen-share', 'index.ts')
     },
     bundle: true,
     format: 'esm',

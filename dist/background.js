@@ -145,14 +145,77 @@ var init_constants = __esm({
   }
 });
 
+// src/shared/browserCapabilities.ts
+function getBrowserCapabilities() {
+  const chromeApi = globalThis.chrome;
+  return {
+    runtimeMessaging: Boolean(chromeApi?.runtime?.sendMessage),
+    offscreenDocument: Boolean(chromeApi?.offscreen?.createDocument),
+    debuggerApi: Boolean(chromeApi?.debugger?.attach && chromeApi?.debugger?.sendCommand),
+    scriptingApi: Boolean(chromeApi?.scripting?.executeScript),
+    tabsApi: Boolean(chromeApi?.tabs?.query),
+    commandsApi: Boolean(chromeApi?.commands?.onCommand),
+    clipboardWrite: Boolean(
+      typeof ClipboardItem !== "undefined" && navigator.clipboard?.write || navigator.clipboard?.writeText
+    )
+  };
+}
+function getBrowserIdentity() {
+  const userAgent = navigator.userAgent;
+  if (/Brave\//i.test(userAgent)) {
+    return { name: "Brave", engine: "chromium" };
+  }
+  if (/Edg\//i.test(userAgent)) {
+    return { name: "Microsoft Edge", engine: "chromium" };
+  }
+  if (/Chrome\//i.test(userAgent)) {
+    return { name: "Google Chrome", engine: "chromium" };
+  }
+  return {
+    name: "This browser",
+    engine: "unknown"
+  };
+}
+function getUnsupportedCapabilitiesSummary() {
+  const capabilities = getBrowserCapabilities();
+  const unsupported = [];
+  if (!capabilities.runtimeMessaging) {
+    unsupported.push("runtime messaging");
+  }
+  if (!capabilities.offscreenDocument) {
+    unsupported.push("offscreen documents");
+  }
+  if (!capabilities.debuggerApi) {
+    unsupported.push("debugger API");
+  }
+  if (!capabilities.scriptingApi) {
+    unsupported.push("scripting API");
+  }
+  if (!capabilities.tabsApi) {
+    unsupported.push("tabs API");
+  }
+  return unsupported;
+}
+var init_browserCapabilities = __esm({
+  "src/shared/browserCapabilities.ts"() {
+    "use strict";
+  }
+});
+
 // src/infrastructure/browser/ChromeActiveTabGateway.ts
 var ChromeActiveTabGateway;
 var init_ChromeActiveTabGateway = __esm({
   "src/infrastructure/browser/ChromeActiveTabGateway.ts"() {
     "use strict";
+    init_browserCapabilities();
     init_constants();
+    init_errors();
     ChromeActiveTabGateway = class {
       async getActiveCapturableTab() {
+        const capabilities = getBrowserCapabilities();
+        if (!capabilities.tabsApi) {
+          throw new ExtensionError("This browser does not support the tabs API required to inspect the active page.");
+        }
         const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
         if (!tab?.id || !tab.url || this.isBlockedUrl(tab.url)) {
           return null;
@@ -434,8 +497,14 @@ var ChromeClipboardAccessGateway;
 var init_ChromeClipboardAccessGateway = __esm({
   "src/infrastructure/browser/ChromeClipboardAccessGateway.ts"() {
     "use strict";
+    init_browserCapabilities();
+    init_errors();
     ChromeClipboardAccessGateway = class {
       async enable(tab) {
+        const capabilities = getBrowserCapabilities();
+        if (!capabilities.scriptingApi) {
+          throw new ExtensionError("This browser does not support script injection required for page copy and paste enablement.");
+        }
         const results = await chrome.scripting.executeScript({
           target: { tabId: tab.id, allFrames: true },
           world: "MAIN",
@@ -467,190 +536,14 @@ var init_ChromeClipboardAccessGateway = __esm({
   }
 });
 
-// src/infrastructure/browser/ChromeDebuggerClient.ts
-var ChromeDebuggerClient;
-var init_ChromeDebuggerClient = __esm({
-  "src/infrastructure/browser/ChromeDebuggerClient.ts"() {
-    "use strict";
-    init_errors();
-    ChromeDebuggerClient = class {
-      async attach(debuggee) {
-        await this.promisify((callback) => chrome.debugger.attach(debuggee, "1.3", callback));
-      }
-      async detach(debuggee) {
-        try {
-          await this.promisify((callback) => chrome.debugger.detach(debuggee, callback));
-        } catch (error) {
-          const message = error instanceof Error ? error.message : "";
-          if (!message.includes("Detached while handling command")) {
-            throw error;
-          }
-        }
-      }
-      async sendCommand(debuggee, method, commandParams) {
-        return new Promise((resolve, reject) => {
-          chrome.debugger.sendCommand(debuggee, method, commandParams, (result) => {
-            const runtimeError = chrome.runtime.lastError;
-            if (runtimeError) {
-              reject(new ExtensionError(runtimeError.message ?? "Unknown Chrome runtime error."));
-              return;
-            }
-            resolve(result);
-          });
-        });
-      }
-      promisify(executor) {
-        return new Promise((resolve, reject) => {
-          executor((value) => {
-            const runtimeError = chrome.runtime.lastError;
-            if (runtimeError) {
-              reject(new ExtensionError(runtimeError.message ?? "Unknown Chrome runtime error."));
-              return;
-            }
-            resolve(value);
-          });
-        });
-      }
-    };
-  }
-});
-
-// src/shared/fileName.ts
-function buildCaptureFileName(prefix, capturedAt) {
-  const timestamp = capturedAt.replace(/[:.]/g, "-");
-  return `${prefix}-${timestamp}.png`;
-}
-var init_fileName = __esm({
-  "src/shared/fileName.ts"() {
-    "use strict";
-  }
-});
-
-// src/infrastructure/browser/ChromeFullPageCaptureGateway.ts
-var ChromeFullPageCaptureGateway;
-var init_ChromeFullPageCaptureGateway = __esm({
-  "src/infrastructure/browser/ChromeFullPageCaptureGateway.ts"() {
-    "use strict";
-    init_constants();
-    init_errors();
-    init_fileName();
-    ChromeFullPageCaptureGateway = class {
-      constructor(debuggerClient) {
-        this.debuggerClient = debuggerClient;
-      }
-      debuggerClient;
-      async capture(tab, settings) {
-        const debuggee = { tabId: tab.id };
-        await this.debuggerClient.attach(debuggee);
-        try {
-          await this.debuggerClient.sendCommand(debuggee, "Page.enable");
-          const layoutMetrics = await this.debuggerClient.sendCommand(debuggee, "Page.getLayoutMetrics");
-          const devicePixelRatio = await this.readDevicePixelRatio(tab.id);
-          const widthCssPx = Math.max(1, Math.ceil(layoutMetrics.contentSize.width));
-          const heightCssPx = Math.max(1, Math.ceil(layoutMetrics.contentSize.height));
-          const scale = this.computeCaptureScale(widthCssPx, heightCssPx, devicePixelRatio);
-          const result = await this.debuggerClient.sendCommand(debuggee, "Page.captureScreenshot", {
-            format: "png",
-            fromSurface: true,
-            captureBeyondViewport: true,
-            optimizeForSpeed: true,
-            clip: {
-              x: 0,
-              y: 0,
-              width: widthCssPx,
-              height: heightCssPx,
-              scale
-            }
-          });
-          const capturedAt = (/* @__PURE__ */ new Date()).toISOString();
-          return {
-            tab,
-            base64Data: result.data,
-            mimeType: "image/png",
-            fileName: buildCaptureFileName(settings.fileNamePrefix, capturedAt),
-            capturedAt,
-            widthCssPx,
-            heightCssPx,
-            scale
-          };
-        } catch (error) {
-          const message = error instanceof Error ? error.message : "Unknown screenshot failure.";
-          throw new ExtensionError(`Full-page capture failed: ${message}`);
-        } finally {
-          await this.debuggerClient.detach(debuggee).catch(() => void 0);
-        }
-      }
-      async readDevicePixelRatio(tabId) {
-        const results = await chrome.scripting.executeScript({
-          target: { tabId },
-          func: () => window.devicePixelRatio || 1
-        });
-        const firstResult = results[0]?.result;
-        return typeof firstResult === "number" && Number.isFinite(firstResult) ? firstResult : 1;
-      }
-      computeCaptureScale(widthCssPx, heightCssPx, devicePixelRatio) {
-        const cappedDeviceScale = Math.max(1, devicePixelRatio);
-        const dimensionScale = Math.min(MAX_CAPTURE_DIMENSION / widthCssPx, MAX_CAPTURE_DIMENSION / heightCssPx, cappedDeviceScale);
-        const areaScale = Math.sqrt(MAX_CAPTURE_AREA / (widthCssPx * heightCssPx));
-        const scale = Math.min(cappedDeviceScale, dimensionScale, areaScale);
-        if (!Number.isFinite(scale) || scale <= 0) {
-          throw new ExtensionError("Computed capture scale is invalid for the current page size.");
-        }
-        return Number(scale.toFixed(2));
-      }
-    };
-  }
-});
-
-// src/infrastructure/browser/ChromeOffscreenBridgeRuntime.ts
-var ChromeOffscreenBridgeRuntime;
-var init_ChromeOffscreenBridgeRuntime = __esm({
-  "src/infrastructure/browser/ChromeOffscreenBridgeRuntime.ts"() {
-    "use strict";
-    init_constants();
-    init_errors();
-    ChromeOffscreenBridgeRuntime = class {
-      creatingDocumentPromise = null;
-      async ensureStarted() {
-        if (this.creatingDocumentPromise) {
-          await this.creatingDocumentPromise;
-          return;
-        }
-        this.creatingDocumentPromise = this.createDocument();
-        try {
-          await this.creatingDocumentPromise;
-        } finally {
-          this.creatingDocumentPromise = null;
-        }
-      }
-      async reconnect() {
-        await chrome.runtime.sendMessage({ type: "bridge-start" }).catch(() => void 0);
-        await chrome.runtime.sendMessage({ type: "bridge-reconnect" }).catch(() => void 0);
-      }
-      async createDocument() {
-        try {
-          await chrome.offscreen.createDocument({
-            url: OFFSCREEN_DOCUMENT_PATH,
-            reasons: [chrome.offscreen.Reason.BLOBS, chrome.offscreen.Reason.CLIPBOARD],
-            justification: "Maintain a resilient local WebSocket bridge for desktop-driven screenshot capture and clipboard sync."
-          });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : "";
-          if (!message.includes("Only a single offscreen document may be created")) {
-            throw new ExtensionError(message || "Unable to create the offscreen bridge document.");
-          }
-        }
-      }
-    };
-  }
-});
-
 // src/infrastructure/browser/ChromePagePopupGateway.ts
 function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
   const popupHostId = "page-signal-capture-popup-host";
   const minimizedSizePx = 40;
-  const defaultSizePx = 200;
-  const minimumSizePx = 160;
+  const defaultWidthPx = 280;
+  const defaultHeightPx = 220;
+  const minimumWidthPx = 220;
+  const minimumHeightPx = 180;
   const defaultOpacity = 0.5;
   function updateMeta(textArea2, meta2) {
     const lineCount = textArea2.value.length === 0 ? 0 : textArea2.value.split(/\r\n|\r|\n/).length;
@@ -661,6 +554,86 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
       void chrome.runtime.sendMessage(message).catch(() => void 0);
     } catch {
     }
+  }
+  function clamp(value, minimum, maximum) {
+    return Math.min(Math.max(value, minimum), maximum);
+  }
+  function parseColor(value, fallback) {
+    const probe = document.createElement("span");
+    probe.style.color = fallback;
+    probe.style.color = value;
+    const normalized = probe.style.color || fallback;
+    const match = normalized.match(/\d+/g);
+    if (!match || match.length < 3) {
+      return parseColor(fallback, "rgb(255, 255, 255)");
+    }
+    const [red = 255, green = 255, blue = 255] = match.slice(0, 3).map((part) => clamp(Number.parseInt(part, 10), 0, 255));
+    return { red, green, blue };
+  }
+  function toRgb(color, alpha) {
+    return alpha === void 0 ? `rgb(${color.red}, ${color.green}, ${color.blue})` : `rgba(${color.red}, ${color.green}, ${color.blue}, ${alpha})`;
+  }
+  function mixColors(base, overlay, amount) {
+    const ratio = clamp(amount, 0, 1);
+    return {
+      red: Math.round(base.red + (overlay.red - base.red) * ratio),
+      green: Math.round(base.green + (overlay.green - base.green) * ratio),
+      blue: Math.round(base.blue + (overlay.blue - base.blue) * ratio)
+    };
+  }
+  function getLuminance(color) {
+    const transform = (channel) => {
+      const normalized = channel / 255;
+      return normalized <= 0.03928 ? normalized / 12.92 : ((normalized + 0.055) / 1.055) ** 2.4;
+    };
+    const red = transform(color.red);
+    const green = transform(color.green);
+    const blue = transform(color.blue);
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+  }
+  function getContrastRatio(first, second) {
+    const firstLuminance = getLuminance(first);
+    const secondLuminance = getLuminance(second);
+    const lighter = Math.max(firstLuminance, secondLuminance);
+    const darker = Math.min(firstLuminance, secondLuminance);
+    return (lighter + 0.05) / (darker + 0.05);
+  }
+  function chooseReadableText(background, preferred) {
+    if (getContrastRatio(background, preferred) >= 4.5) {
+      return preferred;
+    }
+    const black = { red: 17, green: 24, blue: 39 };
+    const white = { red: 248, green: 250, blue: 252 };
+    return getContrastRatio(background, black) >= getContrastRatio(background, white) ? black : white;
+  }
+  function applyTheme(host2) {
+    const pageStyles = getComputedStyle(document.body || document.documentElement);
+    const rootStyles = getComputedStyle(document.documentElement);
+    const pageBackground = parseColor(pageStyles.backgroundColor || rootStyles.backgroundColor || "rgb(255, 255, 255)", "rgb(255, 255, 255)");
+    const pageForeground = parseColor(pageStyles.color || rootStyles.color || "rgb(17, 24, 39)", "rgb(17, 24, 39)");
+    const pageAccent = parseColor(rootStyles.getPropertyValue("a") || pageStyles.color || "rgb(37, 99, 235)", "rgb(37, 99, 235)");
+    const darkPage = getLuminance(pageBackground) < 0.45;
+    const surface = darkPage ? mixColors(pageBackground, { red: 15, green: 23, blue: 42 }, 0.76) : mixColors(pageBackground, { red: 255, green: 255, blue: 255 }, 0.92);
+    const header = darkPage ? mixColors(surface, { red: 255, green: 255, blue: 255 }, 0.06) : mixColors(surface, { red: 15, green: 23, blue: 42 }, 0.04);
+    const editor = darkPage ? mixColors(surface, { red: 2, green: 6, blue: 23 }, 0.34) : mixColors(surface, { red: 248, green: 250, blue: 252 }, 0.72);
+    const foreground = chooseReadableText(surface, pageForeground);
+    const mutedForeground = mixColors(foreground, surface, darkPage ? 0.28 : 0.42);
+    const controlBackground = darkPage ? mixColors(surface, { red: 255, green: 255, blue: 255 }, 0.09) : mixColors(surface, { red: 15, green: 23, blue: 42 }, 0.08);
+    const border = darkPage ? mixColors(surface, { red: 148, green: 163, blue: 184 }, 0.32) : mixColors(surface, { red: 100, green: 116, blue: 139 }, 0.26);
+    const accent = chooseReadableText(header, pageAccent);
+    const accentSoft = darkPage ? mixColors(accent, { red: 96, green: 165, blue: 250 }, 0.28) : mixColors(accent, { red: 124, green: 58, blue: 237 }, 0.18);
+    const fontFamily = pageStyles.fontFamily || rootStyles.fontFamily || "'Segoe UI', system-ui, sans-serif";
+    host2.style.setProperty("--popup-surface", toRgb(surface, 0.96));
+    host2.style.setProperty("--popup-surface-strong", toRgb(header, 0.98));
+    host2.style.setProperty("--popup-editor", toRgb(editor, 0.98));
+    host2.style.setProperty("--popup-border", toRgb(border, darkPage ? 0.48 : 0.38));
+    host2.style.setProperty("--popup-foreground", toRgb(foreground));
+    host2.style.setProperty("--popup-muted", toRgb(mutedForeground));
+    host2.style.setProperty("--popup-control", toRgb(controlBackground, 0.94));
+    host2.style.setProperty("--popup-accent", toRgb(accent));
+    host2.style.setProperty("--popup-accent-soft", toRgb(accentSoft));
+    host2.style.setProperty("--popup-font-family", fontFamily);
+    host2.style.setProperty("--popup-shadow", darkPage ? "0 28px 70px rgba(2, 6, 23, 0.52)" : "0 24px 60px rgba(15, 23, 42, 0.22)");
   }
   async function copyTextToClipboard(text2) {
     if (typeof ClipboardItem !== "undefined" && navigator.clipboard?.write) {
@@ -769,9 +742,21 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
     };
   }
   function sendPopupStatus(host2, popupTabId, popupPageUrl, textLength) {
+    const status = buildPopupStatus(host2, popupTabId, popupPageUrl, textLength ?? getTextLength(host2));
+    const statusKey = JSON.stringify({
+      exists: status.exists,
+      state: status.state,
+      tabId: status.tabId,
+      pageUrl: status.pageUrl,
+      textLength: status.textLength
+    });
+    if (host2.dataset.lastStatusKey === statusKey) {
+      return;
+    }
+    host2.dataset.lastStatusKey = statusKey;
     sendRuntimeMessage2({
       type: "popup-status-update",
-      status: buildPopupStatus(host2, popupTabId, popupPageUrl, textLength ?? getTextLength(host2))
+      status
     });
   }
   function setPopupState(host2, state, detail) {
@@ -790,11 +775,10 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
   }
   function restorePopup(host2, shell) {
     host2.style.display = "block";
-    host2.style.width = `${defaultSizePx}px`;
-    host2.style.height = `${defaultSizePx}px`;
-    host2.style.minWidth = `${minimumSizePx}px`;
-    host2.style.minHeight = `${minimumSizePx}px`;
-    host2.style.resize = "both";
+    host2.style.width = `${defaultWidthPx}px`;
+    host2.style.height = `${defaultHeightPx}px`;
+    host2.style.minWidth = `${minimumWidthPx}px`;
+    host2.style.minHeight = `${minimumHeightPx}px`;
     shell.classList.remove("minimized");
     setPopupState(host2, "open");
   }
@@ -826,32 +810,50 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
       window.addEventListener("pointerup", stop, { once: true });
     });
   }
-  function isLightColor(color) {
-    const match = color.match(/\d+/g);
-    if (!match || match.length < 3) {
-      return true;
-    }
-    const [red = 255, green = 255, blue = 255] = match.slice(0, 3).map((value) => Number.parseInt(value, 10));
-    const luminance = (0.2126 * red + 0.7152 * green + 0.0722 * blue) / 255;
-    return luminance > 0.5;
-  }
-  function detectTheme() {
-    const styles = getComputedStyle(document.body || document.documentElement);
-    const backgroundColor = styles.backgroundColor || "rgb(255, 255, 255)";
-    const foreground = styles.color || "#111827";
-    const fontFamily = styles.fontFamily || "'Segoe UI', system-ui, sans-serif";
-    const light = isLightColor(backgroundColor);
-    return {
-      background: light ? "rgba(255, 255, 255, 0.88)" : "rgba(17, 24, 39, 0.88)",
-      headerBackground: light ? "rgba(255, 255, 255, 0.72)" : "rgba(31, 41, 55, 0.82)",
-      textareaBackground: light ? "rgba(248, 250, 252, 0.92)" : "rgba(17, 24, 39, 0.78)",
-      controlBackground: light ? "rgba(226, 232, 240, 0.9)" : "rgba(55, 65, 81, 0.92)",
-      border: light ? "rgba(148, 163, 184, 0.35)" : "rgba(148, 163, 184, 0.24)",
-      foreground,
-      accent: light ? "#2563eb" : "#38bdf8",
-      accentSoft: light ? "#7c3aed" : "#6366f1",
-      fontFamily
-    };
+  function attachResize(handle, host2, horizontalDirection, verticalDirection) {
+    handle.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const rect = host2.getBoundingClientRect();
+      const viewportWidth = window.innerWidth;
+      const viewportHeight = window.innerHeight;
+      const startLeft = rect.left;
+      const startTop = rect.top;
+      const startWidth = rect.width;
+      const startHeight = rect.height;
+      const originX = event.clientX;
+      const originY = event.clientY;
+      host2.style.left = `${startLeft}px`;
+      host2.style.top = `${startTop}px`;
+      host2.style.right = "auto";
+      host2.style.bottom = "auto";
+      const move = (moveEvent) => {
+        const deltaX = moveEvent.clientX - originX;
+        const deltaY = moveEvent.clientY - originY;
+        const nextWidth = clamp(
+          horizontalDirection === 1 ? startWidth + deltaX : startWidth - deltaX,
+          minimumWidthPx,
+          viewportWidth
+        );
+        const nextHeight = clamp(
+          verticalDirection === 1 ? startHeight + deltaY : startHeight - deltaY,
+          minimumHeightPx,
+          viewportHeight
+        );
+        const nextLeft = horizontalDirection === -1 ? clamp(startLeft + (startWidth - nextWidth), 0, viewportWidth - nextWidth) : clamp(startLeft, 0, viewportWidth - nextWidth);
+        const nextTop = verticalDirection === -1 ? clamp(startTop + (startHeight - nextHeight), 0, viewportHeight - nextHeight) : clamp(startTop, 0, viewportHeight - nextHeight);
+        host2.style.width = `${nextWidth}px`;
+        host2.style.height = `${nextHeight}px`;
+        host2.style.left = `${nextLeft}px`;
+        host2.style.top = `${nextTop}px`;
+      };
+      const stop = () => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", stop);
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", stop, { once: true });
+    });
   }
   function createPopupHost() {
     const host2 = document.createElement("div");
@@ -860,37 +862,36 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
     host2.style.position = "fixed";
     host2.style.top = "24px";
     host2.style.right = "24px";
-    host2.style.width = `${defaultSizePx}px`;
-    host2.style.height = `${defaultSizePx}px`;
-    host2.style.minWidth = `${minimumSizePx}px`;
-    host2.style.minHeight = `${minimumSizePx}px`;
+    host2.style.width = `${defaultWidthPx}px`;
+    host2.style.height = `${defaultHeightPx}px`;
+    host2.style.minWidth = `${minimumWidthPx}px`;
+    host2.style.minHeight = `${minimumHeightPx}px`;
     host2.style.zIndex = "2147483647";
-    host2.style.resize = "both";
-    host2.style.overflow = "hidden";
+    host2.style.overflow = "visible";
     host2.style.boxSizing = "border-box";
     host2.style.opacity = String(defaultOpacity);
     return host2;
   }
   function initializePopupDom(host2, shadowRoot2) {
-    const theme = detectTheme();
     shadowRoot2.innerHTML = `
       <style>
         :host {
           all: initial;
         }
         .shell {
+          position: relative;
           width: 100%;
           height: 100%;
           display: flex;
           flex-direction: column;
-          border-radius: 18px;
+          border-radius: 20px;
           overflow: hidden;
-          border: 1px solid ${theme.border};
-          background: ${theme.background};
-          color: ${theme.foreground};
-          box-shadow: 0 24px 60px rgba(0, 0, 0, 0.24);
+          border: 1px solid var(--popup-border);
+          background: var(--popup-surface);
+          color: var(--popup-foreground);
+          box-shadow: var(--popup-shadow);
           backdrop-filter: blur(18px);
-          font-family: ${theme.fontFamily};
+          font-family: var(--popup-font-family);
         }
         .shell.minimized {
           width: ${minimizedSizePx}px;
@@ -911,7 +912,7 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
           display: grid;
           place-items: center;
           border: none;
-          background: linear-gradient(135deg, ${theme.accent}, ${theme.accentSoft});
+          background: linear-gradient(135deg, var(--popup-accent), var(--popup-accent-soft));
           color: #fff;
           font: inherit;
           cursor: pointer;
@@ -921,106 +922,159 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
           display: flex;
           align-items: center;
           justify-content: space-between;
-          padding: 10px 12px;
-          gap: 8px;
-          background: ${theme.headerBackground};
-          border-bottom: 1px solid ${theme.border};
+          padding: 12px 14px;
+          gap: 12px;
+          background: var(--popup-surface-strong);
+          border-bottom: 1px solid var(--popup-border);
           cursor: move;
           user-select: none;
         }
         .title {
           display: flex;
           flex-direction: column;
-          gap: 2px;
+          gap: 3px;
           min-width: 0;
         }
         .title strong {
           font-size: 13px;
           font-weight: 700;
+          letter-spacing: 0.01em;
         }
         .title span {
           font-size: 11px;
-          opacity: 0.72;
+          color: var(--popup-muted);
         }
         .controls {
           display: flex;
-          gap: 5px;
+          gap: 6px;
         }
         button.control,
         button.copy,
         button.send {
-          border: none;
-          border-radius: 8px;
-          background: ${theme.controlBackground};
-          color: ${theme.foreground};
-          padding: 4px 8px;
+          border: 1px solid transparent;
+          border-radius: 10px;
+          background: var(--popup-control);
+          color: var(--popup-foreground);
+          padding: 6px 10px;
           font: inherit;
           font-size: 11px;
           line-height: 1.2;
           cursor: pointer;
+          transition: transform 120ms ease, filter 120ms ease, border-color 120ms ease;
+        }
+        button.send {
+          background: linear-gradient(135deg, var(--popup-accent), var(--popup-accent-soft));
+          color: #fff;
         }
         button.control:hover,
         button.copy:hover,
         button.send:hover,
         .launcher:hover {
-          filter: brightness(1.06);
+          filter: brightness(1.04);
+          transform: translateY(-1px);
+        }
+        button.control:focus-visible,
+        button.copy:focus-visible,
+        button.send:focus-visible,
+        textarea:focus-visible,
+        .resize-handle:focus-visible {
+          outline: 2px solid var(--popup-accent);
+          outline-offset: 1px;
         }
         .body {
           flex: 1;
           min-height: 0;
-          padding: 10px 12px 0;
+          padding: 12px 14px 0;
         }
         textarea {
           width: 100%;
           height: 100%;
           min-height: 0;
           resize: none;
-          border: 1px solid ${theme.border};
-          border-radius: 12px;
-          background: ${theme.textareaBackground};
-          color: ${theme.foreground};
-          padding: 10px;
+          border: 1px solid var(--popup-border);
+          border-radius: 14px;
+          background: var(--popup-editor);
+          color: var(--popup-foreground);
+          padding: 12px;
           box-sizing: border-box;
           font-family: Consolas, 'SFMono-Regular', 'Cascadia Code', monospace;
           font-size: 12px;
-          line-height: 1.45;
+          line-height: 1.5;
           white-space: pre;
+          caret-color: var(--popup-accent);
         }
         .footer {
           display: flex;
           align-items: center;
           justify-content: space-between;
-          padding: 8px 10px 10px;
-          gap: 8px;
+          padding: 10px 14px 14px;
+          gap: 10px;
         }
         .footer-right {
           display: flex;
           align-items: center;
-          gap: 8px;
+          gap: 10px;
           flex-wrap: wrap;
           justify-content: flex-end;
         }
         .meta {
           font-size: 11px;
-          opacity: 0.72;
+          color: var(--popup-muted);
         }
         .opacity-wrap {
           display: inline-flex;
           align-items: center;
           gap: 5px;
           font-size: 10px;
-          opacity: 0.84;
+          color: var(--popup-muted);
         }
         .opacity-wrap input {
           width: 72px;
         }
+        .resize-handle {
+          position: absolute;
+          width: 14px;
+          height: 14px;
+          border-radius: 999px;
+          background: var(--popup-control);
+          border: 1px solid var(--popup-border);
+          box-shadow: 0 2px 10px rgba(15, 23, 42, 0.16);
+          z-index: 3;
+        }
+        .resize-handle.nw {
+          left: -7px;
+          top: -7px;
+          cursor: nwse-resize;
+        }
+        .resize-handle.ne {
+          right: -7px;
+          top: -7px;
+          cursor: nesw-resize;
+        }
+        .resize-handle.sw {
+          left: -7px;
+          bottom: -7px;
+          cursor: nesw-resize;
+        }
+        .resize-handle.se {
+          right: -7px;
+          bottom: -7px;
+          cursor: nwse-resize;
+        }
+        .shell.minimized .resize-handle {
+          display: none;
+        }
       </style>
       <div class="shell" data-role="shell">
         <button class="launcher" data-role="launcher" title="Restore popup">\u2726</button>
+        <button class="resize-handle nw" data-role="resize-nw" title="Resize from top left"></button>
+        <button class="resize-handle ne" data-role="resize-ne" title="Resize from top right"></button>
+        <button class="resize-handle sw" data-role="resize-sw" title="Resize from bottom left"></button>
+        <button class="resize-handle se" data-role="resize-se" title="Resize from bottom right"></button>
         <div class="header" data-role="drag-handle">
           <div class="title">
             <strong>Shared Text</strong>
-            <span>Always on top</span>
+            <span>Context aware, always readable</span>
           </div>
           <div class="controls">
             <button class="control" data-role="minimize" title="Minimize">\u2212</button>
@@ -1053,17 +1107,35 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
     const opacityInput = shadowRoot2.querySelector('[data-role="opacity"]');
     const textArea2 = shadowRoot2.querySelector('[data-role="content"]');
     const meta2 = shadowRoot2.querySelector('[data-role="meta"]');
-    if (!shell || !dragHandle || !minimizeButton || !closeButton || !launcher || !copyButton || !sendButton || !opacityInput || !textArea2 || !meta2) {
+    const resizeNorthWest = shadowRoot2.querySelector('[data-role="resize-nw"]');
+    const resizeNorthEast = shadowRoot2.querySelector('[data-role="resize-ne"]');
+    const resizeSouthWest = shadowRoot2.querySelector('[data-role="resize-sw"]');
+    const resizeSouthEast = shadowRoot2.querySelector('[data-role="resize-se"]');
+    let pendingStatusTimer = null;
+    if (!shell || !dragHandle || !minimizeButton || !closeButton || !launcher || !copyButton || !sendButton || !opacityInput || !textArea2 || !meta2 || !resizeNorthWest || !resizeNorthEast || !resizeSouthWest || !resizeSouthEast) {
       throw new Error("Popup controls could not be initialized.");
     }
+    applyTheme(host2);
     attachDrag(dragHandle, host2);
     attachDrag(launcher, host2, true);
+    attachResize(resizeNorthWest, host2, -1, -1);
+    attachResize(resizeNorthEast, host2, 1, -1);
+    attachResize(resizeSouthWest, host2, -1, 1);
+    attachResize(resizeSouthEast, host2, 1, 1);
+    const scheduleStatusPublish = (nextTextLength) => {
+      if (pendingStatusTimer !== null) {
+        window.clearTimeout(pendingStatusTimer);
+      }
+      pendingStatusTimer = window.setTimeout(() => {
+        pendingStatusTimer = null;
+        sendPopupStatus(host2, tabId, location.href, nextTextLength);
+      }, 120);
+    };
     minimizeButton.addEventListener("click", () => {
       host2.style.width = `${minimizedSizePx}px`;
       host2.style.height = `${minimizedSizePx}px`;
       host2.style.minWidth = `${minimizedSizePx}px`;
       host2.style.minHeight = `${minimizedSizePx}px`;
-      host2.style.resize = "none";
       shell.classList.add("minimized");
       setPopupState(host2, "minimized");
     });
@@ -1118,7 +1190,7 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
     });
     textArea2.addEventListener("input", () => {
       updateMeta(textArea2, meta2);
-      sendPopupStatus(host2, tabId, location.href, textArea2.value.length);
+      scheduleStatusPublish(textArea2.value.length);
     });
     textArea2.addEventListener("keydown", (event) => {
       if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "a") {
@@ -1133,6 +1205,7 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
   if (!shadowRoot.hasChildNodes()) {
     initializePopupDom(host, shadowRoot);
   }
+  applyTheme(host);
   const textArea = shadowRoot.querySelector('[data-role="content"]');
   const meta = shadowRoot.querySelector('[data-role="meta"]');
   if (!textArea || !meta) {
@@ -1200,8 +1273,11 @@ var ChromePagePopupGateway;
 var init_ChromePagePopupGateway = __esm({
   "src/infrastructure/browser/ChromePagePopupGateway.ts"() {
     "use strict";
+    init_browserCapabilities();
+    init_errors();
     ChromePagePopupGateway = class {
       async show(tab, text) {
+        this.ensureScriptingSupport();
         const results = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           func: injectOrUpdatePopupInPage,
@@ -1211,6 +1287,7 @@ var init_ChromePagePopupGateway = __esm({
         return this.normalizeShowResult(firstResult, tab);
       }
       async getStatus(tab) {
+        this.ensureScriptingSupport();
         const results = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           func: readPopupStatusInPage,
@@ -1220,6 +1297,7 @@ var init_ChromePagePopupGateway = __esm({
         return this.normalizeStatus(firstResult, tab);
       }
       async close(tab) {
+        this.ensureScriptingSupport();
         const results = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           func: closePopupInPage,
@@ -1258,7 +1336,366 @@ var init_ChromePagePopupGateway = __esm({
           textLength: 0
         };
       }
+      ensureScriptingSupport() {
+        const capabilities = getBrowserCapabilities();
+        if (!capabilities.scriptingApi) {
+          throw new ExtensionError("This browser does not support script injection required for the page popup feature.");
+        }
+      }
     };
+  }
+});
+
+// src/infrastructure/browser/ChromeScreenShareGateway.ts
+var ChromeScreenShareGateway;
+var init_ChromeScreenShareGateway = __esm({
+  "src/infrastructure/browser/ChromeScreenShareGateway.ts"() {
+    "use strict";
+    init_errors();
+    ChromeScreenShareGateway = class {
+      viewerWindowId = null;
+      latestStatus = {
+        state: "idle",
+        active: false,
+        viewerWindowId: null,
+        sourceLabel: null,
+        updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+        message: "Screen share is idle."
+      };
+      async start() {
+        this.ensureSupport();
+        if (this.viewerWindowId !== null && (this.latestStatus.active || this.latestStatus.state === "launching")) {
+          await this.focusViewerWindow();
+          return this.latestStatus;
+        }
+        const createdWindow = await chrome.windows.create({
+          url: chrome.runtime.getURL("screen-share.html"),
+          type: "popup",
+          focused: true,
+          state: "maximized"
+        });
+        this.viewerWindowId = typeof createdWindow.id === "number" ? createdWindow.id : null;
+        this.latestStatus = {
+          state: "launching",
+          active: false,
+          viewerWindowId: this.viewerWindowId,
+          sourceLabel: null,
+          updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+          message: "Browser sharing window opened. Click Start Streaming in Chrome to open the picker."
+        };
+        return this.latestStatus;
+      }
+      updateStatus(status) {
+        this.latestStatus = {
+          ...status,
+          viewerWindowId: status.viewerWindowId ?? this.viewerWindowId
+        };
+        this.viewerWindowId = this.latestStatus.viewerWindowId;
+        return this.latestStatus;
+      }
+      handleViewerWindowRemoved(windowId) {
+        if (windowId !== this.viewerWindowId) {
+          return null;
+        }
+        this.viewerWindowId = null;
+        this.latestStatus = {
+          state: "ended",
+          active: false,
+          viewerWindowId: null,
+          sourceLabel: null,
+          updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+          message: "Screen share window closed."
+        };
+        return this.latestStatus;
+      }
+      getStatus() {
+        return this.latestStatus;
+      }
+      async focusViewerWindow() {
+        if (this.viewerWindowId === null) {
+          return;
+        }
+        try {
+          await chrome.windows.update(this.viewerWindowId, { focused: true });
+        } catch {
+          this.viewerWindowId = null;
+        }
+      }
+      ensureSupport() {
+        if (!chrome.windows?.create) {
+          throw new ExtensionError("This browser does not support extension popup windows required for screen share preview.");
+        }
+      }
+    };
+  }
+});
+
+// src/infrastructure/browser/ChromeDebuggerClient.ts
+var ChromeDebuggerClient;
+var init_ChromeDebuggerClient = __esm({
+  "src/infrastructure/browser/ChromeDebuggerClient.ts"() {
+    "use strict";
+    init_browserCapabilities();
+    init_errors();
+    ChromeDebuggerClient = class {
+      async attach(debuggee) {
+        this.ensureDebuggerSupport();
+        await this.promisify((callback) => chrome.debugger.attach(debuggee, "1.3", callback));
+      }
+      async detach(debuggee) {
+        try {
+          await this.promisify((callback) => chrome.debugger.detach(debuggee, callback));
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "";
+          if (!message.includes("Detached while handling command")) {
+            throw error;
+          }
+        }
+      }
+      async sendCommand(debuggee, method, commandParams) {
+        this.ensureDebuggerSupport();
+        return new Promise((resolve, reject) => {
+          chrome.debugger.sendCommand(debuggee, method, commandParams, (result) => {
+            const runtimeError = chrome.runtime.lastError;
+            if (runtimeError) {
+              reject(new ExtensionError(runtimeError.message ?? "Unknown Chrome runtime error."));
+              return;
+            }
+            resolve(result);
+          });
+        });
+      }
+      ensureDebuggerSupport() {
+        const capabilities = getBrowserCapabilities();
+        if (!capabilities.debuggerApi) {
+          throw new ExtensionError("This browser does not support the debugger API required for full-page capture.");
+        }
+      }
+      promisify(executor) {
+        return new Promise((resolve, reject) => {
+          executor((value) => {
+            const runtimeError = chrome.runtime.lastError;
+            if (runtimeError) {
+              reject(new ExtensionError(runtimeError.message ?? "Unknown Chrome runtime error."));
+              return;
+            }
+            resolve(value);
+          });
+        });
+      }
+    };
+  }
+});
+
+// src/shared/fileName.ts
+function buildCaptureFileName(prefix, capturedAt) {
+  const timestamp = capturedAt.replace(/[:.]/g, "-");
+  return `${prefix}-${timestamp}.png`;
+}
+var init_fileName = __esm({
+  "src/shared/fileName.ts"() {
+    "use strict";
+  }
+});
+
+// src/infrastructure/browser/ChromeFullPageCaptureGateway.ts
+var ChromeFullPageCaptureGateway;
+var init_ChromeFullPageCaptureGateway = __esm({
+  "src/infrastructure/browser/ChromeFullPageCaptureGateway.ts"() {
+    "use strict";
+    init_browserCapabilities();
+    init_constants();
+    init_errors();
+    init_fileName();
+    ChromeFullPageCaptureGateway = class {
+      constructor(debuggerClient) {
+        this.debuggerClient = debuggerClient;
+      }
+      debuggerClient;
+      async capture(tab, settings) {
+        const debuggee = { tabId: tab.id };
+        await this.debuggerClient.attach(debuggee);
+        try {
+          await this.debuggerClient.sendCommand(debuggee, "Page.enable");
+          const layoutMetrics = await this.debuggerClient.sendCommand(debuggee, "Page.getLayoutMetrics");
+          const devicePixelRatio = await this.readDevicePixelRatio(tab.id);
+          const widthCssPx = Math.max(1, Math.ceil(layoutMetrics.contentSize.width));
+          const heightCssPx = Math.max(1, Math.ceil(layoutMetrics.contentSize.height));
+          const scale = this.computeCaptureScale(widthCssPx, heightCssPx, devicePixelRatio);
+          const result = await this.debuggerClient.sendCommand(debuggee, "Page.captureScreenshot", {
+            format: "png",
+            fromSurface: true,
+            captureBeyondViewport: true,
+            optimizeForSpeed: true,
+            clip: {
+              x: 0,
+              y: 0,
+              width: widthCssPx,
+              height: heightCssPx,
+              scale
+            }
+          });
+          const capturedAt = (/* @__PURE__ */ new Date()).toISOString();
+          return {
+            tab,
+            base64Data: result.data,
+            mimeType: "image/png",
+            fileName: buildCaptureFileName(settings.fileNamePrefix, capturedAt),
+            capturedAt,
+            widthCssPx,
+            heightCssPx,
+            scale
+          };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Unknown screenshot failure.";
+          throw new ExtensionError(`Full-page capture failed: ${message}`);
+        } finally {
+          await this.debuggerClient.detach(debuggee).catch(() => void 0);
+        }
+      }
+      async readDevicePixelRatio(tabId) {
+        const capabilities = getBrowserCapabilities();
+        if (!capabilities.scriptingApi) {
+          throw new ExtensionError("This browser does not support script injection required to inspect page metrics.");
+        }
+        const results = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: () => window.devicePixelRatio || 1
+        });
+        const firstResult = results[0]?.result;
+        return typeof firstResult === "number" && Number.isFinite(firstResult) ? firstResult : 1;
+      }
+      computeCaptureScale(widthCssPx, heightCssPx, devicePixelRatio) {
+        const cappedDeviceScale = Math.max(1, devicePixelRatio);
+        const dimensionScale = Math.min(MAX_CAPTURE_DIMENSION / widthCssPx, MAX_CAPTURE_DIMENSION / heightCssPx, cappedDeviceScale);
+        const areaScale = Math.sqrt(MAX_CAPTURE_AREA / (widthCssPx * heightCssPx));
+        const scale = Math.min(cappedDeviceScale, dimensionScale, areaScale);
+        if (!Number.isFinite(scale) || scale <= 0) {
+          throw new ExtensionError("Computed capture scale is invalid for the current page size.");
+        }
+        return Number(scale.toFixed(2));
+      }
+    };
+  }
+});
+
+// src/infrastructure/browser/ChromeOffscreenBridgeRuntime.ts
+var ChromeOffscreenBridgeRuntime;
+var init_ChromeOffscreenBridgeRuntime = __esm({
+  "src/infrastructure/browser/ChromeOffscreenBridgeRuntime.ts"() {
+    "use strict";
+    init_browserCapabilities();
+    init_constants();
+    init_errors();
+    ChromeOffscreenBridgeRuntime = class {
+      creatingDocumentPromise = null;
+      async ensureStarted() {
+        if (this.creatingDocumentPromise) {
+          await this.creatingDocumentPromise;
+          return;
+        }
+        this.creatingDocumentPromise = this.createDocument();
+        try {
+          await this.creatingDocumentPromise;
+        } finally {
+          this.creatingDocumentPromise = null;
+        }
+      }
+      async reconnect() {
+        const capabilities = getBrowserCapabilities();
+        if (!capabilities.runtimeMessaging) {
+          throw new ExtensionError("This browser does not support extension runtime messaging required for bridge reconnect.");
+        }
+        await chrome.runtime.sendMessage({ type: "bridge-start" }).catch(() => void 0);
+        await chrome.runtime.sendMessage({ type: "bridge-reconnect" }).catch(() => void 0);
+      }
+      async createDocument() {
+        const capabilities = getBrowserCapabilities();
+        if (!capabilities.offscreenDocument) {
+          throw new ExtensionError("This browser does not support offscreen documents required for the desktop bridge.");
+        }
+        try {
+          await chrome.offscreen.createDocument({
+            url: OFFSCREEN_DOCUMENT_PATH,
+            reasons: [chrome.offscreen.Reason.BLOBS, chrome.offscreen.Reason.CLIPBOARD],
+            justification: "Maintain a resilient local WebSocket bridge for desktop-driven screenshot capture and clipboard sync."
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "";
+          if (!message.includes("Only a single offscreen document may be created")) {
+            throw new ExtensionError(message || "Unable to create the offscreen bridge document.");
+          }
+        }
+      }
+    };
+  }
+});
+
+// src/infrastructure/browser/UnsupportedBridgeRuntime.ts
+var UnsupportedBridgeRuntime;
+var init_UnsupportedBridgeRuntime = __esm({
+  "src/infrastructure/browser/UnsupportedBridgeRuntime.ts"() {
+    "use strict";
+    init_errors();
+    UnsupportedBridgeRuntime = class {
+      constructor(reason) {
+        this.reason = reason;
+      }
+      reason;
+      async ensureStarted() {
+        throw new ExtensionError(this.reason);
+      }
+      async reconnect() {
+        throw new ExtensionError(this.reason);
+      }
+    };
+  }
+});
+
+// src/infrastructure/browser/UnsupportedFullPageCaptureGateway.ts
+var UnsupportedFullPageCaptureGateway;
+var init_UnsupportedFullPageCaptureGateway = __esm({
+  "src/infrastructure/browser/UnsupportedFullPageCaptureGateway.ts"() {
+    "use strict";
+    init_errors();
+    UnsupportedFullPageCaptureGateway = class {
+      constructor(reason) {
+        this.reason = reason;
+      }
+      reason;
+      async capture(_tab, _settings) {
+        throw new ExtensionError(this.reason);
+      }
+    };
+  }
+});
+
+// src/infrastructure/browser/createBrowserPlatformAdapters.ts
+function createBrowserPlatformAdapters() {
+  const browserIdentity = getBrowserIdentity();
+  const capabilities = getBrowserCapabilities();
+  const bridgeRuntime = capabilities.offscreenDocument && capabilities.runtimeMessaging ? new ChromeOffscreenBridgeRuntime() : new UnsupportedBridgeRuntime(
+    `${browserIdentity.name} does not support the offscreen bridge APIs required for the desktop connection.`
+  );
+  const fullPageCaptureGateway = capabilities.debuggerApi && capabilities.scriptingApi ? new ChromeFullPageCaptureGateway(new ChromeDebuggerClient()) : new UnsupportedFullPageCaptureGateway(
+    `${browserIdentity.name} does not support the debugger-based full-page capture APIs. Popup, clipboard, and bridge features can still run, but screenshot capture is unavailable.`
+  );
+  return {
+    browserIdentity,
+    capabilities,
+    bridgeRuntime,
+    fullPageCaptureGateway
+  };
+}
+var init_createBrowserPlatformAdapters = __esm({
+  "src/infrastructure/browser/createBrowserPlatformAdapters.ts"() {
+    "use strict";
+    init_browserCapabilities();
+    init_ChromeDebuggerClient();
+    init_ChromeFullPageCaptureGateway();
+    init_ChromeOffscreenBridgeRuntime();
+    init_UnsupportedBridgeRuntime();
+    init_UnsupportedFullPageCaptureGateway();
   }
 });
 
@@ -1480,28 +1917,31 @@ var require_main = __commonJS({
     init_CaptureCycleService();
     init_BridgeLifecycleService();
     init_constants();
+    init_browserCapabilities();
     init_ChromeActiveTabGateway();
     init_ChromeClipboardAccessGateway();
-    init_ChromeDebuggerClient();
-    init_ChromeFullPageCaptureGateway();
-    init_ChromeOffscreenBridgeRuntime();
     init_ChromePagePopupGateway();
+    init_ChromeScreenShareGateway();
+    init_createBrowserPlatformAdapters();
     init_ChromeRunStatusRepository();
     init_ChromeSettingsRepository();
     init_debug();
+    var browserPlatform = createBrowserPlatformAdapters();
     var activeTabGateway = new ChromeActiveTabGateway();
     var settingsRepository = new ChromeSettingsRepository();
     var runStatusRepository = new ChromeRunStatusRepository();
     var captureCycleService = new CaptureCycleService(
       settingsRepository,
       activeTabGateway,
-      new ChromeFullPageCaptureGateway(new ChromeDebuggerClient()),
+      browserPlatform.fullPageCaptureGateway,
       runStatusRepository
     );
-    var bridgeLifecycleService = new BridgeLifecycleService(settingsRepository, new ChromeOffscreenBridgeRuntime());
+    var bridgeLifecycleService = new BridgeLifecycleService(settingsRepository, browserPlatform.bridgeRuntime);
     var clipboardAccessGateway = new ChromeClipboardAccessGateway();
     var pagePopupGateway = new ChromePagePopupGateway();
+    var screenShareGateway = new ChromeScreenShareGateway();
     var recentPopupMessages = [];
+    var SCREEN_SHARE_STOP_OVERLAY_ID = "page-signal-screen-share-stop";
     var latestPopupStatus = {
       exists: false,
       state: "closed",
@@ -1510,6 +1950,16 @@ var require_main = __commonJS({
       updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
       textLength: 0
     };
+    var latestScreenShareStatus = screenShareGateway.getStatus();
+    var latestScreenShareOverlayTabId = null;
+    debugLog("background", "Detected browser capabilities.", {
+      browser: browserPlatform.browserIdentity,
+      capabilities: browserPlatform.capabilities
+    });
+    var unsupportedCapabilities = getUnsupportedCapabilitiesSummary();
+    if (unsupportedCapabilities.length > 0) {
+      debugError("background", "Some browser capabilities are unavailable. Related features will degrade gracefully.", unsupportedCapabilities);
+    }
     async function runCaptureCycle() {
       debugLog("background", "Running capture cycle.");
       return captureCycleService.execute();
@@ -1574,6 +2024,28 @@ var require_main = __commonJS({
       notifyPopupStatusChanged(result);
       return result;
     }
+    async function startScreenShare() {
+      const result = await screenShareGateway.start();
+      latestScreenShareStatus = result;
+      notifyScreenShareStatusChanged(result);
+      return result;
+    }
+    async function requestScreenShareStop() {
+      const response = await new Promise((resolve) => {
+        chrome.runtime.sendMessage({ type: "screen-share-force-stop" }, (result) => {
+          const runtimeError = chrome.runtime.lastError;
+          if (runtimeError) {
+            resolve({ ok: false, message: runtimeError.message });
+            return;
+          }
+          resolve(result ?? { ok: true });
+        });
+      });
+      if (response.ok === false) {
+        throw new Error(response.message || "Screen share stop request failed.");
+      }
+      return latestScreenShareStatus;
+    }
     async function closePagePopup() {
       const tab = await activeTabGateway.getActiveCapturableTab();
       if (!tab) {
@@ -1621,6 +2093,9 @@ var require_main = __commonJS({
     function notifyPopupStatusChanged(status) {
       void chrome.runtime.sendMessage({ type: "popup-status-changed", status }).catch(() => void 0);
     }
+    function notifyScreenShareStatusChanged(status) {
+      void chrome.runtime.sendMessage({ type: "screen-share-status-changed", status }).catch(() => void 0);
+    }
     function notifyPopupMessage(payload) {
       void chrome.runtime.sendMessage({ type: "popup-page-message", payload }).catch(() => void 0);
     }
@@ -1629,6 +2104,69 @@ var require_main = __commonJS({
       if (recentPopupMessages.length > 2) {
         recentPopupMessages.length = 2;
       }
+    }
+    async function syncScreenShareClientControls(status) {
+      if (status.active) {
+        const tab = await activeTabGateway.getActiveCapturableTab();
+        if (!tab) {
+          return;
+        }
+        latestScreenShareOverlayTabId = tab.id;
+        await injectScreenShareStopOverlay(tab.id);
+        return;
+      }
+      if (latestScreenShareOverlayTabId !== null) {
+        await removeScreenShareStopOverlay(latestScreenShareOverlayTabId);
+        latestScreenShareOverlayTabId = null;
+      }
+    }
+    async function injectScreenShareStopOverlay(tabId) {
+      if (!chrome.scripting?.executeScript) {
+        return;
+      }
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (overlayId) => {
+          const existing = document.getElementById(overlayId);
+          if (existing) {
+            return;
+          }
+          const button = document.createElement("button");
+          button.id = overlayId;
+          button.type = "button";
+          button.textContent = "Stop Sharing";
+          button.style.position = "fixed";
+          button.style.top = "14px";
+          button.style.right = "14px";
+          button.style.zIndex = "2147483647";
+          button.style.border = "1px solid rgba(15, 23, 42, 0.18)";
+          button.style.borderRadius = "999px";
+          button.style.padding = "10px 16px";
+          button.style.background = "linear-gradient(135deg, #dc2626, #ef4444)";
+          button.style.color = "#fff";
+          button.style.font = "600 13px Segoe UI, system-ui, sans-serif";
+          button.style.boxShadow = "0 18px 32px rgba(15, 23, 42, 0.28)";
+          button.style.cursor = "pointer";
+          button.style.pointerEvents = "auto";
+          button.addEventListener("click", () => {
+            void chrome.runtime.sendMessage({ type: "screen-share-stop-request" }).catch(() => void 0);
+          });
+          document.documentElement.appendChild(button);
+        },
+        args: [SCREEN_SHARE_STOP_OVERLAY_ID]
+      });
+    }
+    async function removeScreenShareStopOverlay(tabId) {
+      if (!chrome.scripting?.executeScript) {
+        return;
+      }
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (overlayId) => {
+          document.getElementById(overlayId)?.remove();
+        },
+        args: [SCREEN_SHARE_STOP_OVERLAY_ID]
+      }).catch(() => void 0);
     }
     chrome.runtime.onInstalled.addListener(() => {
       debugLog("background", "Extension installed event received.");
@@ -1662,6 +2200,14 @@ var require_main = __commonJS({
         return;
       }
       void enableClipboardAccessForTab(browserTab, "tab-updated");
+    });
+    chrome.windows?.onRemoved?.addListener((windowId) => {
+      const status = screenShareGateway.handleViewerWindowRemoved(windowId);
+      if (!status) {
+        return;
+      }
+      latestScreenShareStatus = status;
+      notifyScreenShareStatusChanged(status);
     });
     chrome.commands?.onCommand.addListener((command) => {
       void (async () => {
@@ -1744,6 +2290,22 @@ var require_main = __commonJS({
         });
         return true;
       }
+      if (message?.type === "bridge-screen-share-start") {
+        void startScreenShare().then((status) => sendResponse({ ok: true, status })).catch((error) => {
+          const messageText = error instanceof Error ? error.message : "Screen share start failed.";
+          debugError("background", "Bridge screen share request failed.", messageText);
+          sendResponse({ ok: false, message: messageText, status: latestScreenShareStatus });
+        });
+        return true;
+      }
+      if (message?.type === "bridge-screen-share-stop") {
+        void requestScreenShareStop().then((status) => sendResponse({ ok: true, status })).catch((error) => {
+          const messageText = error instanceof Error ? error.message : "Screen share stop failed.";
+          debugError("background", "Bridge screen share stop request failed.", messageText);
+          sendResponse({ ok: false, message: messageText, status: latestScreenShareStatus });
+        });
+        return true;
+      }
       if (message?.type === "popup-status-get") {
         void readPopupStatus().then((status) => sendResponse({ ok: true, status })).catch((error) => {
           const messageText = error instanceof Error ? error.message : "Popup status lookup failed.";
@@ -1785,6 +2347,48 @@ var require_main = __commonJS({
         recordPopupMessage(payload);
         notifyPopupMessage(payload);
         sendResponse({ ok: true });
+        return true;
+      }
+      if (message?.type === "screen-share-status-get") {
+        sendResponse({ ok: true, status: latestScreenShareStatus });
+        return true;
+      }
+      if (message?.type === "screen-share-viewer-ready") {
+        sendResponse({ ok: true, status: latestScreenShareStatus });
+        return true;
+      }
+      if (message?.type === "screen-share-stream-endpoint-get") {
+        void (async () => {
+          try {
+            const runStatus = await runStatusRepository.get();
+            sendResponse({ ok: true, targetUrl: runStatus.targetUrl });
+          } catch (error) {
+            const messageText = error instanceof Error ? error.message : "Screen share stream endpoint lookup failed.";
+            debugError("background", "Screen share stream endpoint lookup failed.", messageText);
+            sendResponse({ ok: false, message: messageText });
+          }
+        })();
+        return true;
+      }
+      if (message?.type === "screen-share-viewer-status") {
+        latestScreenShareStatus = screenShareGateway.updateStatus({
+          state: message.status?.state === "idle" || message.status?.state === "launching" || message.status?.state === "active" || message.status?.state === "ended" || message.status?.state === "error" ? message.status.state : "error",
+          active: Boolean(message.status?.active),
+          viewerWindowId: typeof message.status?.viewerWindowId === "number" ? message.status.viewerWindowId : latestScreenShareStatus.viewerWindowId,
+          sourceLabel: typeof message.status?.sourceLabel === "string" ? message.status.sourceLabel : null,
+          updatedAt: typeof message.status?.updatedAt === "string" ? message.status.updatedAt : (/* @__PURE__ */ new Date()).toISOString(),
+          message: typeof message.status?.message === "string" ? message.status.message : "Screen share status updated."
+        });
+        void syncScreenShareClientControls(latestScreenShareStatus);
+        notifyScreenShareStatusChanged(latestScreenShareStatus);
+        sendResponse({ ok: true, status: latestScreenShareStatus });
+        return true;
+      }
+      if (message?.type === "screen-share-stop-request") {
+        void requestScreenShareStop().catch((error) => {
+          debugError("background", "Screen share stop request from page failed.", error);
+        });
+        sendResponse({ ok: true, status: latestScreenShareStatus });
         return true;
       }
       return false;

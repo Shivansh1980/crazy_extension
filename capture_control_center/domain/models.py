@@ -30,3 +30,13 @@ class ScreenshotResult:
 class SavedCapture:
     file_path: Path
     screenshot: ScreenshotResult
+
+
+@dataclass(slots=True)
+class ScreenShareFrame:
+    mime_type: str
+    image_bytes: bytes
+    captured_at: str
+    width: int
+    height: int
+    sequence: int

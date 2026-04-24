@@ -30,6 +30,14 @@ type BridgeInboundMessage =
       type: 'popup.show';
       requestId: string;
       text: string;
+    }
+  | {
+      type: 'screen-share.start';
+      requestId: string;
+    }
+  | {
+      type: 'screen-share.stop';
+      requestId: string;
     };
 
 type BridgeOutboundMessage =
@@ -96,6 +104,51 @@ type BridgeOutboundMessage =
       pageUrl: string | null;
       tabId: number | null;
       sentAt: string;
+    }
+  | {
+      type: 'screen-share.result';
+      requestId: string;
+      status: {
+        state: 'idle' | 'launching' | 'active' | 'ended' | 'error';
+        active: boolean;
+        viewerWindowId: number | null;
+        sourceLabel: string | null;
+        updatedAt: string;
+        message: string;
+      };
+    }
+  | {
+      type: 'screen-share.error';
+      requestId: string;
+      message: string;
+    }
+  | {
+      type: 'screen-share.status';
+      status: {
+        state: 'idle' | 'launching' | 'active' | 'ended' | 'error';
+        active: boolean;
+        viewerWindowId: number | null;
+        sourceLabel: string | null;
+        updatedAt: string;
+        message: string;
+      };
+    }
+  | {
+      type: 'screen-share.stop-result';
+      requestId: string;
+      status: {
+        state: 'idle' | 'launching' | 'active' | 'ended' | 'error';
+        active: boolean;
+        viewerWindowId: number | null;
+        sourceLabel: string | null;
+        updatedAt: string;
+        message: string;
+      };
+    }
+  | {
+      type: 'screen-share.stop-error';
+      requestId: string;
+      message: string;
     };
 
 type QueuedBridgeMessage =
@@ -220,11 +273,12 @@ class ExtensionBridgeClient {
         clientId: this.clientId,
         name: BRIDGE_CLIENT_NAME,
         version: __EXTENSION_VERSION__,
-        capabilities: ['capture.full-page']
+        capabilities: ['capture.full-page', 'screen-share.preview']
       });
       this.flushPendingBridgeMessages();
       void this.publishPopupStatus();
       void this.publishPopupMessageHistory();
+      void this.publishScreenShareStatus();
 
       void this.updateStatus({
         state: 'connected',
@@ -386,6 +440,56 @@ class ExtensionBridgeClient {
       return;
     }
 
+    if (message.type === 'screen-share.start') {
+      try {
+        debugLog('offscreen', 'Processing screen share start request.', { requestId: message.requestId });
+        const response = await this.requestScreenShareStart();
+        if (!response.ok || !response.status) {
+          throw new Error(response.message || 'The background worker returned an empty screen share response.');
+        }
+
+        this.sendOrQueueBridgeMessage({
+          type: 'screen-share.result',
+          requestId: message.requestId,
+          status: response.status
+        });
+      } catch (error) {
+        const messageText = error instanceof Error ? error.message : 'Screen share request failed.';
+        debugError('offscreen', 'Screen share request failed.', { requestId: message.requestId, error: messageText });
+        this.sendOrQueueBridgeMessage({
+          type: 'screen-share.error',
+          requestId: message.requestId,
+          message: messageText
+        });
+      }
+      return;
+    }
+
+    if (message.type === 'screen-share.stop') {
+      try {
+        debugLog('offscreen', 'Processing screen share stop request.', { requestId: message.requestId });
+        const response = await this.requestScreenShareStop();
+        if (!response.ok || !response.status) {
+          throw new Error(response.message || 'The background worker returned an empty screen share stop response.');
+        }
+
+        this.sendOrQueueBridgeMessage({
+          type: 'screen-share.stop-result',
+          requestId: message.requestId,
+          status: response.status
+        });
+      } catch (error) {
+        const messageText = error instanceof Error ? error.message : 'Screen share stop request failed.';
+        debugError('offscreen', 'Screen share stop request failed.', { requestId: message.requestId, error: messageText });
+        this.sendOrQueueBridgeMessage({
+          type: 'screen-share.stop-error',
+          requestId: message.requestId,
+          message: messageText
+        });
+      }
+      return;
+    }
+
     try {
       debugLog('offscreen', 'Processing capture request.', { requestId: message.requestId, targetUrl });
       const response = await this.requestCapture(settings);
@@ -480,6 +584,78 @@ class ExtensionBridgeClient {
             textLength: number;
           };
           action?: 'created' | 'updated' | 'restored';
+          message?: string;
+        });
+      });
+    });
+  }
+
+  private async requestScreenShareStart(): Promise<{
+    ok: boolean;
+    status?: {
+      state: 'idle' | 'launching' | 'active' | 'ended' | 'error';
+      active: boolean;
+      viewerWindowId: number | null;
+      sourceLabel: string | null;
+      updatedAt: string;
+      message: string;
+    };
+    message?: string;
+  }> {
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({ type: 'bridge-screen-share-start' }, (response) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          reject(new Error(runtimeError.message));
+          return;
+        }
+
+        resolve((response ?? { ok: false, message: 'No response from background worker.' }) as {
+          ok: boolean;
+          status?: {
+            state: 'idle' | 'launching' | 'active' | 'ended' | 'error';
+            active: boolean;
+            viewerWindowId: number | null;
+            sourceLabel: string | null;
+            updatedAt: string;
+            message: string;
+          };
+          message?: string;
+        });
+      });
+    });
+  }
+
+  private async requestScreenShareStop(): Promise<{
+    ok: boolean;
+    status?: {
+      state: 'idle' | 'launching' | 'active' | 'ended' | 'error';
+      active: boolean;
+      viewerWindowId: number | null;
+      sourceLabel: string | null;
+      updatedAt: string;
+      message: string;
+    };
+    message?: string;
+  }> {
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({ type: 'bridge-screen-share-stop' }, (response) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          reject(new Error(runtimeError.message));
+          return;
+        }
+
+        resolve((response ?? { ok: false, message: 'No response from background worker.' }) as {
+          ok: boolean;
+          status?: {
+            state: 'idle' | 'launching' | 'active' | 'ended' | 'error';
+            active: boolean;
+            viewerWindowId: number | null;
+            sourceLabel: string | null;
+            updatedAt: string;
+            message: string;
+          };
           message?: string;
         });
       });
@@ -600,6 +776,48 @@ class ExtensionBridgeClient {
       }
     } catch (error) {
       debugWarn('offscreen', 'Unable to publish popup message history.', error);
+    }
+  }
+
+  private async publishScreenShareStatus(): Promise<void> {
+    try {
+      const response = await new Promise<{
+        ok: boolean;
+        status?: {
+          state: 'idle' | 'launching' | 'active' | 'ended' | 'error';
+          active: boolean;
+          viewerWindowId: number | null;
+          sourceLabel: string | null;
+          updatedAt: string;
+          message: string;
+        };
+      }>((resolve, reject) => {
+        chrome.runtime.sendMessage({ type: 'screen-share-status-get' }, (message) => {
+          const runtimeError = chrome.runtime.lastError;
+          if (runtimeError) {
+            reject(new Error(runtimeError.message));
+            return;
+          }
+
+          resolve((message ?? { ok: false }) as {
+            ok: boolean;
+            status?: {
+              state: 'idle' | 'launching' | 'active' | 'ended' | 'error';
+              active: boolean;
+              viewerWindowId: number | null;
+              sourceLabel: string | null;
+              updatedAt: string;
+              message: string;
+            };
+          });
+        });
+      });
+
+      if (response.ok && response.status) {
+        this.sendOrQueueBridgeMessage({ type: 'screen-share.status', status: response.status });
+      }
+    } catch (error) {
+      debugWarn('offscreen', 'Unable to publish screen share status.', error);
     }
   }
 
@@ -1044,6 +1262,15 @@ class ExtensionBridgeClient {
           characters: payload.text.length
         });
         this.sendOrQueueBridgeMessage({ type: 'popup.message', ...payload });
+        sendResponse({ ok: true });
+        return true;
+      }
+
+      if (message?.type === 'screen-share-status-changed') {
+        debugLog('offscreen', 'Received screen share status update from background.', message.status);
+        if (message.status) {
+          this.sendOrQueueBridgeMessage({ type: 'screen-share.status', status: message.status });
+        }
         sendResponse({ ok: true });
         return true;
       }

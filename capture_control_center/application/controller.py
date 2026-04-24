@@ -35,6 +35,14 @@ class CaptureController:
         debug_log('python-controller', 'Popup write requested from GUI.', {'characters': len(text)})
         return asyncio.run_coroutine_threadsafe(self._send_popup_text(text), self._loop)
 
+    def request_screen_share(self) -> Future[dict[str, Any]]:
+        debug_log('python-controller', 'Screen share requested from GUI.')
+        return asyncio.run_coroutine_threadsafe(self._request_screen_share(), self._loop)
+
+    def stop_screen_share(self) -> Future[dict[str, Any]]:
+        debug_log('python-controller', 'Screen share stop requested from GUI.')
+        return asyncio.run_coroutine_threadsafe(self._stop_screen_share(), self._loop)
+
     def stop(self) -> None:
         debug_log('python-controller', 'Stopping bridge server.')
         stop_future = asyncio.run_coroutine_threadsafe(self._bridge_server.stop(), self._loop)
@@ -79,4 +87,16 @@ class CaptureController:
         debug_log('python-controller', 'Sending popup text through the bridge.', {'characters': len(text)})
         result = await self._bridge_server.request_popup_show(text)
         self._events.put_nowait(('popup_status', result))
+        return result
+
+    async def _request_screen_share(self) -> dict[str, Any]:
+        debug_log('python-controller', 'Sending screen share request through the bridge.')
+        result = await self._bridge_server.request_screen_share_start()
+        self._events.put_nowait(('screen_share_status', result))
+        return result
+
+    async def _stop_screen_share(self) -> dict[str, Any]:
+        debug_log('python-controller', 'Sending screen share stop request through the bridge.')
+        result = await self._bridge_server.request_screen_share_stop()
+        self._events.put_nowait(('screen_share_status', result))
         return result

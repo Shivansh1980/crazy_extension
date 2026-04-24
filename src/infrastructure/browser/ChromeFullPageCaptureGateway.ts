@@ -2,6 +2,7 @@ import type { BrowserTab } from '../../domain/models/BrowserTab';
 import type { CapturedPage } from '../../domain/models/CapturedPage';
 import type { ExtensionSettings } from '../../domain/models/ExtensionSettings';
 import type { FullPageCaptureGateway } from '../../domain/ports/FullPageCaptureGateway';
+import { getBrowserCapabilities } from '../../shared/browserCapabilities';
 import { MAX_CAPTURE_AREA, MAX_CAPTURE_DIMENSION } from '../../shared/constants';
 import { ExtensionError } from '../../shared/errors';
 import { buildCaptureFileName } from '../../shared/fileName';
@@ -71,6 +72,11 @@ export class ChromeFullPageCaptureGateway implements FullPageCaptureGateway {
   }
 
   private async readDevicePixelRatio(tabId: number): Promise<number> {
+    const capabilities = getBrowserCapabilities();
+    if (!capabilities.scriptingApi) {
+      throw new ExtensionError('This browser does not support script injection required to inspect page metrics.');
+    }
+
     const results = await chrome.scripting.executeScript({
       target: { tabId },
       func: () => window.devicePixelRatio || 1

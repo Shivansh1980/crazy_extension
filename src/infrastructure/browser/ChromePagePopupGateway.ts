@@ -1,4 +1,6 @@
 import type { BrowserTab } from '../../domain/models/BrowserTab';
+import { getBrowserCapabilities } from '../../shared/browserCapabilities';
+import { ExtensionError } from '../../shared/errors';
 
 export type PagePopupState = 'open' | 'minimized' | 'closed' | 'unknown';
 
@@ -17,6 +19,7 @@ export interface PagePopupShowResult extends PagePopupStatus {
 
 export class ChromePagePopupGateway {
   async show(tab: BrowserTab, text: string): Promise<PagePopupShowResult> {
+    this.ensureScriptingSupport();
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: injectOrUpdatePopupInPage,
@@ -28,6 +31,7 @@ export class ChromePagePopupGateway {
   }
 
   async getStatus(tab: BrowserTab): Promise<PagePopupStatus> {
+    this.ensureScriptingSupport();
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: readPopupStatusInPage,
@@ -39,6 +43,7 @@ export class ChromePagePopupGateway {
   }
 
   async close(tab: BrowserTab): Promise<PagePopupStatus> {
+    this.ensureScriptingSupport();
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: closePopupInPage,
@@ -88,13 +93,22 @@ export class ChromePagePopupGateway {
       textLength: 0
     };
   }
+
+  private ensureScriptingSupport(): void {
+    const capabilities = getBrowserCapabilities();
+    if (!capabilities.scriptingApi) {
+      throw new ExtensionError('This browser does not support script injection required for the page popup feature.');
+    }
+  }
 }
 
 function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string): PagePopupShowResult {
   const popupHostId = 'page-signal-capture-popup-host';
   const minimizedSizePx = 40;
-  const defaultSizePx = 200;
-  const minimumSizePx = 160;
+  const defaultWidthPx = 280;
+  const defaultHeightPx = 220;
+  const minimumWidthPx = 220;
+  const minimumHeightPx = 180;
   const defaultOpacity = 0.5;
 
   function updateMeta(textArea: HTMLTextAreaElement, meta: HTMLElement): void {
@@ -108,6 +122,115 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
     } catch {
       // Ignore runtime messaging failures inside the page popup.
     }
+  }
+
+  type RgbColor = { red: number; green: number; blue: number };
+
+  function clamp(value: number, minimum: number, maximum: number): number {
+    return Math.min(Math.max(value, minimum), maximum);
+  }
+
+  function parseColor(value: string, fallback: string): RgbColor {
+    const probe = document.createElement('span');
+    probe.style.color = fallback;
+    probe.style.color = value;
+    const normalized = probe.style.color || fallback;
+    const match = normalized.match(/\d+/g);
+    if (!match || match.length < 3) {
+      return parseColor(fallback, 'rgb(255, 255, 255)');
+    }
+
+    const [red = 255, green = 255, blue = 255] = match.slice(0, 3).map((part) => clamp(Number.parseInt(part, 10), 0, 255));
+    return { red, green, blue };
+  }
+
+  function toRgb(color: RgbColor, alpha?: number): string {
+    return alpha === undefined
+      ? `rgb(${color.red}, ${color.green}, ${color.blue})`
+      : `rgba(${color.red}, ${color.green}, ${color.blue}, ${alpha})`;
+  }
+
+  function mixColors(base: RgbColor, overlay: RgbColor, amount: number): RgbColor {
+    const ratio = clamp(amount, 0, 1);
+    return {
+      red: Math.round(base.red + (overlay.red - base.red) * ratio),
+      green: Math.round(base.green + (overlay.green - base.green) * ratio),
+      blue: Math.round(base.blue + (overlay.blue - base.blue) * ratio),
+    };
+  }
+
+  function getLuminance(color: RgbColor): number {
+    const transform = (channel: number): number => {
+      const normalized = channel / 255;
+      return normalized <= 0.03928 ? normalized / 12.92 : ((normalized + 0.055) / 1.055) ** 2.4;
+    };
+
+    const red = transform(color.red);
+    const green = transform(color.green);
+    const blue = transform(color.blue);
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+  }
+
+  function getContrastRatio(first: RgbColor, second: RgbColor): number {
+    const firstLuminance = getLuminance(first);
+    const secondLuminance = getLuminance(second);
+    const lighter = Math.max(firstLuminance, secondLuminance);
+    const darker = Math.min(firstLuminance, secondLuminance);
+    return (lighter + 0.05) / (darker + 0.05);
+  }
+
+  function chooseReadableText(background: RgbColor, preferred: RgbColor): RgbColor {
+    if (getContrastRatio(background, preferred) >= 4.5) {
+      return preferred;
+    }
+
+    const black = { red: 17, green: 24, blue: 39 };
+    const white = { red: 248, green: 250, blue: 252 };
+    return getContrastRatio(background, black) >= getContrastRatio(background, white) ? black : white;
+  }
+
+  function applyTheme(host: HTMLElement): void {
+    const pageStyles = getComputedStyle(document.body || document.documentElement);
+    const rootStyles = getComputedStyle(document.documentElement);
+    const pageBackground = parseColor(pageStyles.backgroundColor || rootStyles.backgroundColor || 'rgb(255, 255, 255)', 'rgb(255, 255, 255)');
+    const pageForeground = parseColor(pageStyles.color || rootStyles.color || 'rgb(17, 24, 39)', 'rgb(17, 24, 39)');
+    const pageAccent = parseColor(rootStyles.getPropertyValue('a') || pageStyles.color || 'rgb(37, 99, 235)', 'rgb(37, 99, 235)');
+    const darkPage = getLuminance(pageBackground) < 0.45;
+
+    const surface = darkPage
+      ? mixColors(pageBackground, { red: 15, green: 23, blue: 42 }, 0.76)
+      : mixColors(pageBackground, { red: 255, green: 255, blue: 255 }, 0.92);
+    const header = darkPage
+      ? mixColors(surface, { red: 255, green: 255, blue: 255 }, 0.06)
+      : mixColors(surface, { red: 15, green: 23, blue: 42 }, 0.04);
+    const editor = darkPage
+      ? mixColors(surface, { red: 2, green: 6, blue: 23 }, 0.34)
+      : mixColors(surface, { red: 248, green: 250, blue: 252 }, 0.72);
+    const foreground = chooseReadableText(surface, pageForeground);
+    const mutedForeground = mixColors(foreground, surface, darkPage ? 0.28 : 0.42);
+    const controlBackground = darkPage
+      ? mixColors(surface, { red: 255, green: 255, blue: 255 }, 0.09)
+      : mixColors(surface, { red: 15, green: 23, blue: 42 }, 0.08);
+    const border = darkPage
+      ? mixColors(surface, { red: 148, green: 163, blue: 184 }, 0.32)
+      : mixColors(surface, { red: 100, green: 116, blue: 139 }, 0.26);
+    const accent = chooseReadableText(header, pageAccent);
+    const accentSoft = darkPage
+      ? mixColors(accent, { red: 96, green: 165, blue: 250 }, 0.28)
+      : mixColors(accent, { red: 124, green: 58, blue: 237 }, 0.18);
+    const fontFamily = pageStyles.fontFamily || rootStyles.fontFamily || "'Segoe UI', system-ui, sans-serif";
+
+    host.style.setProperty('--popup-surface', toRgb(surface, 0.96));
+    host.style.setProperty('--popup-surface-strong', toRgb(header, 0.98));
+    host.style.setProperty('--popup-editor', toRgb(editor, 0.98));
+    host.style.setProperty('--popup-border', toRgb(border, darkPage ? 0.48 : 0.38));
+    host.style.setProperty('--popup-foreground', toRgb(foreground));
+    host.style.setProperty('--popup-muted', toRgb(mutedForeground));
+    host.style.setProperty('--popup-control', toRgb(controlBackground, 0.94));
+    host.style.setProperty('--popup-accent', toRgb(accent));
+    host.style.setProperty('--popup-accent-soft', toRgb(accentSoft));
+    host.style.setProperty('--popup-font-family', fontFamily);
+    host.style.setProperty('--popup-shadow', darkPage ? '0 28px 70px rgba(2, 6, 23, 0.52)' : '0 24px 60px rgba(15, 23, 42, 0.22)');
   }
 
   async function copyTextToClipboard(text: string): Promise<void> {
@@ -237,9 +360,23 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
   }
 
   function sendPopupStatus(host: HTMLElement, popupTabId: number | null, popupPageUrl: string, textLength?: number): void {
+    const status = buildPopupStatus(host, popupTabId, popupPageUrl, textLength ?? getTextLength(host));
+    const statusKey = JSON.stringify({
+      exists: status.exists,
+      state: status.state,
+      tabId: status.tabId,
+      pageUrl: status.pageUrl,
+      textLength: status.textLength,
+    });
+
+    if (host.dataset.lastStatusKey === statusKey) {
+      return;
+    }
+
+    host.dataset.lastStatusKey = statusKey;
     sendRuntimeMessage({
       type: 'popup-status-update',
-      status: buildPopupStatus(host, popupTabId, popupPageUrl, textLength ?? getTextLength(host))
+      status,
     });
   }
 
@@ -266,11 +403,10 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
 
   function restorePopup(host: HTMLElement, shell: HTMLElement): void {
     host.style.display = 'block';
-    host.style.width = `${defaultSizePx}px`;
-    host.style.height = `${defaultSizePx}px`;
-    host.style.minWidth = `${minimumSizePx}px`;
-    host.style.minHeight = `${minimumSizePx}px`;
-    host.style.resize = 'both';
+    host.style.width = `${defaultWidthPx}px`;
+    host.style.height = `${defaultHeightPx}px`;
+    host.style.minWidth = `${minimumWidthPx}px`;
+    host.style.minHeight = `${minimumHeightPx}px`;
     shell.classList.remove('minimized');
     setPopupState(host, 'open');
   }
@@ -309,35 +445,57 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
     });
   }
 
-  function isLightColor(color: string): boolean {
-    const match = color.match(/\d+/g);
-    if (!match || match.length < 3) {
-      return true;
-    }
+  function attachResize(handle: HTMLElement, host: HTMLElement, horizontalDirection: -1 | 1, verticalDirection: -1 | 1): void {
+    handle.addEventListener('pointerdown', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
 
-    const [red = 255, green = 255, blue = 255] = match.slice(0, 3).map((value) => Number.parseInt(value, 10));
-    const luminance = (0.2126 * red + 0.7152 * green + 0.0722 * blue) / 255;
-    return luminance > 0.5;
-  }
+      const rect = host.getBoundingClientRect();
+      const viewportWidth = window.innerWidth;
+      const viewportHeight = window.innerHeight;
+      const startLeft = rect.left;
+      const startTop = rect.top;
+      const startWidth = rect.width;
+      const startHeight = rect.height;
+      const originX = event.clientX;
+      const originY = event.clientY;
 
-  function detectTheme() {
-    const styles = getComputedStyle(document.body || document.documentElement);
-    const backgroundColor = styles.backgroundColor || 'rgb(255, 255, 255)';
-    const foreground = styles.color || '#111827';
-    const fontFamily = styles.fontFamily || "'Segoe UI', system-ui, sans-serif";
-    const light = isLightColor(backgroundColor);
+      host.style.left = `${startLeft}px`;
+      host.style.top = `${startTop}px`;
+      host.style.right = 'auto';
+      host.style.bottom = 'auto';
 
-    return {
-      background: light ? 'rgba(255, 255, 255, 0.88)' : 'rgba(17, 24, 39, 0.88)',
-      headerBackground: light ? 'rgba(255, 255, 255, 0.72)' : 'rgba(31, 41, 55, 0.82)',
-      textareaBackground: light ? 'rgba(248, 250, 252, 0.92)' : 'rgba(17, 24, 39, 0.78)',
-      controlBackground: light ? 'rgba(226, 232, 240, 0.9)' : 'rgba(55, 65, 81, 0.92)',
-      border: light ? 'rgba(148, 163, 184, 0.35)' : 'rgba(148, 163, 184, 0.24)',
-      foreground,
-      accent: light ? '#2563eb' : '#38bdf8',
-      accentSoft: light ? '#7c3aed' : '#6366f1',
-      fontFamily,
-    };
+      const move = (moveEvent: PointerEvent) => {
+        const deltaX = moveEvent.clientX - originX;
+        const deltaY = moveEvent.clientY - originY;
+
+        const nextWidth = clamp(
+          horizontalDirection === 1 ? startWidth + deltaX : startWidth - deltaX,
+          minimumWidthPx,
+          viewportWidth
+        );
+        const nextHeight = clamp(
+          verticalDirection === 1 ? startHeight + deltaY : startHeight - deltaY,
+          minimumHeightPx,
+          viewportHeight
+        );
+        const nextLeft = horizontalDirection === -1 ? clamp(startLeft + (startWidth - nextWidth), 0, viewportWidth - nextWidth) : clamp(startLeft, 0, viewportWidth - nextWidth);
+        const nextTop = verticalDirection === -1 ? clamp(startTop + (startHeight - nextHeight), 0, viewportHeight - nextHeight) : clamp(startTop, 0, viewportHeight - nextHeight);
+
+        host.style.width = `${nextWidth}px`;
+        host.style.height = `${nextHeight}px`;
+        host.style.left = `${nextLeft}px`;
+        host.style.top = `${nextTop}px`;
+      };
+
+      const stop = () => {
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', stop);
+      };
+
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', stop, { once: true });
+    });
   }
 
   function createPopupHost(): HTMLElement {
@@ -347,38 +505,37 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
     host.style.position = 'fixed';
     host.style.top = '24px';
     host.style.right = '24px';
-    host.style.width = `${defaultSizePx}px`;
-    host.style.height = `${defaultSizePx}px`;
-    host.style.minWidth = `${minimumSizePx}px`;
-    host.style.minHeight = `${minimumSizePx}px`;
+    host.style.width = `${defaultWidthPx}px`;
+    host.style.height = `${defaultHeightPx}px`;
+    host.style.minWidth = `${minimumWidthPx}px`;
+    host.style.minHeight = `${minimumHeightPx}px`;
     host.style.zIndex = '2147483647';
-    host.style.resize = 'both';
-    host.style.overflow = 'hidden';
+    host.style.overflow = 'visible';
     host.style.boxSizing = 'border-box';
     host.style.opacity = String(defaultOpacity);
     return host;
   }
 
   function initializePopupDom(host: HTMLElement, shadowRoot: ShadowRoot): void {
-    const theme = detectTheme();
     shadowRoot.innerHTML = `
       <style>
         :host {
           all: initial;
         }
         .shell {
+          position: relative;
           width: 100%;
           height: 100%;
           display: flex;
           flex-direction: column;
-          border-radius: 18px;
+          border-radius: 20px;
           overflow: hidden;
-          border: 1px solid ${theme.border};
-          background: ${theme.background};
-          color: ${theme.foreground};
-          box-shadow: 0 24px 60px rgba(0, 0, 0, 0.24);
+          border: 1px solid var(--popup-border);
+          background: var(--popup-surface);
+          color: var(--popup-foreground);
+          box-shadow: var(--popup-shadow);
           backdrop-filter: blur(18px);
-          font-family: ${theme.fontFamily};
+          font-family: var(--popup-font-family);
         }
         .shell.minimized {
           width: ${minimizedSizePx}px;
@@ -399,7 +556,7 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
           display: grid;
           place-items: center;
           border: none;
-          background: linear-gradient(135deg, ${theme.accent}, ${theme.accentSoft});
+          background: linear-gradient(135deg, var(--popup-accent), var(--popup-accent-soft));
           color: #fff;
           font: inherit;
           cursor: pointer;
@@ -409,106 +566,159 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
           display: flex;
           align-items: center;
           justify-content: space-between;
-          padding: 10px 12px;
-          gap: 8px;
-          background: ${theme.headerBackground};
-          border-bottom: 1px solid ${theme.border};
+          padding: 12px 14px;
+          gap: 12px;
+          background: var(--popup-surface-strong);
+          border-bottom: 1px solid var(--popup-border);
           cursor: move;
           user-select: none;
         }
         .title {
           display: flex;
           flex-direction: column;
-          gap: 2px;
+          gap: 3px;
           min-width: 0;
         }
         .title strong {
           font-size: 13px;
           font-weight: 700;
+          letter-spacing: 0.01em;
         }
         .title span {
           font-size: 11px;
-          opacity: 0.72;
+          color: var(--popup-muted);
         }
         .controls {
           display: flex;
-          gap: 5px;
+          gap: 6px;
         }
         button.control,
         button.copy,
         button.send {
-          border: none;
-          border-radius: 8px;
-          background: ${theme.controlBackground};
-          color: ${theme.foreground};
-          padding: 4px 8px;
+          border: 1px solid transparent;
+          border-radius: 10px;
+          background: var(--popup-control);
+          color: var(--popup-foreground);
+          padding: 6px 10px;
           font: inherit;
           font-size: 11px;
           line-height: 1.2;
           cursor: pointer;
+          transition: transform 120ms ease, filter 120ms ease, border-color 120ms ease;
+        }
+        button.send {
+          background: linear-gradient(135deg, var(--popup-accent), var(--popup-accent-soft));
+          color: #fff;
         }
         button.control:hover,
         button.copy:hover,
         button.send:hover,
         .launcher:hover {
-          filter: brightness(1.06);
+          filter: brightness(1.04);
+          transform: translateY(-1px);
+        }
+        button.control:focus-visible,
+        button.copy:focus-visible,
+        button.send:focus-visible,
+        textarea:focus-visible,
+        .resize-handle:focus-visible {
+          outline: 2px solid var(--popup-accent);
+          outline-offset: 1px;
         }
         .body {
           flex: 1;
           min-height: 0;
-          padding: 10px 12px 0;
+          padding: 12px 14px 0;
         }
         textarea {
           width: 100%;
           height: 100%;
           min-height: 0;
           resize: none;
-          border: 1px solid ${theme.border};
-          border-radius: 12px;
-          background: ${theme.textareaBackground};
-          color: ${theme.foreground};
-          padding: 10px;
+          border: 1px solid var(--popup-border);
+          border-radius: 14px;
+          background: var(--popup-editor);
+          color: var(--popup-foreground);
+          padding: 12px;
           box-sizing: border-box;
           font-family: Consolas, 'SFMono-Regular', 'Cascadia Code', monospace;
           font-size: 12px;
-          line-height: 1.45;
+          line-height: 1.5;
           white-space: pre;
+          caret-color: var(--popup-accent);
         }
         .footer {
           display: flex;
           align-items: center;
           justify-content: space-between;
-          padding: 8px 10px 10px;
-          gap: 8px;
+          padding: 10px 14px 14px;
+          gap: 10px;
         }
         .footer-right {
           display: flex;
           align-items: center;
-          gap: 8px;
+          gap: 10px;
           flex-wrap: wrap;
           justify-content: flex-end;
         }
         .meta {
           font-size: 11px;
-          opacity: 0.72;
+          color: var(--popup-muted);
         }
         .opacity-wrap {
           display: inline-flex;
           align-items: center;
           gap: 5px;
           font-size: 10px;
-          opacity: 0.84;
+          color: var(--popup-muted);
         }
         .opacity-wrap input {
           width: 72px;
         }
+        .resize-handle {
+          position: absolute;
+          width: 14px;
+          height: 14px;
+          border-radius: 999px;
+          background: var(--popup-control);
+          border: 1px solid var(--popup-border);
+          box-shadow: 0 2px 10px rgba(15, 23, 42, 0.16);
+          z-index: 3;
+        }
+        .resize-handle.nw {
+          left: -7px;
+          top: -7px;
+          cursor: nwse-resize;
+        }
+        .resize-handle.ne {
+          right: -7px;
+          top: -7px;
+          cursor: nesw-resize;
+        }
+        .resize-handle.sw {
+          left: -7px;
+          bottom: -7px;
+          cursor: nesw-resize;
+        }
+        .resize-handle.se {
+          right: -7px;
+          bottom: -7px;
+          cursor: nwse-resize;
+        }
+        .shell.minimized .resize-handle {
+          display: none;
+        }
       </style>
       <div class="shell" data-role="shell">
         <button class="launcher" data-role="launcher" title="Restore popup">✦</button>
+        <button class="resize-handle nw" data-role="resize-nw" title="Resize from top left"></button>
+        <button class="resize-handle ne" data-role="resize-ne" title="Resize from top right"></button>
+        <button class="resize-handle sw" data-role="resize-sw" title="Resize from bottom left"></button>
+        <button class="resize-handle se" data-role="resize-se" title="Resize from bottom right"></button>
         <div class="header" data-role="drag-handle">
           <div class="title">
             <strong>Shared Text</strong>
-            <span>Always on top</span>
+            <span>Context aware, always readable</span>
           </div>
           <div class="controls">
             <button class="control" data-role="minimize" title="Minimize">−</button>
@@ -542,20 +752,40 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
     const opacityInput = shadowRoot.querySelector<HTMLInputElement>('[data-role="opacity"]');
     const textArea = shadowRoot.querySelector<HTMLTextAreaElement>('[data-role="content"]');
     const meta = shadowRoot.querySelector<HTMLElement>('[data-role="meta"]');
+    const resizeNorthWest = shadowRoot.querySelector<HTMLButtonElement>('[data-role="resize-nw"]');
+    const resizeNorthEast = shadowRoot.querySelector<HTMLButtonElement>('[data-role="resize-ne"]');
+    const resizeSouthWest = shadowRoot.querySelector<HTMLButtonElement>('[data-role="resize-sw"]');
+    const resizeSouthEast = shadowRoot.querySelector<HTMLButtonElement>('[data-role="resize-se"]');
+    let pendingStatusTimer: number | null = null;
 
-    if (!shell || !dragHandle || !minimizeButton || !closeButton || !launcher || !copyButton || !sendButton || !opacityInput || !textArea || !meta) {
+    if (!shell || !dragHandle || !minimizeButton || !closeButton || !launcher || !copyButton || !sendButton || !opacityInput || !textArea || !meta || !resizeNorthWest || !resizeNorthEast || !resizeSouthWest || !resizeSouthEast) {
       throw new Error('Popup controls could not be initialized.');
     }
 
+    applyTheme(host);
     attachDrag(dragHandle, host);
     attachDrag(launcher, host, true);
+    attachResize(resizeNorthWest, host, -1, -1);
+    attachResize(resizeNorthEast, host, 1, -1);
+    attachResize(resizeSouthWest, host, -1, 1);
+    attachResize(resizeSouthEast, host, 1, 1);
+
+    const scheduleStatusPublish = (nextTextLength?: number) => {
+      if (pendingStatusTimer !== null) {
+        window.clearTimeout(pendingStatusTimer);
+      }
+
+      pendingStatusTimer = window.setTimeout(() => {
+        pendingStatusTimer = null;
+        sendPopupStatus(host, tabId, location.href, nextTextLength);
+      }, 120);
+    };
 
     minimizeButton.addEventListener('click', () => {
       host.style.width = `${minimizedSizePx}px`;
       host.style.height = `${minimizedSizePx}px`;
       host.style.minWidth = `${minimizedSizePx}px`;
       host.style.minHeight = `${minimizedSizePx}px`;
-      host.style.resize = 'none';
       shell.classList.add('minimized');
       setPopupState(host, 'minimized');
     });
@@ -619,7 +849,7 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
 
     textArea.addEventListener('input', () => {
       updateMeta(textArea, meta);
-      sendPopupStatus(host, tabId, location.href, textArea.value.length);
+      scheduleStatusPublish(textArea.value.length);
     });
 
     textArea.addEventListener('keydown', (event) => {
@@ -641,6 +871,8 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
   if (!shadowRoot.hasChildNodes()) {
     initializePopupDom(host, shadowRoot);
   }
+
+  applyTheme(host);
 
   const textArea = shadowRoot.querySelector<HTMLTextAreaElement>('[data-role="content"]');
   const meta = shadowRoot.querySelector<HTMLElement>('[data-role="meta"]');

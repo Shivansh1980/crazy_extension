@@ -422,11 +422,12 @@ var require_offscreen = __commonJS({
             clientId: this.clientId,
             name: BRIDGE_CLIENT_NAME,
             version: "1.0.0",
-            capabilities: ["capture.full-page"]
+            capabilities: ["capture.full-page", "screen-share.preview"]
           });
           this.flushPendingBridgeMessages();
           void this.publishPopupStatus();
           void this.publishPopupMessageHistory();
+          void this.publishScreenShareStatus();
           void this.updateStatus({
             state: "connected",
             updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
@@ -563,6 +564,52 @@ var require_offscreen = __commonJS({
           }
           return;
         }
+        if (message.type === "screen-share.start") {
+          try {
+            debugLog("offscreen", "Processing screen share start request.", { requestId: message.requestId });
+            const response = await this.requestScreenShareStart();
+            if (!response.ok || !response.status) {
+              throw new Error(response.message || "The background worker returned an empty screen share response.");
+            }
+            this.sendOrQueueBridgeMessage({
+              type: "screen-share.result",
+              requestId: message.requestId,
+              status: response.status
+            });
+          } catch (error) {
+            const messageText = error instanceof Error ? error.message : "Screen share request failed.";
+            debugError("offscreen", "Screen share request failed.", { requestId: message.requestId, error: messageText });
+            this.sendOrQueueBridgeMessage({
+              type: "screen-share.error",
+              requestId: message.requestId,
+              message: messageText
+            });
+          }
+          return;
+        }
+        if (message.type === "screen-share.stop") {
+          try {
+            debugLog("offscreen", "Processing screen share stop request.", { requestId: message.requestId });
+            const response = await this.requestScreenShareStop();
+            if (!response.ok || !response.status) {
+              throw new Error(response.message || "The background worker returned an empty screen share stop response.");
+            }
+            this.sendOrQueueBridgeMessage({
+              type: "screen-share.stop-result",
+              requestId: message.requestId,
+              status: response.status
+            });
+          } catch (error) {
+            const messageText = error instanceof Error ? error.message : "Screen share stop request failed.";
+            debugError("offscreen", "Screen share stop request failed.", { requestId: message.requestId, error: messageText });
+            this.sendOrQueueBridgeMessage({
+              type: "screen-share.stop-error",
+              requestId: message.requestId,
+              message: messageText
+            });
+          }
+          return;
+        }
         try {
           debugLog("offscreen", "Processing capture request.", { requestId: message.requestId, targetUrl });
           const response = await this.requestCapture(settings);
@@ -617,6 +664,30 @@ var require_offscreen = __commonJS({
       async requestPagePopup(text) {
         return new Promise((resolve, reject) => {
           chrome.runtime.sendMessage({ type: "bridge-popup-show", text }, (response) => {
+            const runtimeError = chrome.runtime.lastError;
+            if (runtimeError) {
+              reject(new Error(runtimeError.message));
+              return;
+            }
+            resolve(response ?? { ok: false, message: "No response from background worker." });
+          });
+        });
+      }
+      async requestScreenShareStart() {
+        return new Promise((resolve, reject) => {
+          chrome.runtime.sendMessage({ type: "bridge-screen-share-start" }, (response) => {
+            const runtimeError = chrome.runtime.lastError;
+            if (runtimeError) {
+              reject(new Error(runtimeError.message));
+              return;
+            }
+            resolve(response ?? { ok: false, message: "No response from background worker." });
+          });
+        });
+      }
+      async requestScreenShareStop() {
+        return new Promise((resolve, reject) => {
+          chrome.runtime.sendMessage({ type: "bridge-screen-share-stop" }, (response) => {
             const runtimeError = chrome.runtime.lastError;
             if (runtimeError) {
               reject(new Error(runtimeError.message));
@@ -686,6 +757,25 @@ var require_offscreen = __commonJS({
           }
         } catch (error) {
           debugWarn("offscreen", "Unable to publish popup message history.", error);
+        }
+      }
+      async publishScreenShareStatus() {
+        try {
+          const response = await new Promise((resolve, reject) => {
+            chrome.runtime.sendMessage({ type: "screen-share-status-get" }, (message) => {
+              const runtimeError = chrome.runtime.lastError;
+              if (runtimeError) {
+                reject(new Error(runtimeError.message));
+                return;
+              }
+              resolve(message ?? { ok: false });
+            });
+          });
+          if (response.ok && response.status) {
+            this.sendOrQueueBridgeMessage({ type: "screen-share.status", status: response.status });
+          }
+        } catch (error) {
+          debugWarn("offscreen", "Unable to publish screen share status.", error);
         }
       }
       send(message) {
@@ -1064,6 +1154,14 @@ var require_offscreen = __commonJS({
               characters: payload.text.length
             });
             this.sendOrQueueBridgeMessage({ type: "popup.message", ...payload });
+            sendResponse({ ok: true });
+            return true;
+          }
+          if (message?.type === "screen-share-status-changed") {
+            debugLog("offscreen", "Received screen share status update from background.", message.status);
+            if (message.status) {
+              this.sendOrQueueBridgeMessage({ type: "screen-share.status", status: message.status });
+            }
             sendResponse({ ok: true });
             return true;
           }

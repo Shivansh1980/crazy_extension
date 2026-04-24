@@ -1,7 +1,9 @@
+import { getBrowserCapabilities } from '../../shared/browserCapabilities';
 import { ExtensionError } from '../../shared/errors';
 
 export class ChromeDebuggerClient {
   async attach(debuggee: chrome.debugger.Debuggee): Promise<void> {
+    this.ensureDebuggerSupport();
     await this.promisify<void>((callback) => chrome.debugger.attach(debuggee, '1.3', callback));
   }
 
@@ -21,6 +23,7 @@ export class ChromeDebuggerClient {
     method: string,
     commandParams?: Record<string, unknown>
   ): Promise<TResponse> {
+    this.ensureDebuggerSupport();
     return new Promise<TResponse>((resolve, reject) => {
       chrome.debugger.sendCommand(debuggee, method, commandParams, (result) => {
         const runtimeError = chrome.runtime.lastError;
@@ -32,6 +35,13 @@ export class ChromeDebuggerClient {
         resolve(result as TResponse);
       });
     });
+  }
+
+  private ensureDebuggerSupport(): void {
+    const capabilities = getBrowserCapabilities();
+    if (!capabilities.debuggerApi) {
+      throw new ExtensionError('This browser does not support the debugger API required for full-page capture.');
+    }
   }
 
   private promisify<T>(executor: (callback: (value?: T) => void) => void): Promise<T> {

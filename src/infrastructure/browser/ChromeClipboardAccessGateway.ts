@@ -1,4 +1,6 @@
 import type { BrowserTab } from '../../domain/models/BrowserTab';
+import { getBrowserCapabilities } from '../../shared/browserCapabilities';
+import { ExtensionError } from '../../shared/errors';
 
 export interface ClipboardAccessEnableResult {
   tabId: number;
@@ -18,6 +20,11 @@ interface FrameClipboardAccessEnableResult {
 
 export class ChromeClipboardAccessGateway {
   async enable(tab: BrowserTab): Promise<ClipboardAccessEnableResult> {
+    const capabilities = getBrowserCapabilities();
+    if (!capabilities.scriptingApi) {
+      throw new ExtensionError('This browser does not support script injection required for page copy and paste enablement.');
+    }
+
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id, allFrames: true },
       world: 'MAIN',
