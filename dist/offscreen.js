@@ -405,6 +405,7 @@ var require_offscreen = __commonJS({
           targetUrl: endpoint.targetUrl
         });
         const socket = new WebSocket(endpoint.targetUrl);
+        socket.binaryType = "arraybuffer";
         this.socket = socket;
         socket.addEventListener("open", () => {
           if (generation !== this.connectionGeneration) {
@@ -484,7 +485,12 @@ var require_offscreen = __commonJS({
         if (generation !== this.connectionGeneration) {
           return;
         }
-        const payload = typeof rawData === "string" ? rawData : new TextDecoder().decode(rawData);
+        if (typeof rawData !== "string") {
+          const binaryPayload = rawData instanceof Blob ? await rawData.arrayBuffer() : rawData;
+          await this.handleBinaryMessage(binaryPayload, targetUrl);
+          return;
+        }
+        const payload = rawData;
         let message;
         try {
           message = JSON.parse(payload);
@@ -610,6 +616,127 @@ var require_offscreen = __commonJS({
           }
           return;
         }
+        if (message.type === "screen-share.click") {
+          try {
+            debugLog("offscreen", "Processing screen share click request.", {
+              requestId: message.requestId,
+              normalizedX: message.normalizedX,
+              normalizedY: message.normalizedY
+            });
+            const response = await this.requestScreenShareClick(message.normalizedX, message.normalizedY);
+            if (!response.ok) {
+              throw new Error(response.message || "The background worker returned an empty screen share click response.");
+            }
+            this.sendOrQueueBridgeMessage({
+              type: "screen-share.click-result",
+              requestId: message.requestId,
+              message: response.message ?? "Remote click delivered to the shared page.",
+              targetDescription: response.targetDescription ?? "page element",
+              viewportWidth: response.viewportWidth ?? 0,
+              viewportHeight: response.viewportHeight ?? 0
+            });
+          } catch (error) {
+            const messageText = error instanceof Error ? error.message : "Screen share click request failed.";
+            debugError("offscreen", "Screen share click request failed.", { requestId: message.requestId, error: messageText });
+            this.sendOrQueueBridgeMessage({
+              type: "screen-share.click-error",
+              requestId: message.requestId,
+              message: messageText
+            });
+          }
+          return;
+        }
+        if (message.type === "screen-share.input") {
+          try {
+            const response = await this.requestScreenShareInput({
+              action: message.action,
+              normalizedX: message.normalizedX,
+              normalizedY: message.normalizedY,
+              button: message.button,
+              buttons: message.buttons,
+              deltaX: message.deltaX,
+              deltaY: message.deltaY,
+              modifiers: message.modifiers
+            });
+            if (!response.ok) {
+              throw new Error(response.message || "The background worker returned an empty screen share input response.");
+            }
+            this.sendOrQueueBridgeMessage({
+              type: "screen-share.input-result",
+              requestId: message.requestId,
+              message: response.message ?? "Remote input delivered to the shared page.",
+              targetDescription: response.targetDescription ?? "page element",
+              viewportWidth: response.viewportWidth ?? 0,
+              viewportHeight: response.viewportHeight ?? 0
+            });
+          } catch (error) {
+            const messageText = error instanceof Error ? error.message : "Screen share input request failed.";
+            debugError("offscreen", "Screen share input request failed.", { requestId: message.requestId, error: messageText });
+            this.sendOrQueueBridgeMessage({
+              type: "screen-share.input-error",
+              requestId: message.requestId,
+              message: messageText
+            });
+          }
+          return;
+        }
+        if (message.type === "screen-share.key") {
+          try {
+            const response = await this.requestScreenShareKey({
+              action: message.action,
+              key: message.key,
+              code: message.code,
+              text: message.text,
+              modifiers: message.modifiers
+            });
+            if (!response.ok) {
+              throw new Error(response.message || "The background worker returned an empty screen share key response.");
+            }
+            this.sendOrQueueBridgeMessage({
+              type: "screen-share.key-result",
+              requestId: message.requestId,
+              message: response.message ?? "Remote key event delivered to the shared page.",
+              targetDescription: response.targetDescription ?? "focused element"
+            });
+          } catch (error) {
+            const messageText = error instanceof Error ? error.message : "Screen share key request failed.";
+            debugError("offscreen", "Screen share key request failed.", { requestId: message.requestId, error: messageText });
+            this.sendOrQueueBridgeMessage({
+              type: "screen-share.key-error",
+              requestId: message.requestId,
+              message: messageText
+            });
+          }
+          return;
+        }
+        if (message.type === "screen-share.paste") {
+          try {
+            debugLog("offscreen", "Processing screen share paste request.", {
+              requestId: message.requestId,
+              characters: message.text.length
+            });
+            const response = await this.requestScreenSharePaste(message.text);
+            if (!response.ok) {
+              throw new Error(response.message || "The background worker returned an empty screen share paste response.");
+            }
+            this.sendOrQueueBridgeMessage({
+              type: "screen-share.paste-result",
+              requestId: message.requestId,
+              message: response.message ?? "Clipboard text inserted into the shared page.",
+              targetDescription: response.targetDescription ?? "focused element",
+              characterCount: response.characterCount ?? message.text.length
+            });
+          } catch (error) {
+            const messageText = error instanceof Error ? error.message : "Screen share paste request failed.";
+            debugError("offscreen", "Screen share paste request failed.", { requestId: message.requestId, error: messageText });
+            this.sendOrQueueBridgeMessage({
+              type: "screen-share.paste-error",
+              requestId: message.requestId,
+              message: messageText
+            });
+          }
+          return;
+        }
         try {
           debugLog("offscreen", "Processing capture request.", { requestId: message.requestId, targetUrl });
           const response = await this.requestCapture(settings);
@@ -638,6 +765,71 @@ var require_offscreen = __commonJS({
           this.sendOrQueueBridgeMessage({
             type: "capture.error",
             requestId: message.requestId,
+            message: messageText
+          });
+        }
+      }
+      async handleBinaryMessage(rawData, targetUrl) {
+        const envelope = new Uint8Array(rawData);
+        if (envelope.byteLength < 5) {
+          debugWarn("offscreen", "Ignoring malformed binary bridge payload.", { bytes: envelope.byteLength });
+          return;
+        }
+        const view = new DataView(envelope.buffer, envelope.byteOffset, envelope.byteLength);
+        const metadataLength = view.getUint32(0);
+        if (metadataLength <= 0 || envelope.byteLength < 4 + metadataLength) {
+          debugWarn("offscreen", "Ignoring binary bridge payload with invalid metadata length.", {
+            bytes: envelope.byteLength,
+            metadataLength
+          });
+          return;
+        }
+        let metadata;
+        try {
+          metadata = JSON.parse(new TextDecoder().decode(envelope.slice(4, 4 + metadataLength)));
+        } catch (error) {
+          debugWarn("offscreen", "Ignoring binary bridge payload with invalid JSON metadata.", error);
+          return;
+        }
+        if (metadata.type !== "file-transfer.upload.binary") {
+          debugWarn("offscreen", "Ignoring unsupported binary bridge payload type.", metadata.type);
+          return;
+        }
+        const fileBytes = envelope.slice(4 + metadataLength);
+        try {
+          const response = await this.requestBrowserDownload(metadata.fileName, metadata.mimeType, fileBytes);
+          if (!response.ok) {
+            throw new Error(response.message || "The background worker returned an empty browser download response.");
+          }
+          await this.updateStatus({
+            state: "success",
+            updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+            message: `Browser download started for ${metadata.fileName}.`,
+            lastFileName: metadata.fileName,
+            targetUrl
+          });
+          this.sendOrQueueBridgeMessage({
+            type: "file-transfer.result",
+            requestId: metadata.requestId,
+            fileName: metadata.fileName,
+            savedPath: response.savedPath ?? metadata.fileName,
+            byteCount: metadata.byteCount,
+            downloadedAt: (/* @__PURE__ */ new Date()).toISOString(),
+            message: response.message ?? `${metadata.fileName} download started in the browser.`
+          });
+        } catch (error) {
+          const messageText = error instanceof Error ? error.message : "Browser download request failed.";
+          debugError("offscreen", "Browser download request failed.", { requestId: metadata.requestId, error: messageText });
+          await this.updateStatus({
+            state: "error",
+            updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+            message: messageText,
+            lastFileName: null,
+            targetUrl
+          });
+          this.sendOrQueueBridgeMessage({
+            type: "file-transfer.error",
+            requestId: metadata.requestId,
             message: messageText
           });
         }
@@ -696,6 +888,87 @@ var require_offscreen = __commonJS({
             resolve(response ?? { ok: false, message: "No response from background worker." });
           });
         });
+      }
+      async requestScreenShareClick(normalizedX, normalizedY) {
+        return new Promise((resolve, reject) => {
+          chrome.runtime.sendMessage({ type: "bridge-screen-share-click", normalizedX, normalizedY }, (response) => {
+            const runtimeError = chrome.runtime.lastError;
+            if (runtimeError) {
+              reject(new Error(runtimeError.message));
+              return;
+            }
+            resolve(response ?? { ok: false, message: "No response from background worker." });
+          });
+        });
+      }
+      async requestScreenSharePaste(text) {
+        return new Promise((resolve, reject) => {
+          chrome.runtime.sendMessage({ type: "bridge-screen-share-paste", text }, (response) => {
+            const runtimeError = chrome.runtime.lastError;
+            if (runtimeError) {
+              reject(new Error(runtimeError.message));
+              return;
+            }
+            resolve(response ?? { ok: false, message: "No response from background worker." });
+          });
+        });
+      }
+      async requestScreenShareInput(payload) {
+        return new Promise((resolve, reject) => {
+          chrome.runtime.sendMessage({ type: "bridge-screen-share-input", payload }, (response) => {
+            const runtimeError = chrome.runtime.lastError;
+            if (runtimeError) {
+              reject(new Error(runtimeError.message));
+              return;
+            }
+            resolve(response ?? { ok: false, message: "No response from background worker." });
+          });
+        });
+      }
+      async requestScreenShareKey(payload) {
+        return new Promise((resolve, reject) => {
+          chrome.runtime.sendMessage({ type: "bridge-screen-share-key", payload }, (response) => {
+            const runtimeError = chrome.runtime.lastError;
+            if (runtimeError) {
+              reject(new Error(runtimeError.message));
+              return;
+            }
+            resolve(response ?? { ok: false, message: "No response from background worker." });
+          });
+        });
+      }
+      async requestBrowserDownload(fileName, mimeType, fileBytes) {
+        const blobBytes = new Uint8Array(fileBytes.byteLength);
+        blobBytes.set(fileBytes);
+        const blob = new Blob([blobBytes.buffer], { type: mimeType || "application/octet-stream" });
+        const objectUrl = URL.createObjectURL(blob);
+        try {
+          const transferableBytes = new Uint8Array(fileBytes.byteLength);
+          transferableBytes.set(fileBytes);
+          return await new Promise((resolve, reject) => {
+            chrome.runtime.sendMessage(
+              {
+                type: "bridge-browser-download",
+                objectUrl,
+                fileName,
+                mimeType,
+                fileBytes: transferableBytes.buffer
+              },
+              (response) => {
+                const runtimeError = chrome.runtime.lastError;
+                if (runtimeError) {
+                  reject(new Error(runtimeError.message));
+                  return;
+                }
+                resolve(response ?? { ok: false, message: "No response from background worker." });
+              }
+            );
+          });
+        } finally {
+          window.setTimeout(() => {
+            URL.revokeObjectURL(objectUrl);
+          }, 3e4);
+        }
       }
       async publishPopupStatus() {
         try {
@@ -861,6 +1134,25 @@ var require_offscreen = __commonJS({
           fileName: capturedPage.fileName,
           bytes: imageBytes.length,
           metadataBytes: metadataBytes.length
+        });
+        this.socket.send(envelope.buffer);
+      }
+      sendPopupFileUpload(metadata, fileBytes) {
+        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+          throw new Error("The desktop bridge is not connected. Reconnect the GUI bridge before sending files from the popup.");
+        }
+        const metadataBytes = new TextEncoder().encode(JSON.stringify(metadata));
+        const envelope = new Uint8Array(4 + metadataBytes.length + fileBytes.length);
+        const view = new DataView(envelope.buffer);
+        view.setUint32(0, metadataBytes.length);
+        envelope.set(metadataBytes, 4);
+        envelope.set(fileBytes, 4 + metadataBytes.length);
+        debugLog("offscreen", "Sending popup-uploaded file to desktop bridge.", {
+          uploadId: metadata.uploadId,
+          fileName: metadata.fileName,
+          bytes: fileBytes.length,
+          pageUrl: metadata.pageUrl,
+          tabId: metadata.tabId
         });
         this.socket.send(envelope.buffer);
       }
@@ -1155,6 +1447,36 @@ var require_offscreen = __commonJS({
             });
             this.sendOrQueueBridgeMessage({ type: "popup.message", ...payload });
             sendResponse({ ok: true });
+            return true;
+          }
+          if (message?.type === "popup-file-upload") {
+            try {
+              const fileName = typeof message.payload?.fileName === "string" && message.payload.fileName.trim() ? message.payload.fileName.trim() : "client-upload.bin";
+              const mimeType = typeof message.payload?.mimeType === "string" && message.payload.mimeType.trim() ? message.payload.mimeType.trim() : "application/octet-stream";
+              const rawBytes = message.payload?.fileBytes;
+              const fileBytes = rawBytes instanceof ArrayBuffer ? new Uint8Array(rawBytes) : rawBytes instanceof Uint8Array ? rawBytes : null;
+              if (fileBytes === null) {
+                throw new Error("Popup file upload did not include a valid binary payload.");
+              }
+              this.sendPopupFileUpload(
+                {
+                  type: "popup-file.binary",
+                  uploadId: typeof message.payload?.uploadId === "string" && message.payload.uploadId ? message.payload.uploadId : crypto.randomUUID(),
+                  fileName,
+                  mimeType,
+                  byteCount: typeof message.payload?.byteCount === "number" ? message.payload.byteCount : fileBytes.byteLength,
+                  pageUrl: typeof message.payload?.pageUrl === "string" ? message.payload.pageUrl : null,
+                  tabId: typeof message.payload?.tabId === "number" ? message.payload.tabId : null,
+                  sentAt: typeof message.payload?.sentAt === "string" && message.payload.sentAt ? message.payload.sentAt : (/* @__PURE__ */ new Date()).toISOString()
+                },
+                fileBytes
+              );
+              sendResponse({ ok: true, message: `${fileName} queued for delivery to the desktop control center.` });
+            } catch (error) {
+              const messageText = error instanceof Error ? error.message : "Popup file upload failed.";
+              debugError("offscreen", "Popup file upload request failed.", messageText);
+              sendResponse({ ok: false, message: messageText });
+            }
             return true;
           }
           if (message?.type === "screen-share-status-changed") {

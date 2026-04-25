@@ -49,6 +49,13 @@ Popup flow:
 5. The Python GUI shows the current popup state reported by the extension: open, minimized, or not present.
 6. You can also press `Alt+P` in Chrome to toggle the popup on the active tab: if it is missing it opens, and if it is already present it closes.
 
+File transfer flow:
+
+1. Click **Send File to Browser** in the Python GUI and choose any file.
+2. The Python bridge sends the selected file to the extension over the existing WebSocket bridge.
+3. The extension first tries the browser downloads API and falls back to a tab-triggered save flow when the browser does not expose that API.
+4. If the browser supports managed downloads, its normal uniquify behavior is used instead of overwriting an older file.
+
 ## Why this capture strategy
 
 The extension still uses the Chrome DevTools Protocol through `chrome.debugger` and `Page.captureScreenshot`. That remains the fastest high-fidelity path for full-page screenshots because it avoids scroll-and-stitch artifacts and preserves device-aware detail that downstream AI analysis needs.

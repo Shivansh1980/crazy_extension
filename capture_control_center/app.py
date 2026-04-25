@@ -10,6 +10,7 @@ from capture_control_center.application.controller import CaptureController
 from capture_control_center.debug import debug_log
 from capture_control_center.infrastructure.bridge_server import BridgeServer
 from capture_control_center.infrastructure.image_store import ImageStore
+from capture_control_center.infrastructure.received_file_store import ReceivedFileStore
 from capture_control_center.presentation.gui import CaptureControlWindow
 
 
@@ -47,6 +48,7 @@ def main() -> None:
     loop = asyncio.new_event_loop()
     bridge_server = BridgeServer(host=host, port=port)
     image_store = ImageStore(working_directory)
+    received_file_store = ReceivedFileStore(working_directory)
 
     server_thread = threading.Thread(target=_run_loop, args=(loop,), daemon=True)
     server_thread.start()
@@ -54,7 +56,12 @@ def main() -> None:
 
     asyncio.run_coroutine_threadsafe(bridge_server.start(), loop).result(timeout=5)
     debug_log('python-app', 'running...')
-    controller = CaptureController(bridge_server=bridge_server, image_store=image_store, loop=loop)
+    controller = CaptureController(
+        bridge_server=bridge_server,
+        image_store=image_store,
+        received_file_store=received_file_store,
+        loop=loop,
+    )
 
     configure_tk_environment()
     import tkinter as tk
@@ -64,6 +71,7 @@ def main() -> None:
         root=root,
         controller=controller,
         images_directory=image_store.images_directory,
+        client_uploads_directory=received_file_store.files_directory,
         bridge_url=f'ws://{host}:{port}',
     )
 

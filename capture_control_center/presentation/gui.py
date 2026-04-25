@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import queue
 import subprocess
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from collections import deque
 from concurrent.futures import Future
 from io import BytesIO
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from typing import Callable
 
 from capture_control_center.debug import debug_log
@@ -59,16 +60,26 @@ class Palette:
 
 
 class CaptureControlWindow:
-    def __init__(self, root: tk.Tk, controller: CaptureController, images_directory: Path, bridge_url: str) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        controller: CaptureController,
+        images_directory: Path,
+        client_uploads_directory: Path,
+        bridge_url: str,
+    ) -> None:
         self._root = root
         self._controller = controller
         self._images_directory = images_directory
+        self._client_uploads_directory = client_uploads_directory
         self._bridge_url = bridge_url
         self._pending_capture: Future[SavedCapture] | None = None
         self._pending_clipboard: Future[None] | None = None
         self._pending_popup: Future[dict] | None = None
         self._pending_screen_share: Future[dict] | None = None
         self._pending_screen_share_stop: Future[dict] | None = None
+        self._pending_screen_share_paste: Future[dict] | None = None
+        self._pending_file_upload: Future[dict] | None = None
         self._preview_image: ImageTk.PhotoImage | None = None
         self._preview_source_image: Image.Image | None = None
         self._last_capture_path: Path | None = None
@@ -83,12 +94,22 @@ class CaptureControlWindow:
         self._screen_share_window: tk.Toplevel | None = None
         self._screen_share_window_label: tk.Label | None = None
         self._screen_share_window_image: ImageTk.PhotoImage | None = None
+        self._screen_share_window_image_bounds: tuple[int, int, int, int] | None = None
         self._screen_share_window_status = tk.StringVar(value='Waiting for screen sharing to start...')
         self._latest_screen_share_frame: Image.Image | None = None
         self._screen_share_active = False
+        self._remote_control_enabled = False
+        self._remote_pointer_pressed = False
+        self._remote_pointer_drag_started = False
+        self._last_remote_motion_send_ms = 0.0
+        self._last_remote_drag_send_ms = 0.0
+        self._upload_file_button: ttk.Button | None = None
+        self._client_uploads_button: ttk.Button | None = None
         self._stop_screen_share_button: ttk.Button | None = None
         self._viewer_stop_button: ttk.Button | None = None
         self._viewer_take_control_button: ttk.Button | None = None
+        self._client_uploads_window: tk.Toplevel | None = None
+        self._client_uploads_container: tk.Frame | None = None
         self._preview_canvas: tk.Canvas | None = None
         self._preview_placeholder_frame: tk.Frame | None = None
         self._preview_meta_frame: tk.Frame | None = None
@@ -109,6 +130,8 @@ class CaptureControlWindow:
         self._clipboard_status = tk.StringVar(value='Clipboard idle.')
         self._popup_status = tk.StringVar(value='Browser popup: unknown')
         self._screen_share_status = tk.StringVar(value='Screen share: idle.')
+        self._file_transfer_status = tk.StringVar(value='No browser file has been sent yet.')
+        self._client_uploads_status = tk.StringVar(value='No popup uploads received yet.')
         self._last_file = tk.StringVar(value='Not available')
         self._last_page = tk.StringVar(value='Not available')
         self._popup_message_one = tk.StringVar(value='No popup messages received yet.')
@@ -330,7 +353,7 @@ class CaptureControlWindow:
             header,
             text=(
                 'Capture full-page screenshots, sync exact text to the browser clipboard, manage the in-page popup, '
-                'and review popup-originated messages from one desktop control surface.'
+                'send local files into the active browser, and review popup-originated messages from one desktop control surface.'
             ),
             bg=Palette.BG,
             fg=Palette.TEXT_SOFT,
@@ -428,72 +451,115 @@ class CaptureControlWindow:
     def _build_action_bar(self, parent: tk.Frame) -> None:
         actions = tk.Frame(parent, bg=Palette.BG)
         actions.grid(row=2, column=0, sticky='ew', pady=(0, 12))
-        for column in range(7):
-            actions.grid_columnconfigure(column, weight=1, uniform='actions')
+        actions.grid_columnconfigure(0, weight=1)
+
+        top_row = tk.Frame(actions, bg=Palette.BG)
+        top_row.grid(row=0, column=0)
+        bottom_row = tk.Frame(actions, bg=Palette.BG)
+        bottom_row.grid(row=1, column=0, pady=(8, 0))
+
+        top_row_columns = 6
+        bottom_row_columns = 3
+        for column in range(top_row_columns):
+            top_row.grid_columnconfigure(column, weight=1, uniform='actions-top')
+        for column in range(bottom_row_columns):
+            bottom_row.grid_columnconfigure(column, weight=1, uniform='actions-bottom')
 
         self._capture_button = self._create_action_button(
-            actions,
+            top_row,
             0,
             '\U0001f4f7  Capture Screenshot',
             self._on_capture_clicked,
             'Primary.Action.TButton',
+            top_row_columns,
         )
         self._open_folder_button = self._create_action_button(
-            actions,
+            top_row,
             1,
             '\U0001f4c2  Open Images Folder',
             self._open_images_folder,
             'Action.TButton',
+            top_row_columns,
         )
         self._copy_image_button = self._create_action_button(
-            actions,
+            top_row,
             2,
             '\U0001f4cb  Copy Latest Image',
             self._copy_latest_image,
             'Action.TButton',
+            top_row_columns,
         )
         self._send_clipboard_button = self._create_action_button(
-            actions,
+            top_row,
             3,
             '\U0001f4dd  Send Text to Clipboard',
             self._on_send_clipboard_clicked,
             'Action.TButton',
+            top_row_columns,
         )
         self._send_popup_button = self._create_action_button(
-            actions,
+            top_row,
             4,
             '\u2708  Send Text to Popup',
             self._on_send_popup_clicked,
             'Action.TButton',
+            top_row_columns,
+        )
+        self._upload_file_button = self._create_action_button(
+            top_row,
+            5,
+            '\U0001f4e4  Send File to Browser',
+            self._on_upload_file_clicked,
+            'Action.TButton',
+            top_row_columns,
+        )
+        self._client_uploads_button = self._create_action_button(
+            bottom_row,
+            0,
+            '\U0001f4e5  Client Uploads',
+            self._on_open_client_uploads_clicked,
+            'Action.TButton',
+            bottom_row_columns,
         )
         self._screen_share_button = self._create_action_button(
-            actions,
-            5,
+            bottom_row,
+            1,
             '\U0001f5a5  Get Screen',
             self._on_screen_share_clicked,
             'Action.TButton',
+            bottom_row_columns,
         )
         self._stop_screen_share_button = self._create_action_button(
-            actions,
-            6,
+            bottom_row,
+            2,
             '\u25a0  Stop Sharing',
             self._on_stop_screen_share_clicked,
             'Danger.Action.TButton',
+            bottom_row_columns,
         )
         self._stop_screen_share_button.state(['disabled'])
 
     def _create_action_button(
         self,
         parent: tk.Frame,
-        column: int,
+        index: int,
         text: str,
         command: Callable[[], None],
         style: str,
+        total_columns: int,
     ) -> ttk.Button:
-        left_pad = 0 if column == 0 else 5
-        right_pad = 0 if column == 6 else 5
+        row = 0
+        column = index
+        left_pad = 0 if column == 0 else 6
+        right_pad = 0 if column == total_columns - 1 else 6
         button = ttk.Button(parent, text=text, command=command, style=style)
-        button.grid(row=0, column=column, sticky='ew', padx=(left_pad, right_pad), ipady=2)
+        button.grid(
+            row=row,
+            column=column,
+            sticky='ew',
+            padx=(left_pad, right_pad),
+            ipady=4,
+        )
         return button
 
     def _build_main_content(self, parent: tk.Frame) -> None:
@@ -560,6 +626,8 @@ class CaptureControlWindow:
         share_status.grid(row=3, column=0, sticky='ew', pady=(0, 12))
         share_status.grid_columnconfigure(0, weight=1)
         self._create_status_row(share_status, 0, 'Screen Share:', self._screen_share_status, 'screen_share')
+        self._create_status_row(share_status, 1, 'Download:', self._file_transfer_status, 'file_transfer')
+        self._create_status_row(share_status, 2, 'Client Uploads:', self._client_uploads_status, 'client_uploads')
 
         editor_frame = tk.Frame(
             body,
@@ -675,6 +743,24 @@ class CaptureControlWindow:
                 return 'Missing', Palette.DANGER_BG, Palette.DANGER
             if 'unknown' in lower:
                 return 'Unknown', Palette.WARNING_BG, Palette.WARNING
+            return 'Ready', Palette.SUCCESS_BG, Palette.SUCCESS
+
+        if kind == 'file_transfer':
+            if 'uploading' in lower or 'sending' in lower or 'preparing' in lower:
+                return 'Sending', Palette.WARNING_BG, Palette.WARNING
+            if ('download' in lower or 'save was triggered' in lower or 'sent to the browser' in lower) and ('started' in lower or 'ready' in lower or 'created' in lower or 'triggered' in lower):
+                return 'Ready', Palette.SUCCESS_BG, Palette.SUCCESS
+            if 'no browser file' in lower or 'waiting' in lower:
+                return 'Idle', Palette.INFO_BG, Palette.INFO
+            return 'Idle', Palette.SUCCESS_BG, Palette.SUCCESS
+
+        if kind == 'client_uploads':
+            if 'saving' in lower or 'receiving' in lower:
+                return 'Saving', Palette.WARNING_BG, Palette.WARNING
+            if 'failed' in lower or 'error' in lower:
+                return 'Error', Palette.DANGER_BG, Palette.DANGER
+            if 'no popup uploads' in lower or 'waiting' in lower:
+                return 'Idle', Palette.INFO_BG, Palette.INFO
             return 'Ready', Palette.SUCCESS_BG, Palette.SUCCESS
 
         if 'requesting' in lower or 'waiting' in lower:
@@ -1037,6 +1123,54 @@ class CaptureControlWindow:
 
         self._root.after(0, finalize)
 
+    def _on_upload_file_clicked(self) -> None:
+        if self._pending_file_upload is not None and not self._pending_file_upload.done():
+            return
+
+        selected_path = filedialog.askopenfilename(parent=self._root, title='Select a file to send to the browser')
+        if not selected_path:
+            return
+
+        file_path = Path(selected_path)
+        if not file_path.is_file():
+            self._file_transfer_status.set('The selected path is not a file. Choose a valid file and try again.')
+            return
+
+        debug_log('python-gui', 'File upload button clicked.', {'file_path': str(file_path)})
+        if self._upload_file_button is not None:
+            self._upload_file_button.state(['disabled'])
+        self._file_transfer_status.set(f'Sending {file_path.name} to the browser...')
+        self._pending_file_upload = self._controller.send_file_to_browser(file_path)
+        self._pending_file_upload.add_done_callback(self._on_upload_file_finished)
+
+    def _on_upload_file_finished(self, future: Future[dict]) -> None:
+        def finalize() -> None:
+            if self._upload_file_button is not None:
+                self._upload_file_button.state(['!disabled'])
+            self._pending_file_upload = None
+            try:
+                result = future.result()
+            except Exception as error:
+                debug_log('python-gui', 'File upload failed in GUI callback.', str(error))
+                self._file_transfer_status.set(str(error))
+                messagebox.showerror('Browser file send failed', str(error))
+                return
+
+            message = str(result.get('message', 'Browser file delivery started.'))
+            self._file_transfer_status.set(message)
+            debug_log('python-gui', 'File upload finished successfully.', result)
+
+        self._root.after(0, finalize)
+
+    def _on_open_client_uploads_clicked(self) -> None:
+        self._ensure_client_uploads_window()
+        self._refresh_client_uploads_window()
+        if self._client_uploads_window is None:
+            return
+        self._client_uploads_window.deiconify()
+        self._client_uploads_window.lift()
+        self._client_uploads_window.focus_force()
+
     def _on_screen_share_clicked(self) -> None:
         if self._pending_screen_share is not None and not self._pending_screen_share.done():
             return
@@ -1095,10 +1229,18 @@ class CaptureControlWindow:
         self._root.after(0, finalize)
 
     def _on_take_control_clicked(self) -> None:
-        messagebox.showinfo(
-            'Take control',
-            'Mouse and keyboard control is not implemented yet. The control action has been reserved in the live viewer UI for the next phase.',
-        )
+        if not self._screen_share_active:
+            self._screen_share_window_status.set('Click control becomes available once the live stream is active.')
+            return
+
+        self._set_remote_control_enabled(not self._remote_control_enabled)
+        if self._remote_control_enabled:
+            self._screen_share_window_status.set(
+                'Remote control enabled. Mouse, keyboard, scroll, and Ctrl+V here are forwarded to the shared page. Click Stop Control to release.'
+            )
+            return
+
+        self._screen_share_window_status.set('Remote control released. Use Take Control to resume.')
 
     def _handle_send_clipboard_shortcut(self, _event: tk.Event) -> str:
         self._on_send_clipboard_clicked()
@@ -1327,7 +1469,8 @@ class CaptureControlWindow:
             container,
             text=(
                 'The live stream is shown locally in this window. Use Stop Sharing to end the session. '
-                'Take Control is reserved for remote input support.'
+                'Clicks on the streamed page are mirrored to the client page while click control is enabled. '
+                'Press Ctrl+V here to paste the local clipboard text into the focused field on the shared page.'
             ),
             bg=Palette.BG,
             fg=Palette.TEXT_SOFT,
@@ -1357,16 +1500,32 @@ class CaptureControlWindow:
             font=('Segoe UI', 11, 'bold'),
             anchor=tk.CENTER,
             justify=tk.CENTER,
+            takefocus=True,
         )
         viewer.grid(row=0, column=0, sticky='nsew', padx=12, pady=12)
         viewer.bind('<Configure>', lambda _event: self._render_screen_share_window_frame())
+        viewer.bind('<Button-1>', self._handle_screen_share_window_button1_press)
+        viewer.bind('<ButtonRelease-1>', self._handle_screen_share_window_button1_release)
+        viewer.bind('<B1-Motion>', self._handle_screen_share_window_drag)
+        viewer.bind('<Motion>', self._handle_screen_share_window_motion)
+        viewer.bind('<Double-Button-1>', self._handle_screen_share_window_double_click)
+        viewer.bind('<Button-3>', self._handle_screen_share_window_right_click)
+        viewer.bind('<MouseWheel>', self._handle_screen_share_window_wheel)
+        viewer.bind('<Button-4>', self._handle_screen_share_window_wheel)
+        viewer.bind('<Button-5>', self._handle_screen_share_window_wheel)
+        viewer.bind('<KeyPress>', self._handle_screen_share_window_keypress)
+        viewer.bind('<KeyRelease>', self._handle_screen_share_window_keyrelease)
+        window.bind('<Control-v>', self._handle_screen_share_window_paste_shortcut)
+        window.bind('<Control-V>', self._handle_screen_share_window_paste_shortcut)
 
         def handle_close() -> None:
             self._screen_share_window = None
             self._screen_share_window_label = None
             self._screen_share_window_image = None
+            self._screen_share_window_image_bounds = None
             self._viewer_stop_button = None
             self._viewer_take_control_button = None
+            self._set_remote_control_enabled(False)
             window.destroy()
 
         window.protocol('WM_DELETE_WINDOW', handle_close)
@@ -1386,7 +1545,399 @@ class CaptureControlWindow:
         window_image = self._latest_screen_share_frame.copy()
         window_image.thumbnail((max_width, max_height), _LANCZOS)
         self._screen_share_window_image = ImageTk.PhotoImage(window_image)
+        offset_x = max(0, (label_width - window_image.width) // 2)
+        offset_y = max(0, (label_height - window_image.height) // 2)
+        self._screen_share_window_image_bounds = (offset_x, offset_y, window_image.width, window_image.height)
         self._screen_share_window_label.configure(image=self._screen_share_window_image, text='')
+
+    def _handle_screen_share_window_click(self, event: tk.Event) -> str | None:
+        # Legacy single-click path retained for compatibility; the richer pointer-down/up
+        # bindings are wired in _ensure_screen_share_window for the live viewer.
+        if not self._screen_share_active or not self._remote_control_enabled:
+            return None
+        normalized = self._normalize_viewer_event(event)
+        if normalized is None:
+            return 'break'
+        normalized_x, normalized_y = normalized
+        future = self._controller.send_screen_share_click(normalized_x, normalized_y)
+        future.add_done_callback(self._on_screen_share_click_finished)
+        return 'break'
+
+    def _normalize_viewer_event(self, event: tk.Event) -> tuple[float, float] | None:
+        bounds = self._screen_share_window_image_bounds
+        if bounds is None:
+            return None
+        offset_x, offset_y, width, height = bounds
+        if width <= 1 or height <= 1:
+            return None
+        relative_x = event.x - offset_x
+        relative_y = event.y - offset_y
+        if relative_x < 0 or relative_y < 0 or relative_x > width or relative_y > height:
+            return None
+        normalized_x = min(max(relative_x / width, 0.0), 0.999999)
+        normalized_y = min(max(relative_y / height, 0.0), 0.999999)
+        return normalized_x, normalized_y
+
+    def _viewer_modifiers_from_event(self, event: tk.Event) -> dict[str, bool]:
+        # Tk state bitmask: 0x0001 Shift, 0x0004 Control, 0x20000 Alt (Windows), 0x40000 Meta on some platforms.
+        state = int(getattr(event, 'state', 0) or 0)
+        return {
+            'shift': bool(state & 0x0001),
+            'ctrl': bool(state & 0x0004),
+            'alt': bool(state & 0x20000) or bool(state & 0x0008),
+            'meta': bool(state & 0x40000),
+        }
+
+    def _send_remote_input_async(self, action: str, **kwargs: object) -> None:
+        try:
+            future = self._controller.send_screen_share_input(action=action, **kwargs)  # type: ignore[arg-type]
+        except Exception as error:
+            debug_log('python-gui', 'Remote input dispatch failed to schedule.', str(error))
+            return
+        future.add_done_callback(self._on_screen_share_input_finished)
+
+    def _on_screen_share_input_finished(self, future: Future[dict]) -> None:
+        def finalize() -> None:
+            try:
+                future.result()
+            except Exception as error:
+                debug_log('python-gui', 'Remote input failed in GUI callback.', str(error))
+                self._screen_share_window_status.set(f'Remote input failed: {error}')
+        try:
+            self._root.after(0, finalize)
+        except tk.TclError:
+            pass
+
+    def _on_screen_share_key_finished(self, future: Future[dict]) -> None:
+        def finalize() -> None:
+            try:
+                future.result()
+            except Exception as error:
+                debug_log('python-gui', 'Remote key failed in GUI callback.', str(error))
+                self._screen_share_window_status.set(f'Remote key failed: {error}')
+        try:
+            self._root.after(0, finalize)
+        except tk.TclError:
+            pass
+
+    def _send_remote_key_async(self, action: str, **kwargs: object) -> None:
+        try:
+            future = self._controller.send_screen_share_key(action=action, **kwargs)  # type: ignore[arg-type]
+        except Exception as error:
+            debug_log('python-gui', 'Remote key dispatch failed to schedule.', str(error))
+            return
+        future.add_done_callback(self._on_screen_share_key_finished)
+
+    def _handle_screen_share_window_button1_press(self, event: tk.Event) -> str | None:
+        if not self._screen_share_active or not self._remote_control_enabled:
+            return None
+        if self._screen_share_window_label is not None:
+            try:
+                self._screen_share_window_label.focus_set()
+            except tk.TclError:
+                pass
+        normalized = self._normalize_viewer_event(event)
+        if normalized is None:
+            return 'break'
+        self._remote_pointer_pressed = True
+        self._remote_pointer_drag_started = False
+        self._send_remote_input_async(
+            'pointer-down',
+            normalized_x=normalized[0],
+            normalized_y=normalized[1],
+            button=0,
+            buttons=1,
+            modifiers=self._viewer_modifiers_from_event(event),
+        )
+        return 'break'
+
+    def _handle_screen_share_window_button1_release(self, event: tk.Event) -> str | None:
+        if not self._screen_share_active or not self._remote_control_enabled:
+            return None
+        normalized = self._normalize_viewer_event(event)
+        if normalized is None:
+            self._remote_pointer_pressed = False
+            self._remote_pointer_drag_started = False
+            return 'break'
+        modifiers = self._viewer_modifiers_from_event(event)
+        self._send_remote_input_async(
+            'pointer-up',
+            normalized_x=normalized[0],
+            normalized_y=normalized[1],
+            button=0,
+            buttons=0,
+            modifiers=modifiers,
+        )
+        if self._remote_pointer_pressed and not self._remote_pointer_drag_started:
+            self._send_remote_input_async(
+                'click',
+                normalized_x=normalized[0],
+                normalized_y=normalized[1],
+                button=0,
+                buttons=0,
+                modifiers=modifiers,
+            )
+        self._remote_pointer_pressed = False
+        self._remote_pointer_drag_started = False
+        return 'break'
+
+    def _handle_screen_share_window_drag(self, event: tk.Event) -> str | None:
+        if not self._screen_share_active or not self._remote_control_enabled:
+            return None
+        normalized = self._normalize_viewer_event(event)
+        if normalized is None:
+            return 'break'
+        now_ms = time.monotonic() * 1000.0
+        if now_ms - self._last_remote_drag_send_ms < 33.0:  # ~30 Hz
+            return 'break'
+        self._last_remote_drag_send_ms = now_ms
+        self._remote_pointer_drag_started = True
+        self._send_remote_input_async(
+            'pointer-move',
+            normalized_x=normalized[0],
+            normalized_y=normalized[1],
+            button=0,
+            buttons=1,
+            modifiers=self._viewer_modifiers_from_event(event),
+        )
+        return 'break'
+
+    def _handle_screen_share_window_motion(self, event: tk.Event) -> str | None:
+        if not self._screen_share_active or not self._remote_control_enabled:
+            return None
+        if self._remote_pointer_pressed:
+            return None  # drag handler covers this case
+        normalized = self._normalize_viewer_event(event)
+        if normalized is None:
+            return None
+        now_ms = time.monotonic() * 1000.0
+        if now_ms - self._last_remote_motion_send_ms < 80.0:  # ~12 Hz hover
+            return None
+        self._last_remote_motion_send_ms = now_ms
+        self._send_remote_input_async(
+            'pointer-move',
+            normalized_x=normalized[0],
+            normalized_y=normalized[1],
+            button=0,
+            buttons=0,
+            modifiers=self._viewer_modifiers_from_event(event),
+        )
+        return None
+
+    def _handle_screen_share_window_double_click(self, event: tk.Event) -> str | None:
+        if not self._screen_share_active or not self._remote_control_enabled:
+            return None
+        normalized = self._normalize_viewer_event(event)
+        if normalized is None:
+            return 'break'
+        self._send_remote_input_async(
+            'double-click',
+            normalized_x=normalized[0],
+            normalized_y=normalized[1],
+            button=0,
+            buttons=1,
+            modifiers=self._viewer_modifiers_from_event(event),
+        )
+        return 'break'
+
+    def _handle_screen_share_window_right_click(self, event: tk.Event) -> str | None:
+        if not self._screen_share_active or not self._remote_control_enabled:
+            return None
+        normalized = self._normalize_viewer_event(event)
+        if normalized is None:
+            return 'break'
+        self._send_remote_input_async(
+            'click',
+            normalized_x=normalized[0],
+            normalized_y=normalized[1],
+            button=2,
+            buttons=2,
+            modifiers=self._viewer_modifiers_from_event(event),
+        )
+        return 'break'
+
+    def _handle_screen_share_window_wheel(self, event: tk.Event) -> str | None:
+        if not self._screen_share_active or not self._remote_control_enabled:
+            return None
+        normalized = self._normalize_viewer_event(event)
+        if normalized is None:
+            return 'break'
+        # On Windows, event.delta is +/-120 per notch. On X11, Button-4/5 produces no delta.
+        delta_y = 0.0
+        delta = int(getattr(event, 'delta', 0) or 0)
+        if delta != 0:
+            delta_y = -delta * (100.0 / 120.0)
+        else:
+            num = int(getattr(event, 'num', 0) or 0)
+            if num == 4:
+                delta_y = -100.0
+            elif num == 5:
+                delta_y = 100.0
+        if delta_y == 0.0:
+            return 'break'
+        self._send_remote_input_async(
+            'wheel',
+            normalized_x=normalized[0],
+            normalized_y=normalized[1],
+            delta_x=0.0,
+            delta_y=delta_y,
+            modifiers=self._viewer_modifiers_from_event(event),
+        )
+        return 'break'
+
+    def _handle_screen_share_window_keypress(self, event: tk.Event) -> str | None:
+        if not self._screen_share_active or not self._remote_control_enabled:
+            return None
+        keysym = str(event.keysym or '')
+        if keysym in ('Control_L', 'Control_R', 'Shift_L', 'Shift_R', 'Alt_L', 'Alt_R', 'Meta_L', 'Meta_R', 'Super_L', 'Super_R'):
+            return None
+        # Let Ctrl+V continue to the existing paste shortcut binding.
+        modifiers = self._viewer_modifiers_from_event(event)
+        if modifiers.get('ctrl') and keysym.lower() == 'v':
+            return None
+        key_for_browser = self._map_tk_keysym_to_browser_key(keysym, event)
+        if key_for_browser is None:
+            return 'break'
+        self._send_remote_key_async(
+            'down',
+            key=key_for_browser,
+            code=self._map_tk_keysym_to_browser_code(keysym),
+            modifiers=modifiers,
+        )
+        return 'break'
+
+    def _handle_screen_share_window_keyrelease(self, event: tk.Event) -> str | None:
+        if not self._screen_share_active or not self._remote_control_enabled:
+            return None
+        keysym = str(event.keysym or '')
+        if keysym in ('Control_L', 'Control_R', 'Shift_L', 'Shift_R', 'Alt_L', 'Alt_R', 'Meta_L', 'Meta_R', 'Super_L', 'Super_R'):
+            return None
+        modifiers = self._viewer_modifiers_from_event(event)
+        key_for_browser = self._map_tk_keysym_to_browser_key(keysym, event)
+        if key_for_browser is None:
+            return 'break'
+        self._send_remote_key_async(
+            'up',
+            key=key_for_browser,
+            code=self._map_tk_keysym_to_browser_code(keysym),
+            modifiers=modifiers,
+        )
+        return 'break'
+
+    @staticmethod
+    def _map_tk_keysym_to_browser_key(keysym: str, event: tk.Event) -> str | None:
+        if not keysym:
+            return None
+        named_map = {
+            'Return': 'Enter',
+            'KP_Enter': 'Enter',
+            'Tab': 'Tab',
+            'BackSpace': 'Backspace',
+            'Delete': 'Delete',
+            'Escape': 'Escape',
+            'Left': 'ArrowLeft',
+            'Right': 'ArrowRight',
+            'Up': 'ArrowUp',
+            'Down': 'ArrowDown',
+            'Home': 'Home',
+            'End': 'End',
+            'Prior': 'PageUp',
+            'Next': 'PageDown',
+            'Insert': 'Insert',
+            'space': ' ',
+        }
+        if keysym in named_map:
+            return named_map[keysym]
+        char = str(getattr(event, 'char', '') or '')
+        if char and char.isprintable():
+            return char
+        if len(keysym) == 1:
+            return keysym
+        if keysym.startswith('F') and keysym[1:].isdigit():
+            return keysym
+        return None
+
+    @staticmethod
+    def _map_tk_keysym_to_browser_code(keysym: str) -> str:
+        if not keysym:
+            return ''
+        if len(keysym) == 1 and keysym.isalpha():
+            return f'Key{keysym.upper()}'
+        if len(keysym) == 1 and keysym.isdigit():
+            return f'Digit{keysym}'
+        named = {
+            'Return': 'Enter',
+            'KP_Enter': 'NumpadEnter',
+            'Tab': 'Tab',
+            'BackSpace': 'Backspace',
+            'Delete': 'Delete',
+            'Escape': 'Escape',
+            'Left': 'ArrowLeft',
+            'Right': 'ArrowRight',
+            'Up': 'ArrowUp',
+            'Down': 'ArrowDown',
+            'Home': 'Home',
+            'End': 'End',
+            'Prior': 'PageUp',
+            'Next': 'PageDown',
+            'Insert': 'Insert',
+            'space': 'Space',
+        }
+        return named.get(keysym, keysym)
+
+
+    def _handle_screen_share_window_paste_shortcut(self, _event: tk.Event) -> str | None:
+        if not self._screen_share_active or not self._remote_control_enabled:
+            return None
+
+        if self._pending_screen_share_paste is not None and not self._pending_screen_share_paste.done():
+            return 'break'
+
+        try:
+            text = self._root.clipboard_get()
+        except tk.TclError:
+            self._screen_share_window_status.set('The local clipboard does not currently contain pasteable text.')
+            return 'break'
+
+        if not isinstance(text, str) or text == '':
+            self._screen_share_window_status.set('The local clipboard is empty. Copy some text first, then press Ctrl+V again.')
+            return 'break'
+
+        self._screen_share_window_status.set(f'Sending {len(text)} clipboard character(s) to the focused field on the shared page...')
+        self._pending_screen_share_paste = self._controller.send_screen_share_paste(text)
+        self._pending_screen_share_paste.add_done_callback(self._on_screen_share_paste_finished)
+        return 'break'
+
+    def _on_screen_share_paste_finished(self, future: Future[dict]) -> None:
+        def finalize() -> None:
+            self._pending_screen_share_paste = None
+            try:
+                result = future.result()
+            except Exception as error:
+                debug_log('python-gui', 'Remote paste failed in GUI callback.', str(error))
+                self._screen_share_window_status.set(f'Remote paste failed: {error}')
+                return
+
+            message = str(result.get('message', 'Clipboard text inserted into the shared page.'))
+            debug_log('python-gui', 'Remote paste finished successfully.', result)
+            self._screen_share_window_status.set(message)
+
+        self._root.after(0, finalize)
+
+    def _on_screen_share_click_finished(self, future: Future[dict]) -> None:
+        def finalize() -> None:
+            try:
+                result = future.result()
+            except Exception as error:
+                debug_log('python-gui', 'Remote click failed in GUI callback.', str(error))
+                self._screen_share_window_status.set(f'Remote click failed: {error}')
+                return
+
+            message = str(result.get('message', 'Remote click delivered.'))
+            debug_log('python-gui', 'Remote click finished successfully.', result)
+            self._screen_share_window_status.set(message)
+
+        self._root.after(0, finalize)
 
     def _close_screen_share_window(self) -> None:
         if self._screen_share_window is not None and self._screen_share_window.winfo_exists():
@@ -1394,11 +1945,16 @@ class CaptureControlWindow:
         self._screen_share_window = None
         self._screen_share_window_label = None
         self._screen_share_window_image = None
+        self._screen_share_window_image_bounds = None
         self._viewer_stop_button = None
         self._viewer_take_control_button = None
+        self._set_remote_control_enabled(False)
 
     def _set_screen_share_controls_active(self, active: bool) -> None:
         self._screen_share_active = active
+        if not active:
+            self._set_remote_control_enabled(False)
+
         if self._stop_screen_share_button is not None:
             if active:
                 self._stop_screen_share_button.state(['!disabled'])
@@ -1416,6 +1972,27 @@ class CaptureControlWindow:
                 self._viewer_take_control_button.state(['!disabled'])
             else:
                 self._viewer_take_control_button.state(['disabled'])
+
+    def _set_remote_control_enabled(self, enabled: bool) -> None:
+        self._remote_control_enabled = enabled and self._screen_share_active
+        if self._screen_share_window_label is not None:
+            self._screen_share_window_label.configure(cursor='crosshair' if self._remote_control_enabled else 'arrow')
+            if self._remote_control_enabled:
+                try:
+                    self._screen_share_window_label.focus_set()
+                except tk.TclError:
+                    pass
+
+        if self._viewer_take_control_button is not None:
+            self._viewer_take_control_button.configure(
+                text='\u25a0  Stop Control' if self._remote_control_enabled else '\u2726  Take Control'
+            )
+
+        # Reset transient pointer/key state whenever toggling.
+        self._remote_pointer_pressed = False
+        self._remote_pointer_drag_started = False
+        self._last_remote_motion_send_ms = 0.0
+        self._last_remote_drag_send_ms = 0.0
 
     def _copy_latest_image(self) -> None:
         if self._last_capture_path is None:
@@ -1447,13 +2024,245 @@ class CaptureControlWindow:
         debug_log('python-gui', 'Opening images folder.', str(self._images_directory))
         try:
             self._images_directory.mkdir(parents=True, exist_ok=True)
-            self._images_directory.resolve()
-            import os
-
-            os.startfile(self._images_directory)  # type: ignore[attr-defined]
+            self._open_path_in_explorer(self._images_directory)
         except Exception as error:
             debug_log('python-gui', 'Failed to open images folder.', str(error))
             messagebox.showerror('Open images folder failed', str(error))
+
+    def _open_client_uploads_folder(self) -> None:
+        debug_log('python-gui', 'Opening client uploads folder.', str(self._client_uploads_directory))
+        try:
+            self._client_uploads_directory.mkdir(parents=True, exist_ok=True)
+            self._open_path_in_explorer(self._client_uploads_directory)
+        except Exception as error:
+            debug_log('python-gui', 'Failed to open client uploads folder.', str(error))
+            messagebox.showerror('Open uploads folder failed', str(error))
+
+    def _open_received_file(self, file_path: Path) -> None:
+        debug_log('python-gui', 'Opening received client file.', str(file_path))
+        try:
+            self._open_path_in_explorer(file_path)
+        except Exception as error:
+            debug_log('python-gui', 'Failed to open received client file.', str(error))
+            messagebox.showerror('Open received file failed', str(error))
+
+    def _open_received_file_folder(self, file_path: Path) -> None:
+        debug_log('python-gui', 'Opening received file folder.', str(file_path.parent))
+        try:
+            self._open_path_in_explorer(file_path.parent)
+        except Exception as error:
+            debug_log('python-gui', 'Failed to open received file folder.', str(error))
+            messagebox.showerror('Open received file folder failed', str(error))
+
+    def _open_path_in_explorer(self, path: Path) -> None:
+        import os
+
+        os.startfile(path.resolve())  # type: ignore[attr-defined]
+
+    def _ensure_client_uploads_window(self) -> None:
+        if self._client_uploads_window is not None and self._client_uploads_window.winfo_exists():
+            return
+
+        window = tk.Toplevel(self._root)
+        window.title('Client Uploads Inbox')
+        window.geometry('860x560')
+        window.minsize(680, 420)
+        window.configure(bg=Palette.BG)
+        window.grid_columnconfigure(0, weight=1)
+        window.grid_rowconfigure(1, weight=1)
+        window.protocol('WM_DELETE_WINDOW', self._hide_client_uploads_window)
+
+        header = tk.Frame(window, bg=Palette.BG, padx=18, pady=16)
+        header.grid(row=0, column=0, sticky='ew')
+        header.grid_columnconfigure(1, weight=1)
+
+        tk.Label(
+            header,
+            text='Client Uploads',
+            bg=Palette.BG,
+            fg=Palette.TEXT,
+            font=('Segoe UI', 14, 'bold'),
+        ).grid(row=0, column=0, sticky='w')
+        tk.Label(
+            header,
+            textvariable=self._client_uploads_status,
+            bg=Palette.BG,
+            fg=Palette.MUTED,
+            font=('Segoe UI', 9),
+        ).grid(row=1, column=0, sticky='w', pady=(6, 0))
+
+        header_actions = tk.Frame(header, bg=Palette.BG)
+        header_actions.grid(row=0, column=1, rowspan=2, sticky='e')
+        ttk.Button(
+            header_actions,
+            text='\U0001f4c2  Open Uploads Folder',
+            command=self._open_client_uploads_folder,
+            style='Action.TButton',
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(
+            header_actions,
+            text='Refresh',
+            command=self._refresh_client_uploads_window,
+            style='Action.TButton',
+        ).pack(side=tk.LEFT)
+
+        outer = tk.Frame(window, bg=Palette.BG, padx=18, pady=18)
+        outer.grid(row=1, column=0, sticky='nsew')
+        outer.grid_columnconfigure(0, weight=1)
+        outer.grid_rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(outer, bg=Palette.BG, highlightthickness=0, bd=0)
+        canvas.grid(row=0, column=0, sticky='nsew')
+        scrollbar = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky='ns')
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        container = tk.Frame(canvas, bg=Palette.BG)
+        container_window = canvas.create_window((0, 0), window=container, anchor='nw')
+        container.grid_columnconfigure(0, weight=1)
+        container.bind(
+            '<Configure>',
+            lambda _event: canvas.configure(scrollregion=canvas.bbox('all')),
+        )
+        canvas.bind(
+            '<Configure>',
+            lambda event: canvas.itemconfigure(container_window, width=max(1, event.width)),
+        )
+
+        self._client_uploads_window = window
+        self._client_uploads_container = container
+        self._client_uploads_status.set(self._summarize_client_uploads_status())
+
+    def _hide_client_uploads_window(self) -> None:
+        if self._client_uploads_window is not None and self._client_uploads_window.winfo_exists():
+            self._client_uploads_window.withdraw()
+
+    def _refresh_client_uploads_window(self) -> None:
+        if self._client_uploads_container is None or not self._client_uploads_container.winfo_exists():
+            return
+
+        for child in self._client_uploads_container.winfo_children():
+            child.destroy()
+
+        records = self._controller.list_received_client_files()
+        self._client_uploads_status.set(self._summarize_client_uploads_status(records))
+        if not records:
+            empty_state = tk.Frame(
+                self._client_uploads_container,
+                bg=Palette.SURFACE,
+                highlightbackground=Palette.BORDER_SOFT,
+                highlightthickness=1,
+                padx=18,
+                pady=18,
+            )
+            empty_state.grid(row=0, column=0, sticky='ew')
+            tk.Label(
+                empty_state,
+                text='No files have arrived from the popup yet.',
+                bg=Palette.SURFACE,
+                fg=Palette.TEXT_SOFT,
+                font=('Segoe UI', 11, 'bold'),
+            ).pack(anchor='w')
+            tk.Label(
+                empty_state,
+                text='When a user sends a file from the browser popup, it will appear here and be saved in the client_uploads folder.',
+                bg=Palette.SURFACE,
+                fg=Palette.MUTED,
+                font=('Segoe UI', 9),
+                justify=tk.LEFT,
+                wraplength=700,
+            ).pack(anchor='w', pady=(8, 0))
+            return
+
+        for index, record in enumerate(records):
+            card = tk.Frame(
+                self._client_uploads_container,
+                bg=Palette.SURFACE,
+                highlightbackground=Palette.BORDER_SOFT,
+                highlightthickness=1,
+                padx=16,
+                pady=14,
+            )
+            card.grid(row=index, column=0, sticky='ew', pady=(0, 10))
+            card.grid_columnconfigure(0, weight=1)
+
+            file_path = Path(str(record.get('file_path', '')))
+            file_name = str(record.get('file_name', file_path.name or 'client-upload.bin'))
+            tk.Label(
+                card,
+                text=file_name,
+                bg=Palette.SURFACE,
+                fg=Palette.TEXT,
+                font=('Segoe UI', 11, 'bold'),
+                anchor='w',
+            ).grid(row=0, column=0, sticky='w')
+
+            meta_parts = [
+                self._format_byte_count(int(record.get('byte_count', 0))),
+                str(record.get('mime_type', 'application/octet-stream')),
+                str(record.get('received_at', 'Unknown time')),
+            ]
+            page_url = record.get('page_url')
+            if isinstance(page_url, str) and page_url:
+                meta_parts.append(page_url)
+            tk.Label(
+                card,
+                text='   |   '.join(meta_parts),
+                bg=Palette.SURFACE,
+                fg=Palette.MUTED,
+                font=('Segoe UI', 9),
+                anchor='w',
+                justify=tk.LEFT,
+                wraplength=720,
+            ).grid(row=1, column=0, sticky='ew', pady=(6, 0))
+
+            tk.Label(
+                card,
+                text=str(file_path),
+                bg=Palette.SURFACE,
+                fg=Palette.MUTED_DARK,
+                font=('Consolas', 9),
+                anchor='w',
+                justify=tk.LEFT,
+                wraplength=720,
+            ).grid(row=2, column=0, sticky='ew', pady=(4, 10))
+
+            actions = tk.Frame(card, bg=Palette.SURFACE)
+            actions.grid(row=3, column=0, sticky='w')
+            ttk.Button(
+                actions,
+                text='Open File',
+                command=lambda target=file_path: self._open_received_file(target),
+                style='Action.TButton',
+            ).pack(side=tk.LEFT, padx=(0, 8))
+            ttk.Button(
+                actions,
+                text='Open Folder',
+                command=lambda target=file_path: self._open_received_file_folder(target),
+                style='Action.TButton',
+            ).pack(side=tk.LEFT)
+
+    def _summarize_client_uploads_status(self, records: list[dict] | None = None) -> str:
+        records = self._controller.list_received_client_files() if records is None else records
+        upload_count = len(records)
+        if upload_count == 0:
+            return 'No popup uploads received yet.'
+
+        newest_file = str(records[0].get('file_name', 'client-upload.bin'))
+        suffix = '' if upload_count == 1 else 's'
+        return f'{upload_count} popup upload{suffix} saved. Latest: {newest_file}.'
+
+    def _format_byte_count(self, byte_count: int) -> str:
+        size = float(max(0, byte_count))
+        units = ['B', 'KB', 'MB', 'GB']
+        unit_index = 0
+        while size >= 1024 and unit_index < len(units) - 1:
+            size /= 1024
+            unit_index += 1
+
+        if unit_index == 0:
+            return f'{int(size)} {units[unit_index]}'
+        return f'{size:.1f} {units[unit_index]}'
 
     def _poll_events(self) -> None:
         latest_screen_share_payload: dict | None = None
@@ -1519,3 +2328,19 @@ class CaptureControlWindow:
             self._screen_share_window_status.set(str(payload.get('message', 'Screen share stream ended.')))
             self._set_screen_share_controls_active(False)
             self._close_screen_share_window()
+        elif event_name == 'file_transfer_status':
+            debug_log('python-gui', 'Received GUI event.', payload)
+            self._file_transfer_status.set(str(payload.get('message', 'Browser file delivery started.')))
+        elif event_name == 'popup_file_saved':
+            debug_log('python-gui', 'Received GUI event.', payload)
+            file_name = str(payload.get('file_name', 'client-upload.bin'))
+            file_path = str(payload.get('file_path', ''))
+            self._client_uploads_status.set(f'Received {file_name} from the browser popup.')
+            self._show_toast(f'{file_name} saved to client uploads.')
+            if self._client_uploads_container is not None and self._client_uploads_container.winfo_exists():
+                self._refresh_client_uploads_window()
+            if file_path:
+                debug_log('python-gui', 'Popup-uploaded file available locally.', file_path)
+        elif event_name == 'popup_file_failed':
+            debug_log('python-gui', 'Received GUI event.', payload)
+            self._client_uploads_status.set(str(payload.get('message', 'Saving the popup-uploaded file failed.')))

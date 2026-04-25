@@ -9,6 +9,8 @@ class ClientRegistration:
     client_id: str
     name: str
     version: str
+    capabilities: tuple[str, ...] = ()
+    role: str = 'extension-client'
 
 
 @dataclass(slots=True)
@@ -40,3 +42,14 @@ class ScreenShareFrame:
     width: int
     height: int
     sequence: int
+
+
+@dataclass(slots=True)
+class ReceivedClientFile:
+    file_name: str
+    file_path: Path
+    mime_type: str
+    byte_count: int
+    page_url: str | None
+    tab_id: int | None
+    received_at: str

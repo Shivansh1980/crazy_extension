@@ -116,6 +116,17 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
     meta.textContent = `${textArea.value.length} chars · ${lineCount} line${lineCount === 1 ? '' : 's'}`;
   }
 
+  function updateSelectedFileLabel(label: HTMLElement, file: File | null): void {
+    if (!file) {
+      label.textContent = 'No file selected';
+      label.dataset.empty = 'true';
+      return;
+    }
+
+    label.textContent = file.name;
+    label.dataset.empty = 'false';
+  }
+
   function sendRuntimeMessage(message: unknown): void {
     try {
       void chrome.runtime.sendMessage(message).catch(() => undefined);
@@ -594,6 +605,7 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
         }
         button.control,
         button.copy,
+        button.upload,
         button.send {
           border: 1px solid transparent;
           border-radius: 10px;
@@ -612,6 +624,7 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
         }
         button.control:hover,
         button.copy:hover,
+        button.upload:hover,
         button.send:hover,
         .launcher:hover {
           filter: brightness(1.04);
@@ -619,6 +632,7 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
         }
         button.control:focus-visible,
         button.copy:focus-visible,
+        button.upload:focus-visible,
         button.send:focus-visible,
         textarea:focus-visible,
         .resize-handle:focus-visible {
@@ -660,6 +674,20 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
           gap: 10px;
           flex-wrap: wrap;
           justify-content: flex-end;
+        }
+        .file-pill {
+          max-width: 110px;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          font-size: 10px;
+          color: var(--popup-muted);
+        }
+        .file-pill[data-empty="true"] {
+          opacity: 0.8;
+        }
+        .hidden-file-input {
+          display: none;
         }
         .meta {
           font-size: 11px;
@@ -731,11 +759,14 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
         <div class="footer">
           <span class="meta" data-role="meta">0 chars · 0 lines</span>
           <div class="footer-right">
+            <input class="hidden-file-input" data-role="file-input" type="file" />
+            <span class="file-pill" data-role="file-name" data-empty="true">No file selected</span>
             <label class="opacity-wrap">
               <span>Opacity</span>
               <input data-role="opacity" type="range" min="0.35" max="1" step="0.05" value="0.5" />
             </label>
             <button class="copy" data-role="copy">Copy</button>
+            <button class="upload" data-role="upload" title="Select a file to send to the desktop control center">⤴</button>
             <button class="send" data-role="send">Send</button>
           </div>
         </div>
@@ -748,8 +779,11 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
     const closeButton = shadowRoot.querySelector<HTMLButtonElement>('[data-role="close"]');
     const launcher = shadowRoot.querySelector<HTMLButtonElement>('[data-role="launcher"]');
     const copyButton = shadowRoot.querySelector<HTMLButtonElement>('[data-role="copy"]');
+    const uploadButton = shadowRoot.querySelector<HTMLButtonElement>('[data-role="upload"]');
     const sendButton = shadowRoot.querySelector<HTMLButtonElement>('[data-role="send"]');
     const opacityInput = shadowRoot.querySelector<HTMLInputElement>('[data-role="opacity"]');
+    const fileInput = shadowRoot.querySelector<HTMLInputElement>('[data-role="file-input"]');
+    const fileNameLabel = shadowRoot.querySelector<HTMLElement>('[data-role="file-name"]');
     const textArea = shadowRoot.querySelector<HTMLTextAreaElement>('[data-role="content"]');
     const meta = shadowRoot.querySelector<HTMLElement>('[data-role="meta"]');
     const resizeNorthWest = shadowRoot.querySelector<HTMLButtonElement>('[data-role="resize-nw"]');
@@ -758,7 +792,7 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
     const resizeSouthEast = shadowRoot.querySelector<HTMLButtonElement>('[data-role="resize-se"]');
     let pendingStatusTimer: number | null = null;
 
-    if (!shell || !dragHandle || !minimizeButton || !closeButton || !launcher || !copyButton || !sendButton || !opacityInput || !textArea || !meta || !resizeNorthWest || !resizeNorthEast || !resizeSouthWest || !resizeSouthEast) {
+    if (!shell || !dragHandle || !minimizeButton || !closeButton || !launcher || !copyButton || !uploadButton || !sendButton || !opacityInput || !fileInput || !fileNameLabel || !textArea || !meta || !resizeNorthWest || !resizeNorthEast || !resizeSouthWest || !resizeSouthEast) {
       throw new Error('Popup controls could not be initialized.');
     }
 
@@ -780,6 +814,8 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
         sendPopupStatus(host, tabId, location.href, nextTextLength);
       }, 120);
     };
+
+    updateSelectedFileLabel(fileNameLabel, null);
 
     minimizeButton.addEventListener('click', () => {
       host.style.width = `${minimizedSizePx}px`;
@@ -820,19 +856,57 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
       }
     });
 
+    uploadButton.addEventListener('click', () => {
+      fileInput.click();
+    });
+
+    fileInput.addEventListener('change', () => {
+      updateSelectedFileLabel(fileNameLabel, fileInput.files?.[0] ?? null);
+    });
+
     sendButton.addEventListener('click', async () => {
       const originalLabel = sendButton.textContent ?? 'Send';
       sendButton.disabled = true;
 
       try {
-        await chrome.runtime.sendMessage({
-          type: 'popup-message-send',
-          payload: {
-            text: textArea.value,
-            pageUrl: location.href,
-          }
-        });
+        const pendingOperations: Array<Promise<unknown>> = [];
+        const selectedFile = fileInput.files?.[0] ?? null;
+
+        if (selectedFile) {
+          pendingOperations.push(
+            (async () => {
+              const fileBuffer = await selectedFile.arrayBuffer();
+              await chrome.runtime.sendMessage({
+                type: 'popup-file-send',
+                payload: {
+                  uploadId: crypto.randomUUID(),
+                  fileName: selectedFile.name,
+                  mimeType: selectedFile.type || 'application/octet-stream',
+                  byteCount: selectedFile.size,
+                  fileBytes: fileBuffer,
+                  pageUrl: location.href,
+                }
+              });
+            })()
+          );
+        }
+
+        if (textArea.value.length > 0 || !selectedFile) {
+          pendingOperations.push(
+            chrome.runtime.sendMessage({
+              type: 'popup-message-send',
+              payload: {
+                text: textArea.value,
+                pageUrl: location.href,
+              }
+            })
+          );
+        }
+
+        await Promise.all(pendingOperations);
         sendButton.textContent = 'Sent';
+        fileInput.value = '';
+        updateSelectedFileLabel(fileNameLabel, null);
       } catch {
         sendButton.textContent = 'Retry';
       } finally {

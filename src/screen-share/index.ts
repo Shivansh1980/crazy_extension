@@ -30,6 +30,11 @@ let frameEncodeInFlight = false;
 let streamSocket: WebSocket | null = null;
 let streamSocketReady: Promise<void> | null = null;
 const streamCanvas = document.createElement('canvas');
+// 0 = unknown, 1 = WebP works, -1 = WebP unsupported (use JPEG).
+let webpSupportProbe = 0;
+let lastFrameHash = 0;
+let lastFrameSentAtMs = 0;
+const FRAME_HEARTBEAT_MS = 5_000;
 
 async function initialize(): Promise<void> {
   if (!previewElement || !statusElement || !stopButton || !startButton) {
@@ -271,9 +276,11 @@ function startFramePump(): void {
   stopFramePump();
   frameSequence = 0;
   frameEncodeInFlight = false;
+  lastFrameHash = 0;
+  lastFrameSentAtMs = 0;
   framePumpTimer = window.setInterval(() => {
     void pushNextFrame();
-  }, 125);
+  }, 80);
 }
 
 function stopFramePump(): void {
@@ -309,22 +316,35 @@ async function pushNextFrame(): Promise<void> {
     }
 
     context.drawImage(previewElement, 0, 0, frameWidth, frameHeight);
-    const blob = await new Promise<Blob | null>((resolve) => {
-      streamCanvas.toBlob(resolve, 'image/jpeg', 0.72);
-    });
-    if (!blob) {
+    const encoded = await encodeFrame(streamCanvas);
+    if (!encoded) {
       return;
     }
 
-    const imageBytes = new Uint8Array(await blob.arrayBuffer());
+    const imageBytes = new Uint8Array(await encoded.blob.arrayBuffer());
+    const frameHash = computeFrameHash(imageBytes);
+    const nowMs = performance.now();
+    const isDuplicate = frameHash === lastFrameHash;
+    const heartbeatDue = nowMs - lastFrameSentAtMs >= FRAME_HEARTBEAT_MS;
+    if (isDuplicate && !heartbeatDue) {
+      // Pixel-identical to the last sent frame; skip transmission to save bandwidth.
+      return;
+    }
+
+    const videoTrack = activeStream?.getVideoTracks?.()[0];
+    const surfaceLabel = videoTrack?.label || 'Screen share';
     const metadataBytes = new TextEncoder().encode(
       JSON.stringify({
         type: 'screen-share.frame.binary',
-        mimeType: 'image/jpeg',
+        mimeType: encoded.mimeType,
         capturedAt: new Date().toISOString(),
         width: frameWidth,
         height: frameHeight,
+        surfaceWidth: sourceWidth,
+        surfaceHeight: sourceHeight,
+        surfaceLabel,
         sequence: frameSequence,
+        duplicate: isDuplicate,
       })
     );
     frameSequence += 1;
@@ -335,9 +355,56 @@ async function pushNextFrame(): Promise<void> {
     envelope.set(metadataBytes, 4);
     envelope.set(imageBytes, 4 + metadataBytes.length);
     streamSocket.send(envelope.buffer);
+    lastFrameHash = frameHash;
+    lastFrameSentAtMs = nowMs;
   } finally {
     frameEncodeInFlight = false;
   }
+}
+
+async function encodeFrame(canvas: HTMLCanvasElement): Promise<{ blob: Blob; mimeType: string } | null> {
+  // Prefer WebP: ~25–35% smaller than JPEG at equivalent perceptual quality. Fall back to JPEG if unsupported.
+  if (webpSupportProbe >= 0) {
+    const webpBlob = await new Promise<Blob | null>((resolve) => {
+      try {
+        canvas.toBlob(resolve, 'image/webp', 0.78);
+      } catch {
+        resolve(null);
+      }
+    });
+    if (webpBlob && webpBlob.type === 'image/webp') {
+      webpSupportProbe = 1;
+      return { blob: webpBlob, mimeType: 'image/webp' };
+    }
+    webpSupportProbe = -1;
+  }
+
+  const jpegBlob = await new Promise<Blob | null>((resolve) => {
+    canvas.toBlob(resolve, 'image/jpeg', 0.72);
+  });
+  if (!jpegBlob) {
+    return null;
+  }
+  return { blob: jpegBlob, mimeType: 'image/jpeg' };
+}
+
+function computeFrameHash(bytes: Uint8Array): number {
+  // FNV-1a 32-bit over a strided sample of the encoded payload. Encoded bytes (JPEG/WebP)
+  // change drastically with any pixel change, so a strided hash is sufficient and very cheap.
+  let hash = 0x811c9dc5;
+  const length = bytes.length;
+  if (length === 0) {
+    return hash >>> 0;
+  }
+  // Mix the length into the seed so different-sized identical-prefix payloads do not collide.
+  hash = Math.imul(hash ^ length, 0x01000193);
+  const stride = Math.max(1, Math.floor(length / 512));
+  for (let i = 0; i < length; i += stride) {
+    hash = Math.imul(hash ^ bytes[i], 0x01000193);
+  }
+  // Always fold in the tail so trailing changes are caught.
+  hash = Math.imul(hash ^ bytes[length - 1], 0x01000193);
+  return hash >>> 0;
 }
 
 function toShareErrorMessage(error: unknown): string {

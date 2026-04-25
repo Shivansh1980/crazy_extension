@@ -6,6 +6,7 @@ export interface BrowserCapabilities {
   tabsApi: boolean;
   commandsApi: boolean;
   clipboardWrite: boolean;
+  downloadsApi: boolean;
 }
 
 export interface BrowserIdentity {
@@ -23,6 +24,7 @@ export function getBrowserCapabilities(): BrowserCapabilities {
     scriptingApi: Boolean(chromeApi?.scripting?.executeScript),
     tabsApi: Boolean(chromeApi?.tabs?.query),
     commandsApi: Boolean(chromeApi?.commands?.onCommand),
+    downloadsApi: Boolean(chromeApi?.downloads?.download),
     clipboardWrite: Boolean(
       (typeof ClipboardItem !== 'undefined' && navigator.clipboard?.write) ||
         navigator.clipboard?.writeText

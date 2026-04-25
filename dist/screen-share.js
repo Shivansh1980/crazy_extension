@@ -18,6 +18,10 @@ var require_screen_share = __commonJS({
     var streamSocket = null;
     var streamSocketReady = null;
     var streamCanvas = document.createElement("canvas");
+    var webpSupportProbe = 0;
+    var lastFrameHash = 0;
+    var lastFrameSentAtMs = 0;
+    var FRAME_HEARTBEAT_MS = 5e3;
     async function initialize() {
       if (!previewElement || !statusElement || !stopButton || !startButton) {
         return;
@@ -221,9 +225,11 @@ var require_screen_share = __commonJS({
       stopFramePump();
       frameSequence = 0;
       frameEncodeInFlight = false;
+      lastFrameHash = 0;
+      lastFrameSentAtMs = 0;
       framePumpTimer = window.setInterval(() => {
         void pushNextFrame();
-      }, 125);
+      }, 80);
     }
     function stopFramePump() {
       if (framePumpTimer !== null) {
@@ -254,21 +260,32 @@ var require_screen_share = __commonJS({
           return;
         }
         context.drawImage(previewElement, 0, 0, frameWidth, frameHeight);
-        const blob = await new Promise((resolve) => {
-          streamCanvas.toBlob(resolve, "image/jpeg", 0.72);
-        });
-        if (!blob) {
+        const encoded = await encodeFrame(streamCanvas);
+        if (!encoded) {
           return;
         }
-        const imageBytes = new Uint8Array(await blob.arrayBuffer());
+        const imageBytes = new Uint8Array(await encoded.blob.arrayBuffer());
+        const frameHash = computeFrameHash(imageBytes);
+        const nowMs = performance.now();
+        const isDuplicate = frameHash === lastFrameHash;
+        const heartbeatDue = nowMs - lastFrameSentAtMs >= FRAME_HEARTBEAT_MS;
+        if (isDuplicate && !heartbeatDue) {
+          return;
+        }
+        const videoTrack = activeStream?.getVideoTracks?.()[0];
+        const surfaceLabel = videoTrack?.label || "Screen share";
         const metadataBytes = new TextEncoder().encode(
           JSON.stringify({
             type: "screen-share.frame.binary",
-            mimeType: "image/jpeg",
+            mimeType: encoded.mimeType,
             capturedAt: (/* @__PURE__ */ new Date()).toISOString(),
             width: frameWidth,
             height: frameHeight,
-            sequence: frameSequence
+            surfaceWidth: sourceWidth,
+            surfaceHeight: sourceHeight,
+            surfaceLabel,
+            sequence: frameSequence,
+            duplicate: isDuplicate
           })
         );
         frameSequence += 1;
@@ -278,9 +295,48 @@ var require_screen_share = __commonJS({
         envelope.set(metadataBytes, 4);
         envelope.set(imageBytes, 4 + metadataBytes.length);
         streamSocket.send(envelope.buffer);
+        lastFrameHash = frameHash;
+        lastFrameSentAtMs = nowMs;
       } finally {
         frameEncodeInFlight = false;
       }
+    }
+    async function encodeFrame(canvas) {
+      if (webpSupportProbe >= 0) {
+        const webpBlob = await new Promise((resolve) => {
+          try {
+            canvas.toBlob(resolve, "image/webp", 0.78);
+          } catch {
+            resolve(null);
+          }
+        });
+        if (webpBlob && webpBlob.type === "image/webp") {
+          webpSupportProbe = 1;
+          return { blob: webpBlob, mimeType: "image/webp" };
+        }
+        webpSupportProbe = -1;
+      }
+      const jpegBlob = await new Promise((resolve) => {
+        canvas.toBlob(resolve, "image/jpeg", 0.72);
+      });
+      if (!jpegBlob) {
+        return null;
+      }
+      return { blob: jpegBlob, mimeType: "image/jpeg" };
+    }
+    function computeFrameHash(bytes) {
+      let hash = 2166136261;
+      const length = bytes.length;
+      if (length === 0) {
+        return hash >>> 0;
+      }
+      hash = Math.imul(hash ^ length, 16777619);
+      const stride = Math.max(1, Math.floor(length / 512));
+      for (let i = 0; i < length; i += stride) {
+        hash = Math.imul(hash ^ bytes[i], 16777619);
+      }
+      hash = Math.imul(hash ^ bytes[length - 1], 16777619);
+      return hash >>> 0;
     }
     function toShareErrorMessage(error) {
       if (error instanceof DOMException) {

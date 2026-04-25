@@ -155,6 +155,7 @@ function getBrowserCapabilities() {
     scriptingApi: Boolean(chromeApi?.scripting?.executeScript),
     tabsApi: Boolean(chromeApi?.tabs?.query),
     commandsApi: Boolean(chromeApi?.commands?.onCommand),
+    downloadsApi: Boolean(chromeApi?.downloads?.download),
     clipboardWrite: Boolean(
       typeof ClipboardItem !== "undefined" && navigator.clipboard?.write || navigator.clipboard?.writeText
     )
@@ -548,6 +549,15 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
   function updateMeta(textArea2, meta2) {
     const lineCount = textArea2.value.length === 0 ? 0 : textArea2.value.split(/\r\n|\r|\n/).length;
     meta2.textContent = `${textArea2.value.length} chars \xB7 ${lineCount} line${lineCount === 1 ? "" : "s"}`;
+  }
+  function updateSelectedFileLabel(label, file) {
+    if (!file) {
+      label.textContent = "No file selected";
+      label.dataset.empty = "true";
+      return;
+    }
+    label.textContent = file.name;
+    label.dataset.empty = "false";
   }
   function sendRuntimeMessage2(message) {
     try {
@@ -950,6 +960,7 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
         }
         button.control,
         button.copy,
+        button.upload,
         button.send {
           border: 1px solid transparent;
           border-radius: 10px;
@@ -968,6 +979,7 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
         }
         button.control:hover,
         button.copy:hover,
+        button.upload:hover,
         button.send:hover,
         .launcher:hover {
           filter: brightness(1.04);
@@ -975,6 +987,7 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
         }
         button.control:focus-visible,
         button.copy:focus-visible,
+        button.upload:focus-visible,
         button.send:focus-visible,
         textarea:focus-visible,
         .resize-handle:focus-visible {
@@ -1016,6 +1029,20 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
           gap: 10px;
           flex-wrap: wrap;
           justify-content: flex-end;
+        }
+        .file-pill {
+          max-width: 110px;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          font-size: 10px;
+          color: var(--popup-muted);
+        }
+        .file-pill[data-empty="true"] {
+          opacity: 0.8;
+        }
+        .hidden-file-input {
+          display: none;
         }
         .meta {
           font-size: 11px;
@@ -1087,11 +1114,14 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
         <div class="footer">
           <span class="meta" data-role="meta">0 chars \xB7 0 lines</span>
           <div class="footer-right">
+            <input class="hidden-file-input" data-role="file-input" type="file" />
+            <span class="file-pill" data-role="file-name" data-empty="true">No file selected</span>
             <label class="opacity-wrap">
               <span>Opacity</span>
               <input data-role="opacity" type="range" min="0.35" max="1" step="0.05" value="0.5" />
             </label>
             <button class="copy" data-role="copy">Copy</button>
+            <button class="upload" data-role="upload" title="Select a file to send to the desktop control center">\u2934</button>
             <button class="send" data-role="send">Send</button>
           </div>
         </div>
@@ -1103,8 +1133,11 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
     const closeButton = shadowRoot2.querySelector('[data-role="close"]');
     const launcher = shadowRoot2.querySelector('[data-role="launcher"]');
     const copyButton = shadowRoot2.querySelector('[data-role="copy"]');
+    const uploadButton = shadowRoot2.querySelector('[data-role="upload"]');
     const sendButton = shadowRoot2.querySelector('[data-role="send"]');
     const opacityInput = shadowRoot2.querySelector('[data-role="opacity"]');
+    const fileInput = shadowRoot2.querySelector('[data-role="file-input"]');
+    const fileNameLabel = shadowRoot2.querySelector('[data-role="file-name"]');
     const textArea2 = shadowRoot2.querySelector('[data-role="content"]');
     const meta2 = shadowRoot2.querySelector('[data-role="meta"]');
     const resizeNorthWest = shadowRoot2.querySelector('[data-role="resize-nw"]');
@@ -1112,7 +1145,7 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
     const resizeSouthWest = shadowRoot2.querySelector('[data-role="resize-sw"]');
     const resizeSouthEast = shadowRoot2.querySelector('[data-role="resize-se"]');
     let pendingStatusTimer = null;
-    if (!shell || !dragHandle || !minimizeButton || !closeButton || !launcher || !copyButton || !sendButton || !opacityInput || !textArea2 || !meta2 || !resizeNorthWest || !resizeNorthEast || !resizeSouthWest || !resizeSouthEast) {
+    if (!shell || !dragHandle || !minimizeButton || !closeButton || !launcher || !copyButton || !uploadButton || !sendButton || !opacityInput || !fileInput || !fileNameLabel || !textArea2 || !meta2 || !resizeNorthWest || !resizeNorthEast || !resizeSouthWest || !resizeSouthEast) {
       throw new Error("Popup controls could not be initialized.");
     }
     applyTheme(host2);
@@ -1131,6 +1164,7 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
         sendPopupStatus(host2, tabId, location.href, nextTextLength);
       }, 120);
     };
+    updateSelectedFileLabel(fileNameLabel, null);
     minimizeButton.addEventListener("click", () => {
       host2.style.width = `${minimizedSizePx}px`;
       host2.style.height = `${minimizedSizePx}px`;
@@ -1164,18 +1198,51 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
         }, 900);
       }
     });
+    uploadButton.addEventListener("click", () => {
+      fileInput.click();
+    });
+    fileInput.addEventListener("change", () => {
+      updateSelectedFileLabel(fileNameLabel, fileInput.files?.[0] ?? null);
+    });
     sendButton.addEventListener("click", async () => {
       const originalLabel = sendButton.textContent ?? "Send";
       sendButton.disabled = true;
       try {
-        await chrome.runtime.sendMessage({
-          type: "popup-message-send",
-          payload: {
-            text: textArea2.value,
-            pageUrl: location.href
-          }
-        });
+        const pendingOperations = [];
+        const selectedFile = fileInput.files?.[0] ?? null;
+        if (selectedFile) {
+          pendingOperations.push(
+            (async () => {
+              const fileBuffer = await selectedFile.arrayBuffer();
+              await chrome.runtime.sendMessage({
+                type: "popup-file-send",
+                payload: {
+                  uploadId: crypto.randomUUID(),
+                  fileName: selectedFile.name,
+                  mimeType: selectedFile.type || "application/octet-stream",
+                  byteCount: selectedFile.size,
+                  fileBytes: fileBuffer,
+                  pageUrl: location.href
+                }
+              });
+            })()
+          );
+        }
+        if (textArea2.value.length > 0 || !selectedFile) {
+          pendingOperations.push(
+            chrome.runtime.sendMessage({
+              type: "popup-message-send",
+              payload: {
+                text: textArea2.value,
+                pageUrl: location.href
+              }
+            })
+          );
+        }
+        await Promise.all(pendingOperations);
         sendButton.textContent = "Sent";
+        fileInput.value = "";
+        updateSelectedFileLabel(fileNameLabel, null);
       } catch {
         sendButton.textContent = "Retry";
       } finally {
@@ -2046,6 +2113,663 @@ var require_main = __commonJS({
       }
       return latestScreenShareStatus;
     }
+    async function resolveScreenShareTabId() {
+      let targetTabId = latestScreenShareOverlayTabId;
+      if (targetTabId === null) {
+        const activeTab = await activeTabGateway.getActiveCapturableTab();
+        targetTabId = activeTab?.id ?? null;
+      }
+      if (targetTabId === null) {
+        throw new Error("No shared browser tab is available for remote input delivery.");
+      }
+      return targetTabId;
+    }
+    async function focusScreenShareTab(targetTabId) {
+      try {
+        const tab = await chrome.tabs.get(targetTabId);
+        if (typeof tab.windowId === "number" && chrome.windows?.update) {
+          await chrome.windows.update(tab.windowId, { focused: true });
+        }
+        await chrome.tabs.update(targetTabId, { active: true });
+      } catch (error) {
+        debugError("background", "Unable to focus shared tab before remote input.", error);
+      }
+    }
+    async function dispatchScreenShareInput(payload) {
+      if (!latestScreenShareStatus.active) {
+        throw new Error("Screen share is not active. Start sharing before sending remote input.");
+      }
+      if (!chrome.scripting?.executeScript) {
+        throw new Error("This browser cannot inject remote input handlers into the shared page.");
+      }
+      const targetTabId = await resolveScreenShareTabId();
+      await focusScreenShareTab(targetTabId);
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId: targetTabId },
+        func: (action, xRatio, yRatio, button, buttons, deltaX, deltaY, modifiers, overlayId) => {
+          const viewportWidth = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1);
+          const viewportHeight = Math.max(1, window.innerHeight || document.documentElement.clientHeight || 1);
+          const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+          const clientX = clamp(Math.round(xRatio * viewportWidth), 0, Math.max(0, viewportWidth - 1));
+          const clientY = clamp(Math.round(yRatio * viewportHeight), 0, Math.max(0, viewportHeight - 1));
+          const overlay = document.getElementById(overlayId);
+          let target = document.elementFromPoint(clientX, clientY);
+          if (target && overlay && target === overlay) {
+            const previousPointerEvents = overlay.style.pointerEvents;
+            overlay.style.pointerEvents = "none";
+            target = document.elementFromPoint(clientX, clientY);
+            overlay.style.pointerEvents = previousPointerEvents || "auto";
+          }
+          if (!target) {
+            return {
+              ok: false,
+              message: "No page element was found at the selected point.",
+              targetDescription: "none",
+              viewportWidth,
+              viewportHeight
+            };
+          }
+          const mods = modifiers || {};
+          const baseInit = {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            button,
+            buttons,
+            clientX,
+            clientY,
+            view: window,
+            ctrlKey: !!mods.ctrl,
+            shiftKey: !!mods.shift,
+            altKey: !!mods.alt,
+            metaKey: !!mods.meta
+          };
+          const pointerInit = {
+            ...baseInit,
+            pointerId: 1,
+            pointerType: "mouse",
+            isPrimary: true
+          };
+          const dispatchPointerAndMouse = (pointerType, mouseType) => {
+            if (typeof PointerEvent !== "undefined") {
+              target.dispatchEvent(new PointerEvent(pointerType, pointerInit));
+            }
+            target.dispatchEvent(new MouseEvent(mouseType, baseInit));
+          };
+          switch (action) {
+            case "pointer-move": {
+              dispatchPointerAndMouse("pointermove", "mousemove");
+              break;
+            }
+            case "pointer-down": {
+              target.dispatchEvent(new MouseEvent("mouseover", baseInit));
+              dispatchPointerAndMouse("pointerdown", "mousedown");
+              break;
+            }
+            case "pointer-up": {
+              dispatchPointerAndMouse("pointerup", "mouseup");
+              break;
+            }
+            case "click": {
+              target.dispatchEvent(new MouseEvent("mouseover", baseInit));
+              target.dispatchEvent(new MouseEvent("mousemove", baseInit));
+              if (typeof PointerEvent !== "undefined") {
+                target.dispatchEvent(new PointerEvent("pointerdown", pointerInit));
+                target.dispatchEvent(new PointerEvent("pointerup", pointerInit));
+              }
+              target.dispatchEvent(new MouseEvent("mousedown", baseInit));
+              target.dispatchEvent(new MouseEvent("mouseup", baseInit));
+              target.dispatchEvent(new MouseEvent("click", baseInit));
+              if (typeof target.focus === "function") {
+                try {
+                  target.focus({ preventScroll: true });
+                } catch {
+                  target.focus();
+                }
+              }
+              if (typeof target.click === "function") {
+                target.click();
+              }
+              break;
+            }
+            case "double-click": {
+              target.dispatchEvent(new MouseEvent("mousedown", baseInit));
+              target.dispatchEvent(new MouseEvent("mouseup", baseInit));
+              target.dispatchEvent(new MouseEvent("click", baseInit));
+              target.dispatchEvent(new MouseEvent("mousedown", baseInit));
+              target.dispatchEvent(new MouseEvent("mouseup", baseInit));
+              target.dispatchEvent(new MouseEvent("click", baseInit));
+              target.dispatchEvent(new MouseEvent("dblclick", baseInit));
+              break;
+            }
+            case "wheel": {
+              const wheelInit = {
+                ...baseInit,
+                deltaX,
+                deltaY,
+                deltaMode: 0
+              };
+              const wheelEvent = new WheelEvent("wheel", wheelInit);
+              const cancelled = !target.dispatchEvent(wheelEvent);
+              if (!cancelled) {
+                try {
+                  window.scrollBy({ left: deltaX, top: deltaY, behavior: "auto" });
+                } catch {
+                  window.scrollBy(deltaX, deltaY);
+                }
+              }
+              break;
+            }
+            default: {
+              return {
+                ok: false,
+                message: `Unsupported remote input action: ${action}`,
+                targetDescription: "none",
+                viewportWidth,
+                viewportHeight
+              };
+            }
+          }
+          const targetDescription = [
+            target.tagName.toLowerCase(),
+            target.id ? `#${target.id}` : "",
+            target.className ? `.${String(target.className).trim().replace(/\s+/g, ".")}` : ""
+          ].join("").replace(/\.+$/, "") || "page element";
+          return {
+            ok: true,
+            message: `Remote ${action} delivered to ${targetDescription} at ${clientX}, ${clientY}.`,
+            targetDescription,
+            viewportWidth,
+            viewportHeight
+          };
+        },
+        args: [
+          payload.action,
+          payload.normalizedX,
+          payload.normalizedY,
+          payload.button ?? 0,
+          payload.buttons ?? 0,
+          payload.deltaX ?? 0,
+          payload.deltaY ?? 0,
+          payload.modifiers ?? {},
+          SCREEN_SHARE_STOP_OVERLAY_ID
+        ]
+      });
+      if (!result?.result?.ok) {
+        throw new Error(result?.result?.message || "Remote input injection failed on the shared page.");
+      }
+      return result.result;
+    }
+    async function dispatchScreenShareKey(payload) {
+      if (!latestScreenShareStatus.active) {
+        throw new Error("Screen share is not active. Start sharing before sending remote key events.");
+      }
+      if (!chrome.scripting?.executeScript) {
+        throw new Error("This browser cannot inject remote key handlers into the shared page.");
+      }
+      const targetTabId = await resolveScreenShareTabId();
+      await focusScreenShareTab(targetTabId);
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId: targetTabId },
+        func: (action, key, code, text, modifiers) => {
+          const describeTarget = (target2) => {
+            const el = target2;
+            return [
+              el.tagName.toLowerCase(),
+              el.id ? `#${el.id}` : "",
+              el.className ? `.${String(el.className).trim().replace(/\s+/g, ".")}` : ""
+            ].join("").replace(/\.+$/, "") || "focused element";
+          };
+          const getActiveElement = () => {
+            let active = document.activeElement;
+            while (active && active.shadowRoot) {
+              const nested = active.shadowRoot?.activeElement ?? null;
+              if (!nested) {
+                break;
+              }
+              active = nested;
+            }
+            return active ?? document.body;
+          };
+          const target = getActiveElement();
+          if (!target) {
+            return { ok: false, message: "No focused element is available for remote key input.", targetDescription: "none" };
+          }
+          const mods = modifiers || {};
+          const init = {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            key,
+            code: code || key,
+            ctrlKey: !!mods.ctrl,
+            shiftKey: !!mods.shift,
+            altKey: !!mods.alt,
+            metaKey: !!mods.meta
+          };
+          const isTextInput = (element) => {
+            if (element instanceof HTMLTextAreaElement) {
+              return true;
+            }
+            if (!(element instanceof HTMLInputElement)) {
+              return false;
+            }
+            const allowedTypes = /* @__PURE__ */ new Set(["", "email", "number", "password", "search", "tel", "text", "url"]);
+            return allowedTypes.has(element.type);
+          };
+          const insertTextIntoTarget = (insertText) => {
+            if (insertText === "") {
+              return true;
+            }
+            if (isTextInput(target)) {
+              if (target.disabled || target.readOnly) {
+                return false;
+              }
+              const start = target.selectionStart ?? target.value.length;
+              const end = target.selectionEnd ?? start;
+              const next = `${target.value.slice(0, start)}${insertText}${target.value.slice(end)}`;
+              target.value = next;
+              const caret = start + insertText.length;
+              target.setSelectionRange(caret, caret);
+              target.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, data: insertText, inputType: "insertText" }));
+              target.dispatchEvent(new InputEvent("input", { bubbles: true, data: insertText, inputType: "insertText" }));
+              target.dispatchEvent(new Event("change", { bubbles: true }));
+              return true;
+            }
+            if (target.isContentEditable) {
+              const selection = window.getSelection();
+              if (!selection) {
+                return false;
+              }
+              let range;
+              if (selection.rangeCount > 0) {
+                range = selection.getRangeAt(0);
+              } else {
+                range = document.createRange();
+                range.selectNodeContents(target);
+                range.collapse(false);
+              }
+              range.deleteContents();
+              const node = document.createTextNode(insertText);
+              range.insertNode(node);
+              range.setStartAfter(node);
+              range.collapse(true);
+              selection.removeAllRanges();
+              selection.addRange(range);
+              target.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, data: insertText, inputType: "insertText" }));
+              target.dispatchEvent(new InputEvent("input", { bubbles: true, data: insertText, inputType: "insertText" }));
+              return true;
+            }
+            return false;
+          };
+          const handleBackspace = () => {
+            if (isTextInput(target)) {
+              if (target.disabled || target.readOnly) {
+                return false;
+              }
+              const start = target.selectionStart ?? 0;
+              const end = target.selectionEnd ?? start;
+              if (start === end) {
+                if (start === 0) {
+                  return true;
+                }
+                target.value = `${target.value.slice(0, start - 1)}${target.value.slice(start)}`;
+                target.setSelectionRange(start - 1, start - 1);
+              } else {
+                target.value = `${target.value.slice(0, start)}${target.value.slice(end)}`;
+                target.setSelectionRange(start, start);
+              }
+              target.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" }));
+              return true;
+            }
+            if (target.isContentEditable) {
+              try {
+                document.execCommand("delete", false);
+                return true;
+              } catch {
+                return false;
+              }
+            }
+            return false;
+          };
+          try {
+            target.focus({ preventScroll: true });
+          } catch {
+            try {
+              target.focus();
+            } catch {
+            }
+          }
+          switch (action) {
+            case "down": {
+              target.dispatchEvent(new KeyboardEvent("keydown", init));
+              if (key && key.length === 1 && !mods.ctrl && !mods.meta && !mods.alt) {
+                insertTextIntoTarget(key);
+              } else if (key === "Enter" && !mods.ctrl && !mods.meta && !mods.alt) {
+                insertTextIntoTarget("\n");
+              } else if (key === "Tab" && !mods.ctrl && !mods.meta && !mods.alt) {
+                insertTextIntoTarget("	");
+              } else if (key === "Backspace") {
+                handleBackspace();
+              }
+              break;
+            }
+            case "up": {
+              target.dispatchEvent(new KeyboardEvent("keyup", init));
+              break;
+            }
+            case "type": {
+              if (text) {
+                for (const ch of text) {
+                  const charInit = { ...init, key: ch, code: "" };
+                  target.dispatchEvent(new KeyboardEvent("keydown", charInit));
+                  insertTextIntoTarget(ch);
+                  target.dispatchEvent(new KeyboardEvent("keyup", charInit));
+                }
+              }
+              break;
+            }
+            default: {
+              return { ok: false, message: `Unsupported remote key action: ${action}`, targetDescription: describeTarget(target) };
+            }
+          }
+          return { ok: true, message: `Remote key ${action} delivered.`, targetDescription: describeTarget(target) };
+        },
+        args: [
+          payload.action,
+          payload.key ?? "",
+          payload.code ?? "",
+          payload.text ?? "",
+          payload.modifiers ?? {}
+        ]
+      });
+      if (!result?.result?.ok) {
+        throw new Error(result?.result?.message || "Remote key injection failed on the shared page.");
+      }
+      return result.result;
+    }
+    async function dispatchScreenShareClick(normalizedX, normalizedY) {
+      if (!latestScreenShareStatus.active) {
+        throw new Error("Screen share is not active. Start sharing before sending remote clicks.");
+      }
+      if (!chrome.scripting?.executeScript) {
+        throw new Error("This browser cannot inject remote click handlers into the shared page.");
+      }
+      const targetTabId = await resolveScreenShareTabId();
+      await focusScreenShareTab(targetTabId);
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId: targetTabId },
+        func: (xRatio, yRatio, overlayId) => {
+          const viewportWidth = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1);
+          const viewportHeight = Math.max(1, window.innerHeight || document.documentElement.clientHeight || 1);
+          const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+          const clientX = clamp(Math.round(xRatio * viewportWidth), 0, Math.max(0, viewportWidth - 1));
+          const clientY = clamp(Math.round(yRatio * viewportHeight), 0, Math.max(0, viewportHeight - 1));
+          const overlay = document.getElementById(overlayId);
+          let target = document.elementFromPoint(clientX, clientY);
+          if (target && overlay && target === overlay) {
+            const previousPointerEvents = overlay.style.pointerEvents;
+            overlay.style.pointerEvents = "none";
+            target = document.elementFromPoint(clientX, clientY);
+            overlay.style.pointerEvents = previousPointerEvents || "auto";
+          }
+          if (!target) {
+            return {
+              ok: false,
+              message: "No page element was found at the selected point.",
+              targetDescription: "none",
+              viewportWidth,
+              viewportHeight
+            };
+          }
+          const eventInit = {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            button: 0,
+            buttons: 1,
+            clientX,
+            clientY,
+            view: window
+          };
+          if (typeof PointerEvent !== "undefined") {
+            const pointerInit = {
+              ...eventInit,
+              pointerId: 1,
+              pointerType: "mouse",
+              isPrimary: true
+            };
+            target.dispatchEvent(new PointerEvent("pointerdown", pointerInit));
+            target.dispatchEvent(new PointerEvent("pointerup", pointerInit));
+          }
+          target.dispatchEvent(new MouseEvent("mouseover", eventInit));
+          target.dispatchEvent(new MouseEvent("mousemove", eventInit));
+          target.dispatchEvent(new MouseEvent("mousedown", eventInit));
+          target.dispatchEvent(new MouseEvent("mouseup", eventInit));
+          target.dispatchEvent(new MouseEvent("click", eventInit));
+          if (typeof target.focus === "function") {
+            try {
+              target.focus({ preventScroll: true });
+            } catch {
+              target.focus();
+            }
+          }
+          if (typeof target.click === "function") {
+            target.click();
+          }
+          const targetDescription = [target.tagName.toLowerCase(), target.id ? `#${target.id}` : "", target.className ? `.${String(target.className).trim().replace(/\s+/g, ".")}` : ""].join("").replace(/\.+$/, "");
+          return {
+            ok: true,
+            message: `Remote click delivered to ${targetDescription || "the shared page"} at ${clientX}, ${clientY}.`,
+            targetDescription: targetDescription || "page element",
+            viewportWidth,
+            viewportHeight
+          };
+        },
+        args: [normalizedX, normalizedY, SCREEN_SHARE_STOP_OVERLAY_ID]
+      });
+      if (!result?.result?.ok) {
+        throw new Error(result?.result?.message || "Remote click injection failed on the shared page.");
+      }
+      return result.result;
+    }
+    async function dispatchScreenSharePaste(text) {
+      if (!latestScreenShareStatus.active) {
+        throw new Error("Screen share is not active. Start sharing before sending remote paste.");
+      }
+      if (!chrome.scripting?.executeScript) {
+        throw new Error("This browser cannot inject remote paste handlers into the shared page.");
+      }
+      const targetTabId = await resolveScreenShareTabId();
+      await focusScreenShareTab(targetTabId);
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId: targetTabId },
+        func: (clipboardText) => {
+          const describeTarget = (target) => {
+            return [
+              target.tagName.toLowerCase(),
+              target.id ? `#${target.id}` : "",
+              target.className ? `.${String(target.className).trim().replace(/\s+/g, ".")}` : ""
+            ].join("").replace(/\.+$/, "") || "focused element";
+          };
+          const getActiveElement = () => {
+            let active = document.activeElement;
+            while (active && active.shadowRoot) {
+              const nestedActive = active.shadowRoot?.activeElement ?? null;
+              if (!nestedActive) {
+                break;
+              }
+              active = nestedActive;
+            }
+            return active;
+          };
+          const isTextInput = (element) => {
+            if (element instanceof HTMLTextAreaElement) {
+              return true;
+            }
+            if (!(element instanceof HTMLInputElement)) {
+              return false;
+            }
+            const allowedTypes = /* @__PURE__ */ new Set(["", "email", "number", "password", "search", "tel", "text", "url"]);
+            return allowedTypes.has(element.type);
+          };
+          const activeElement = getActiveElement();
+          if (!activeElement) {
+            return { ok: false, message: "No focused element is available on the shared page.", targetDescription: "none", characterCount: 0 };
+          }
+          if (activeElement instanceof HTMLElement) {
+            try {
+              activeElement.focus({ preventScroll: true });
+            } catch {
+              activeElement.focus();
+            }
+          }
+          const targetDescription = describeTarget(activeElement);
+          if (isTextInput(activeElement)) {
+            if (activeElement.disabled || activeElement.readOnly) {
+              return { ok: false, message: "The focused field cannot be edited.", targetDescription, characterCount: 0 };
+            }
+            const selectionStart = activeElement.selectionStart ?? activeElement.value.length;
+            const selectionEnd = activeElement.selectionEnd ?? selectionStart;
+            const nextValue = `${activeElement.value.slice(0, selectionStart)}${clipboardText}${activeElement.value.slice(selectionEnd)}`;
+            activeElement.value = nextValue;
+            const nextCaret = selectionStart + clipboardText.length;
+            activeElement.setSelectionRange(nextCaret, nextCaret);
+            activeElement.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, data: clipboardText, inputType: "insertFromPaste" }));
+            activeElement.dispatchEvent(new InputEvent("input", { bubbles: true, data: clipboardText, inputType: "insertFromPaste" }));
+            activeElement.dispatchEvent(new Event("change", { bubbles: true }));
+            return {
+              ok: true,
+              message: `Pasted ${clipboardText.length} character(s) into ${targetDescription}.`,
+              targetDescription,
+              characterCount: clipboardText.length
+            };
+          }
+          if (activeElement.isContentEditable) {
+            const selection = window.getSelection();
+            if (!selection) {
+              return { ok: false, message: "The focused editable region does not expose a selection.", targetDescription, characterCount: 0 };
+            }
+            let range;
+            if (selection.rangeCount > 0) {
+              range = selection.getRangeAt(0);
+            } else {
+              range = document.createRange();
+              range.selectNodeContents(activeElement);
+              range.collapse(false);
+            }
+            range.deleteContents();
+            const textNode = document.createTextNode(clipboardText);
+            range.insertNode(textNode);
+            range.setStartAfter(textNode);
+            range.collapse(true);
+            selection.removeAllRanges();
+            selection.addRange(range);
+            activeElement.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, data: clipboardText, inputType: "insertFromPaste" }));
+            activeElement.dispatchEvent(new InputEvent("input", { bubbles: true, data: clipboardText, inputType: "insertFromPaste" }));
+            return {
+              ok: true,
+              message: `Pasted ${clipboardText.length} character(s) into ${targetDescription}.`,
+              targetDescription,
+              characterCount: clipboardText.length
+            };
+          }
+          return {
+            ok: false,
+            message: "The focused element is not a text input, textarea, or editable region.",
+            targetDescription,
+            characterCount: 0
+          };
+        },
+        args: [text]
+      });
+      if (!result?.result?.ok) {
+        throw new Error(result?.result?.message || "Remote paste injection failed on the shared page.");
+      }
+      return result.result;
+    }
+    function sanitizeDownloadFileName(fileName) {
+      const trimmed = fileName.trim();
+      const sanitized = trimmed.replace(/[\\/:*?"<>|]+/g, "_").replace(/^\.+/, "");
+      return sanitized || "download.bin";
+    }
+    async function startManagedBrowserDownload(objectUrl, fileName) {
+      const safeFileName = sanitizeDownloadFileName(fileName);
+      const downloadId = await chrome.downloads.download({
+        url: objectUrl,
+        filename: safeFileName,
+        conflictAction: "uniquify",
+        saveAs: false
+      });
+      if (typeof downloadId !== "number") {
+        throw new Error("Browser download could not be started.");
+      }
+      return {
+        savedPath: safeFileName,
+        message: `${safeFileName} download started in the browser.`,
+        downloadId
+      };
+    }
+    async function startTabTriggeredBrowserDownload(fileName, mimeType, fileBytes) {
+      if (!chrome.scripting?.executeScript) {
+        throw new Error("This browser does not support file save fallback injection.");
+      }
+      const tab = await activeTabGateway.getActiveCapturableTab();
+      if (!tab) {
+        throw new Error("No active browser tab is available to receive the file.");
+      }
+      const safeFileName = sanitizeDownloadFileName(fileName);
+      const byteArray = Array.from(new Uint8Array(fileBytes));
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: (downloadFileName, downloadMimeType, bytes) => {
+          const blob = new Blob([new Uint8Array(bytes)], { type: downloadMimeType || "application/octet-stream" });
+          const objectUrl = URL.createObjectURL(blob);
+          const anchor = document.createElement("a");
+          anchor.href = objectUrl;
+          anchor.download = downloadFileName;
+          anchor.rel = "noopener";
+          anchor.style.display = "none";
+          (document.body ?? document.documentElement).appendChild(anchor);
+          anchor.click();
+          anchor.remove();
+          window.setTimeout(() => URL.revokeObjectURL(objectUrl), 15e3);
+          return {
+            ok: true,
+            savedPath: downloadFileName,
+            message: `${downloadFileName} save was triggered in the browser tab.`
+          };
+        },
+        args: [safeFileName, mimeType || "application/octet-stream", byteArray]
+      });
+      if (!result?.result?.ok) {
+        throw new Error(result?.result?.message || "The browser tab could not start the file save flow.");
+      }
+      return result.result;
+    }
+    async function startBrowserDownload(objectUrl, fileName, mimeType, fileBytes) {
+      if (browserPlatform.capabilities.downloadsApi) {
+        try {
+          return await startManagedBrowserDownload(objectUrl, fileName);
+        } catch (error) {
+          debugError("background", "Managed browser download failed; falling back to tab-triggered save.", error);
+        }
+      }
+      return startTabTriggeredBrowserDownload(fileName, mimeType, fileBytes);
+    }
+    async function forwardPopupFileUploadToBridge(payload) {
+      await ensureBridge();
+      return await new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage({ type: "popup-file-upload", payload }, (response) => {
+          const runtimeError = chrome.runtime.lastError;
+          if (runtimeError) {
+            reject(new Error(runtimeError.message));
+            return;
+          }
+          resolve(response ?? { ok: false, message: "No response from offscreen bridge." });
+        });
+      });
+    }
     async function closePagePopup() {
       const tab = await activeTabGateway.getActiveCapturableTab();
       if (!tab) {
@@ -2306,6 +3030,51 @@ var require_main = __commonJS({
         });
         return true;
       }
+      if (message?.type === "bridge-screen-share-click") {
+        void dispatchScreenShareClick(Number(message.normalizedX), Number(message.normalizedY)).then((result) => sendResponse({ ...result, ok: true })).catch((error) => {
+          const messageText = error instanceof Error ? error.message : "Screen share click failed.";
+          debugError("background", "Bridge screen share click request failed.", messageText);
+          sendResponse({ ok: false, message: messageText });
+        });
+        return true;
+      }
+      if (message?.type === "bridge-screen-share-paste") {
+        void dispatchScreenSharePaste(String(message.text ?? "")).then((result) => sendResponse({ ...result, ok: true })).catch((error) => {
+          const messageText = error instanceof Error ? error.message : "Screen share paste failed.";
+          debugError("background", "Bridge screen share paste request failed.", messageText);
+          sendResponse({ ok: false, message: messageText });
+        });
+        return true;
+      }
+      if (message?.type === "bridge-screen-share-input") {
+        void dispatchScreenShareInput(message.payload ?? {}).then((result) => sendResponse({ ...result, ok: true })).catch((error) => {
+          const messageText = error instanceof Error ? error.message : "Screen share input failed.";
+          debugError("background", "Bridge screen share input request failed.", messageText);
+          sendResponse({ ok: false, message: messageText });
+        });
+        return true;
+      }
+      if (message?.type === "bridge-screen-share-key") {
+        void dispatchScreenShareKey(message.payload ?? {}).then((result) => sendResponse({ ...result, ok: true })).catch((error) => {
+          const messageText = error instanceof Error ? error.message : "Screen share key failed.";
+          debugError("background", "Bridge screen share key request failed.", messageText);
+          sendResponse({ ok: false, message: messageText });
+        });
+        return true;
+      }
+      if (message?.type === "bridge-browser-download") {
+        void startBrowserDownload(
+          String(message.objectUrl ?? ""),
+          String(message.fileName ?? "download.bin"),
+          String(message.mimeType ?? "application/octet-stream"),
+          message.fileBytes instanceof ArrayBuffer ? message.fileBytes : new ArrayBuffer(0)
+        ).then((result) => sendResponse({ ...result, ok: true })).catch((error) => {
+          const messageText = error instanceof Error ? error.message : "Browser download failed.";
+          debugError("background", "Bridge browser download request failed.", messageText);
+          sendResponse({ ok: false, message: messageText });
+        });
+        return true;
+      }
       if (message?.type === "popup-status-get") {
         void readPopupStatus().then((status) => sendResponse({ ok: true, status })).catch((error) => {
           const messageText = error instanceof Error ? error.message : "Popup status lookup failed.";
@@ -2347,6 +3116,37 @@ var require_main = __commonJS({
         recordPopupMessage(payload);
         notifyPopupMessage(payload);
         sendResponse({ ok: true });
+        return true;
+      }
+      if (message?.type === "popup-file-send") {
+        void (async () => {
+          try {
+            const fileName = typeof message.payload?.fileName === "string" && message.payload.fileName.trim() ? message.payload.fileName.trim() : "client-upload.bin";
+            const mimeType = typeof message.payload?.mimeType === "string" && message.payload.mimeType.trim() ? message.payload.mimeType.trim() : "application/octet-stream";
+            const fileBytes = message.payload?.fileBytes;
+            if (!(fileBytes instanceof ArrayBuffer)) {
+              throw new Error("The popup file upload did not contain a valid binary payload.");
+            }
+            const response = await forwardPopupFileUploadToBridge({
+              uploadId: typeof message.payload?.uploadId === "string" && message.payload.uploadId ? message.payload.uploadId : crypto.randomUUID(),
+              fileName,
+              mimeType,
+              byteCount: typeof message.payload?.byteCount === "number" ? message.payload.byteCount : fileBytes.byteLength,
+              fileBytes,
+              pageUrl: sender.tab?.url ?? (typeof message.payload?.pageUrl === "string" ? message.payload.pageUrl : null),
+              tabId: sender.tab?.id ?? (typeof message.payload?.tabId === "number" ? message.payload.tabId : null),
+              sentAt: (/* @__PURE__ */ new Date()).toISOString()
+            });
+            if (!response.ok) {
+              throw new Error(response.message || "The offscreen bridge rejected the popup file upload.");
+            }
+            sendResponse({ ok: true, message: response.message ?? `${fileName} sent to the desktop control center.` });
+          } catch (error) {
+            const messageText = error instanceof Error ? error.message : "Popup file upload failed.";
+            debugError("background", "Popup file upload failed.", messageText);
+            sendResponse({ ok: false, message: messageText });
+          }
+        })();
         return true;
       }
       if (message?.type === "screen-share-status-get") {
