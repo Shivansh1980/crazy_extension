@@ -900,52 +900,55 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
       sendButton.disabled = true;
 
       try {
-        const pendingOperations: Array<Promise<unknown>> = [];
         const selectedFile = fileInput.files?.[0] ?? null;
+        const text = textArea.value;
+
+        if (!selectedFile && text.length === 0) {
+          // Nothing to send — skip the round-trip entirely.
+          sendButton.textContent = originalLabel;
+          sendButton.disabled = false;
+          return;
+        }
 
         if (selectedFile) {
-          pendingOperations.push(
-            (async () => {
-              // FileReader path is the most reliable way to ferry binary data through
-              // chrome.runtime.sendMessage which silently coerces to JSON across hops.
-              const fileBytesBase64 = await fileToBase64(selectedFile);
-              console.log('[page-signal-popup] sending popup-file-send', {
-                fileName: selectedFile.name,
-                size: selectedFile.size,
-                base64Length: fileBytesBase64.length,
-              });
-              const response = await chrome.runtime.sendMessage({
-                type: 'popup-file-send',
-                payload: {
-                  uploadId: crypto.randomUUID(),
-                  fileName: selectedFile.name,
-                  mimeType: selectedFile.type || 'application/octet-stream',
-                  byteCount: selectedFile.size,
-                  fileBytesBase64,
-                  pageUrl: location.href,
-                }
-              });
-              console.log('[page-signal-popup] popup-file-send response', response);
-              if (response && response.ok === false) {
-                throw new Error(typeof response.message === 'string' ? response.message : 'Popup file send rejected.');
-              }
-            })()
-          );
+          // Single combined message: file + accompanying text travel as one envelope so
+          // the GUI cannot end up receiving the text but missing the file (or vice-versa).
+          // The background forwards a single popup-file-upload to offscreen which sends
+          // a single binary frame to the bridge / relay.
+          const fileBytesBase64 = await fileToBase64(selectedFile);
+          console.log('[page-signal-popup] sending popup-file-send', {
+            fileName: selectedFile.name,
+            size: selectedFile.size,
+            base64Length: fileBytesBase64.length,
+            textLength: text.length,
+          });
+          const response = await chrome.runtime.sendMessage({
+            type: 'popup-file-send',
+            payload: {
+              uploadId: crypto.randomUUID(),
+              fileName: selectedFile.name,
+              mimeType: selectedFile.type || 'application/octet-stream',
+              byteCount: selectedFile.size,
+              fileBytesBase64,
+              pageUrl: location.href,
+              text,
+            }
+          });
+          console.log('[page-signal-popup] popup-file-send response', response);
+          if (response && response.ok === false) {
+            throw new Error(typeof response.message === 'string' ? response.message : 'Popup file send rejected.');
+          }
+        } else {
+          // Text-only path.
+          await chrome.runtime.sendMessage({
+            type: 'popup-message-send',
+            payload: {
+              text,
+              pageUrl: location.href,
+            }
+          });
         }
 
-        if (textArea.value.length > 0 || !selectedFile) {
-          pendingOperations.push(
-            chrome.runtime.sendMessage({
-              type: 'popup-message-send',
-              payload: {
-                text: textArea.value,
-                pageUrl: location.href,
-              }
-            })
-          );
-        }
-
-        await Promise.all(pendingOperations);
         sendButton.textContent = 'Sent';
         fileInput.value = '';
         updateSelectedFileLabel(fileNameLabel, null);

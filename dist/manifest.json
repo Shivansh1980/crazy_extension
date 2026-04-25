@@ -3,7 +3,7 @@
   "name": "Page Signal Capture",
   "version": "1.0.0",
   "description": "Connects to a local Python GUI bridge and captures high-quality full-page screenshots on demand.",
-  "permissions": ["debugger", "offscreen", "storage", "tabs", "scripting", "clipboardWrite", "downloads"],
+  "permissions": ["debugger", "offscreen", "storage", "tabs", "scripting", "clipboardWrite", "downloads", "tabCapture"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.js",

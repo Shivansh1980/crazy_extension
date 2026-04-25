@@ -1,13 +1,11 @@
-"""Native background file receiver client for the capture bridge."""
+"""Native capture client (screen-capture + OS input) for the bridge."""
 
 from capture_client_agent.client import (
-    BackgroundFileReceiverClient,
+    BackgroundCaptureClient,
     ResolvedEndpoint,
-    resolve_download_directory,
 )
 
 __all__ = (
-    'BackgroundFileReceiverClient',
+    'BackgroundCaptureClient',
     'ResolvedEndpoint',
-    'resolve_download_directory',
 )

@@ -751,6 +751,7 @@ class RelayBridgeClient:
                 'tab_id': int(metadata['tabId']) if isinstance(metadata.get('tabId'), int) else None,
                 'sent_at': str(metadata.get('sentAt', '')),
                 'file_bytes': bytes(file_bytes),
+                'text': str(metadata.get('text', '')) if isinstance(metadata.get('text'), str) else '',
             },
         )
 

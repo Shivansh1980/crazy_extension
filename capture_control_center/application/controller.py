@@ -135,6 +135,20 @@ class CaptureController:
                 'Scheduling popup file save.',
                 {'file_name': payload.get('file_name'), 'byte_count': payload.get('byte_count')},
             )
+            # If the popup carried an accompanying text message alongside the file, surface
+            # it through the regular popup_message channel BEFORE saving the file so the
+            # GUI's "Latest popup message" updates first and the file appears second.
+            accompanying_text = payload.get('text')
+            if isinstance(accompanying_text, str) and accompanying_text:
+                self._enqueue_event(
+                    'popup_message',
+                    {
+                        'text': accompanying_text,
+                        'page_url': payload.get('page_url'),
+                        'tab_id': payload.get('tab_id'),
+                        'sent_at': payload.get('sent_at', ''),
+                    },
+                )
             # run_coroutine_threadsafe is safe whether _handle_bridge_event runs on the loop
             # thread (the typical case) or some other thread. Using it instead of
             # call_soon_threadsafe + create_task gives us a Future we can await on if needed

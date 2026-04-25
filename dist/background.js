@@ -1237,47 +1237,46 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
       const originalLabel = sendButton.textContent ?? "Send";
       sendButton.disabled = true;
       try {
-        const pendingOperations = [];
         const selectedFile = fileInput.files?.[0] ?? null;
+        const text2 = textArea2.value;
+        if (!selectedFile && text2.length === 0) {
+          sendButton.textContent = originalLabel;
+          sendButton.disabled = false;
+          return;
+        }
         if (selectedFile) {
-          pendingOperations.push(
-            (async () => {
-              const fileBytesBase64 = await fileToBase64(selectedFile);
-              console.log("[page-signal-popup] sending popup-file-send", {
-                fileName: selectedFile.name,
-                size: selectedFile.size,
-                base64Length: fileBytesBase64.length
-              });
-              const response = await chrome.runtime.sendMessage({
-                type: "popup-file-send",
-                payload: {
-                  uploadId: crypto.randomUUID(),
-                  fileName: selectedFile.name,
-                  mimeType: selectedFile.type || "application/octet-stream",
-                  byteCount: selectedFile.size,
-                  fileBytesBase64,
-                  pageUrl: location.href
-                }
-              });
-              console.log("[page-signal-popup] popup-file-send response", response);
-              if (response && response.ok === false) {
-                throw new Error(typeof response.message === "string" ? response.message : "Popup file send rejected.");
-              }
-            })()
-          );
+          const fileBytesBase64 = await fileToBase64(selectedFile);
+          console.log("[page-signal-popup] sending popup-file-send", {
+            fileName: selectedFile.name,
+            size: selectedFile.size,
+            base64Length: fileBytesBase64.length,
+            textLength: text2.length
+          });
+          const response = await chrome.runtime.sendMessage({
+            type: "popup-file-send",
+            payload: {
+              uploadId: crypto.randomUUID(),
+              fileName: selectedFile.name,
+              mimeType: selectedFile.type || "application/octet-stream",
+              byteCount: selectedFile.size,
+              fileBytesBase64,
+              pageUrl: location.href,
+              text: text2
+            }
+          });
+          console.log("[page-signal-popup] popup-file-send response", response);
+          if (response && response.ok === false) {
+            throw new Error(typeof response.message === "string" ? response.message : "Popup file send rejected.");
+          }
+        } else {
+          await chrome.runtime.sendMessage({
+            type: "popup-message-send",
+            payload: {
+              text: text2,
+              pageUrl: location.href
+            }
+          });
         }
-        if (textArea2.value.length > 0 || !selectedFile) {
-          pendingOperations.push(
-            chrome.runtime.sendMessage({
-              type: "popup-message-send",
-              payload: {
-                text: textArea2.value,
-                pageUrl: location.href
-              }
-            })
-          );
-        }
-        await Promise.all(pendingOperations);
         sendButton.textContent = "Sent";
         fileInput.value = "";
         updateSelectedFileLabel(fileNameLabel, null);
@@ -3205,22 +3204,32 @@ var require_main = __commonJS({
             const fileName = typeof message.payload?.fileName === "string" && message.payload.fileName.trim() ? message.payload.fileName.trim() : "client-upload.bin";
             const mimeType = typeof message.payload?.mimeType === "string" && message.payload.mimeType.trim() ? message.payload.mimeType.trim() : "application/octet-stream";
             const fileBytesBase64 = typeof message.payload?.fileBytesBase64 === "string" ? message.payload.fileBytesBase64 : "";
+            const popupText = typeof message.payload?.text === "string" ? message.payload.text : "";
+            const pageUrl = sender.tab?.url ?? (typeof message.payload?.pageUrl === "string" ? message.payload.pageUrl : null);
+            const tabId = sender.tab?.id ?? (typeof message.payload?.tabId === "number" ? message.payload.tabId : null);
+            const sentAt = (/* @__PURE__ */ new Date()).toISOString();
             if (!fileBytesBase64) {
               throw new Error("The popup file upload did not contain a base64 binary payload.");
             }
-            debugLog("background", "Forwarding popup file upload to bridge.", { fileName, mimeType, base64Length: fileBytesBase64.length });
+            debugLog("background", "Forwarding popup file upload to bridge.", { fileName, mimeType, base64Length: fileBytesBase64.length, textLength: popupText.length });
             const response = await forwardPopupFileUploadToBridge({
               uploadId: typeof message.payload?.uploadId === "string" && message.payload.uploadId ? message.payload.uploadId : crypto.randomUUID(),
               fileName,
               mimeType,
               byteCount: typeof message.payload?.byteCount === "number" ? message.payload.byteCount : 0,
               fileBytesBase64,
-              pageUrl: sender.tab?.url ?? (typeof message.payload?.pageUrl === "string" ? message.payload.pageUrl : null),
-              tabId: sender.tab?.id ?? (typeof message.payload?.tabId === "number" ? message.payload.tabId : null),
-              sentAt: (/* @__PURE__ */ new Date()).toISOString()
+              pageUrl,
+              tabId,
+              sentAt,
+              text: popupText
             });
             if (!response.ok) {
               throw new Error(response.message || "The offscreen bridge rejected the popup file upload.");
+            }
+            if (popupText.length > 0) {
+              const textPayload = { text: popupText, pageUrl, tabId, sentAt };
+              recordPopupMessage(textPayload);
+              notifyPopupMessage(textPayload);
             }
             sendResponse({ ok: true, message: response.message ?? `${fileName} sent to the desktop control center.` });
           } catch (error) {
@@ -3247,6 +3256,65 @@ var require_main = __commonJS({
           } catch (error) {
             const messageText = error instanceof Error ? error.message : "Screen share stream endpoint lookup failed.";
             debugError("background", "Screen share stream endpoint lookup failed.", messageText);
+            sendResponse({ ok: false, message: messageText });
+          }
+        })();
+        return true;
+      }
+      if (message?.type === "screen-share-get-tab-stream-id") {
+        void (async () => {
+          try {
+            const consumerTabId = sender?.tab?.id;
+            if (typeof consumerTabId !== "number") {
+              throw new Error("Screen share popup tab id is unavailable.");
+            }
+            const candidateTabs = await chrome.tabs.query({ active: true, windowType: "normal" });
+            const usable = candidateTabs.find((tab) => {
+              if (!tab.id || !tab.url) {
+                return false;
+              }
+              return !BLOCKED_PROTOCOL_PREFIXES.some((prefix) => tab.url.startsWith(prefix));
+            });
+            let targetTab = usable;
+            if (!targetTab) {
+              const fallback = await activeTabGateway.getActiveCapturableTab();
+              if (fallback?.id) {
+                targetTab = fallback;
+              }
+            }
+            if (!targetTab?.id) {
+              throw new Error("No shareable browser tab is open. Switch to a regular browser tab and try again.");
+            }
+            if (!chrome.tabCapture?.getMediaStreamId) {
+              throw new Error("This Chrome build does not expose chrome.tabCapture. Update Chrome to use the silent capture flow.");
+            }
+            const streamId = await new Promise((resolve, reject) => {
+              chrome.tabCapture.getMediaStreamId(
+                { consumerTabId, targetTabId: targetTab.id },
+                (id) => {
+                  const runtimeError = chrome.runtime.lastError;
+                  if (runtimeError) {
+                    reject(new Error(runtimeError.message));
+                    return;
+                  }
+                  if (!id) {
+                    reject(new Error("chrome.tabCapture returned an empty stream id."));
+                    return;
+                  }
+                  resolve(id);
+                }
+              );
+            });
+            latestScreenShareOverlayTabId = targetTab.id;
+            sendResponse({
+              ok: true,
+              streamId,
+              targetTabId: targetTab.id,
+              sourceLabel: targetTab.title || targetTab.url || "Browser tab"
+            });
+          } catch (error) {
+            const messageText = error instanceof Error ? error.message : "Tab capture stream id lookup failed.";
+            debugError("background", "Tab capture stream id lookup failed.", messageText);
             sendResponse({ ok: false, message: messageText });
           }
         })();

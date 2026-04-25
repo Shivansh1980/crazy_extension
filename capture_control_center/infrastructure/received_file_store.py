@@ -63,6 +63,8 @@ class ReceivedFileStore:
                 self._records = [self._serialize_record(record) for record in records]
                 self._persist_index()
 
+            # Always present newest first regardless of stored order.
+            records.sort(key=lambda r: r.received_at or '', reverse=True)
             return records
 
     def _load_index(self) -> list[dict[str, Any]]:

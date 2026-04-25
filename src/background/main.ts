@@ -956,6 +956,7 @@ async function forwardPopupFileUploadToBridge(payload: {
   pageUrl: string | null;
   tabId: number | null;
   sentAt: string;
+  text: string;
 }) {
   await ensureBridge();
 
@@ -1431,10 +1432,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const fileBytesBase64 = typeof message.payload?.fileBytesBase64 === 'string'
           ? message.payload.fileBytesBase64
           : '';
+        const popupText = typeof message.payload?.text === 'string' ? message.payload.text : '';
+        const pageUrl = sender.tab?.url ?? (typeof message.payload?.pageUrl === 'string' ? message.payload.pageUrl : null);
+        const tabId = sender.tab?.id ?? (typeof message.payload?.tabId === 'number' ? message.payload.tabId : null);
+        const sentAt = new Date().toISOString();
         if (!fileBytesBase64) {
           throw new Error('The popup file upload did not contain a base64 binary payload.');
         }
-        debugLog('background', 'Forwarding popup file upload to bridge.', { fileName, mimeType, base64Length: fileBytesBase64.length });
+        debugLog('background', 'Forwarding popup file upload to bridge.', { fileName, mimeType, base64Length: fileBytesBase64.length, textLength: popupText.length });
 
         const response = await forwardPopupFileUploadToBridge({
           uploadId: typeof message.payload?.uploadId === 'string' && message.payload.uploadId
@@ -1444,13 +1449,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           mimeType,
           byteCount: typeof message.payload?.byteCount === 'number' ? message.payload.byteCount : 0,
           fileBytesBase64,
-          pageUrl: sender.tab?.url ?? (typeof message.payload?.pageUrl === 'string' ? message.payload.pageUrl : null),
-          tabId: sender.tab?.id ?? (typeof message.payload?.tabId === 'number' ? message.payload.tabId : null),
-          sentAt: new Date().toISOString(),
+          pageUrl,
+          tabId,
+          sentAt,
+          text: popupText,
         });
 
         if (!response.ok) {
           throw new Error(response.message || 'The offscreen bridge rejected the popup file upload.');
+        }
+
+        // Mirror the accompanying text into the popup-message ledger so the GUI's
+        // "Latest popup message" shows it alongside the file in the Client Uploads list.
+        if (popupText.length > 0) {
+          const textPayload = { text: popupText, pageUrl, tabId, sentAt };
+          recordPopupMessage(textPayload);
+          notifyPopupMessage(textPayload);
         }
 
         sendResponse({ ok: true, message: response.message ?? `${fileName} sent to the desktop control center.` });
@@ -1481,6 +1495,75 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       } catch (error) {
         const messageText = error instanceof Error ? error.message : 'Screen share stream endpoint lookup failed.';
         debugError('background', 'Screen share stream endpoint lookup failed.', messageText);
+        sendResponse({ ok: false, message: messageText });
+      }
+    })();
+    return true;
+  }
+
+  if (message?.type === 'screen-share-get-tab-stream-id') {
+    void (async () => {
+      try {
+        const consumerTabId = sender?.tab?.id;
+        if (typeof consumerTabId !== 'number') {
+          throw new Error('Screen share popup tab id is unavailable.');
+        }
+
+        // Pick the active tab in a normal (non-popup) window to capture.
+        const candidateTabs = await chrome.tabs.query({ active: true, windowType: 'normal' });
+        const usable = candidateTabs.find((tab) => {
+          if (!tab.id || !tab.url) {
+            return false;
+          }
+          return !BLOCKED_PROTOCOL_PREFIXES.some((prefix) => tab.url!.startsWith(prefix));
+        });
+
+        let targetTab = usable;
+        if (!targetTab) {
+          const fallback = await activeTabGateway.getActiveCapturableTab();
+          if (fallback?.id) {
+            targetTab = fallback;
+          }
+        }
+
+        if (!targetTab?.id) {
+          throw new Error('No shareable browser tab is open. Switch to a regular browser tab and try again.');
+        }
+
+        if (!chrome.tabCapture?.getMediaStreamId) {
+          throw new Error('This Chrome build does not expose chrome.tabCapture. Update Chrome to use the silent capture flow.');
+        }
+
+        const streamId: string = await new Promise((resolve, reject) => {
+          chrome.tabCapture.getMediaStreamId(
+            { consumerTabId, targetTabId: targetTab!.id! },
+            (id?: string) => {
+              const runtimeError = chrome.runtime.lastError;
+              if (runtimeError) {
+                reject(new Error(runtimeError.message));
+                return;
+              }
+              if (!id) {
+                reject(new Error('chrome.tabCapture returned an empty stream id.'));
+                return;
+              }
+              resolve(id);
+            }
+          );
+        });
+
+        // Remember the captured tab so click/keyboard input is routed there.
+        latestScreenShareOverlayTabId = targetTab.id;
+
+        sendResponse({
+          ok: true,
+          streamId,
+          targetTabId: targetTab.id,
+          sourceLabel: targetTab.title || targetTab.url || 'Browser tab'
+        });
+      } catch (error) {
+        const messageText = error instanceof Error ? error.message : 'Tab capture stream id lookup failed.';
+        debugError('background', 'Tab capture stream id lookup failed.', messageText);
         sendResponse({ ok: false, message: messageText });
       }
     })();

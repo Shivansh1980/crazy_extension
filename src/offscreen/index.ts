@@ -278,6 +278,7 @@ type PopupFileBinaryMessage = {
   pageUrl: string | null;
   tabId: number | null;
   sentAt: string;
+  text: string;
 };
 
 function decodeBase64ToBytes(base64: string): Uint8Array {
@@ -1897,6 +1898,7 @@ class ExtensionBridgeClient {
               sentAt: typeof message.payload?.sentAt === 'string' && message.payload.sentAt
                 ? message.payload.sentAt
                 : new Date().toISOString(),
+              text: typeof message.payload?.text === 'string' ? message.payload.text : '',
             },
             fileBytes,
           );

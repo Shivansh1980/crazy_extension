@@ -3,25 +3,18 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from capture_client_agent.client import (
-    BackgroundFileReceiverClient,
-    resolve_download_directory,
-)
+from capture_client_agent.client import BackgroundCaptureClient
 from capture_control_center.debug import debug_log
 
 
 def main() -> None:
     project_directory = Path.cwd()
-    download_directory = resolve_download_directory(project_directory)
     debug_log(
         'client-agent',
         'Starting native client agent.',
-        {'project_directory': str(project_directory), 'download_directory': str(download_directory)},
+        {'project_directory': str(project_directory)},
     )
-    client = BackgroundFileReceiverClient(
-        project_directory=project_directory,
-        download_directory=download_directory,
-    )
+    client = BackgroundCaptureClient(project_directory=project_directory)
     try:
         asyncio.run(client.run_forever())
     except KeyboardInterrupt:

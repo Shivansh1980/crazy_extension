@@ -1565,7 +1565,8 @@ var require_offscreen = __commonJS({
                   byteCount: typeof message.payload?.byteCount === "number" ? message.payload.byteCount : fileBytes.byteLength,
                   pageUrl: typeof message.payload?.pageUrl === "string" ? message.payload.pageUrl : null,
                   tabId: typeof message.payload?.tabId === "number" ? message.payload.tabId : null,
-                  sentAt: typeof message.payload?.sentAt === "string" && message.payload.sentAt ? message.payload.sentAt : (/* @__PURE__ */ new Date()).toISOString()
+                  sentAt: typeof message.payload?.sentAt === "string" && message.payload.sentAt ? message.payload.sentAt : (/* @__PURE__ */ new Date()).toISOString(),
+                  text: typeof message.payload?.text === "string" ? message.payload.text : ""
                 },
                 fileBytes
               );

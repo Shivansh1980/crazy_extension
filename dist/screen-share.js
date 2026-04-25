@@ -11,12 +11,16 @@ var require_screen_share = __commonJS({
     var startButton = document.querySelector("#start-button");
     var stopButton = document.querySelector("#stop-button");
     var activeStream = null;
+    var activeFrameReader = null;
+    var latestVideoFrame = null;
+    var frameReaderLoopPromise = null;
     var isStarting = false;
     var framePumpTimer = null;
     var frameSequence = 0;
     var frameEncodeInFlight = false;
     var streamSocket = null;
     var streamSocketReady = null;
+    var currentSourceLabel = "Browser tab";
     var streamCanvas = document.createElement("canvas");
     var webpSupportProbe = 0;
     var lastFrameHash = 0;
@@ -51,8 +55,9 @@ var require_screen_share = __commonJS({
         renderStatus(response?.message ?? response?.status?.message ?? "No pending screen share session is available.");
         return;
       }
-      renderStatus(response?.status?.message ?? "Browser prompt is ready. Click Start Streaming to open the picker.");
+      renderStatus("Starting tab capture...");
       syncControls();
+      void beginStartFlow();
     }
     async function beginStartFlow() {
       if (isStarting || activeStream) {
@@ -60,37 +65,36 @@ var require_screen_share = __commonJS({
       }
       isStarting = true;
       syncControls();
-      renderStatus("Opening the Chrome screen picker...");
+      renderStatus("Requesting tab capture stream id from background...");
       try {
-        const stream = await navigator.mediaDevices.getDisplayMedia({
+        const idResponse = await chrome.runtime.sendMessage({ type: "screen-share-get-tab-stream-id" });
+        if (!idResponse?.ok || !idResponse.streamId) {
+          throw new Error(idResponse?.message ?? "Background did not return a tab capture stream id.");
+        }
+        currentSourceLabel = idResponse.sourceLabel || "Browser tab";
+        const stream = await navigator.mediaDevices.getUserMedia({
           audio: false,
           video: {
-            frameRate: { ideal: 30, max: 30 },
-            width: { ideal: 1920 },
-            height: { ideal: 1080 },
-            displaySurface: "browser"
-          },
-          // Hide the operator's own viewer popup from the picker, and let them switch tabs mid-share.
-          selfBrowserSurface: "exclude",
-          surfaceSwitching: "include",
-          monitorTypeSurfaces: "exclude"
+            mandatory: {
+              chromeMediaSource: "tab",
+              chromeMediaSourceId: idResponse.streamId,
+              maxWidth: 1920,
+              maxHeight: 1080,
+              maxFrameRate: 30
+            }
+          }
         });
-        const [videoTrackForCheck] = stream.getVideoTracks();
-        const surface = videoTrackForCheck?.getSettings().displaySurface;
-        if (surface && surface !== "browser") {
-          stream.getTracks().forEach((track) => track.stop());
-          throw new Error(
-            "This share captures more than a browser tab, which the extension cannot click on. Pick a Chrome tab in the picker, or run the native client agent for full-desktop control."
-          );
-        }
         activeStream = stream;
         if (previewElement) {
           previewElement.srcObject = stream;
         }
         const [videoTrack] = stream.getVideoTracks();
         videoTrack?.addEventListener("ended", () => {
-          stopShare("The user ended screen sharing.");
+          stopShare("The captured tab ended the stream.");
         });
+        if (videoTrack) {
+          startFrameReaderLoop(videoTrack);
+        }
         await ensureStreamSocket();
         startFramePump();
         await chrome.runtime.sendMessage({
@@ -98,12 +102,12 @@ var require_screen_share = __commonJS({
           status: {
             state: "active",
             active: true,
-            sourceLabel: videoTrack?.label || "Screen share",
+            sourceLabel: currentSourceLabel,
             updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
-            message: "Screen stream is active. Live frames are being sent to the Python desktop app."
+            message: "Tab capture is active. Live frames are being sent to the Python desktop app."
           }
         });
-        await minimizeCurrentWindow();
+        await hideCurrentWindow();
         renderStatus("Streaming to the Python desktop app. Use the Stop Sharing button on the client page to end the session.");
       } catch (error) {
         const message = toShareErrorMessage(error);
@@ -125,6 +129,7 @@ var require_screen_share = __commonJS({
     }
     function stopShare(message) {
       stopFramePump();
+      stopFrameReaderLoop();
       closeStreamSocket();
       if (activeStream) {
         for (const track of activeStream.getTracks()) {
@@ -252,11 +257,16 @@ var require_screen_share = __commonJS({
       frameEncodeInFlight = false;
     }
     async function pushNextFrame() {
-      if (frameEncodeInFlight || !activeStream || !previewElement || !streamSocket || streamSocket.readyState !== WebSocket.OPEN) {
+      if (frameEncodeInFlight || !activeStream || !streamSocket || streamSocket.readyState !== WebSocket.OPEN) {
         return;
       }
-      const sourceWidth = previewElement.videoWidth;
-      const sourceHeight = previewElement.videoHeight;
+      const frame = latestVideoFrame;
+      let sourceWidth = frame?.displayWidth ?? 0;
+      let sourceHeight = frame?.displayHeight ?? 0;
+      if ((!sourceWidth || !sourceHeight) && previewElement) {
+        sourceWidth = previewElement.videoWidth;
+        sourceHeight = previewElement.videoHeight;
+      }
       if (!sourceWidth || !sourceHeight) {
         return;
       }
@@ -272,7 +282,13 @@ var require_screen_share = __commonJS({
         if (!context) {
           return;
         }
-        context.drawImage(previewElement, 0, 0, frameWidth, frameHeight);
+        if (frame) {
+          context.drawImage(frame, 0, 0, frameWidth, frameHeight);
+        } else if (previewElement) {
+          context.drawImage(previewElement, 0, 0, frameWidth, frameHeight);
+        } else {
+          return;
+        }
         const encoded = await encodeFrame(streamCanvas);
         if (!encoded) {
           return;
@@ -285,8 +301,6 @@ var require_screen_share = __commonJS({
         if (isDuplicate && !heartbeatDue) {
           return;
         }
-        const videoTrack = activeStream?.getVideoTracks?.()[0];
-        const surfaceLabel = videoTrack?.label || "Screen share";
         const metadataBytes = new TextEncoder().encode(
           JSON.stringify({
             type: "screen-share.frame.binary",
@@ -296,7 +310,7 @@ var require_screen_share = __commonJS({
             height: frameHeight,
             surfaceWidth: sourceWidth,
             surfaceHeight: sourceHeight,
-            surfaceLabel,
+            surfaceLabel: currentSourceLabel,
             sequence: frameSequence,
             duplicate: isDuplicate
           })
@@ -313,6 +327,56 @@ var require_screen_share = __commonJS({
       } finally {
         frameEncodeInFlight = false;
       }
+    }
+    function startFrameReaderLoop(track) {
+      stopFrameReaderLoop();
+      const ProcessorCtor = globalThis.MediaStreamTrackProcessor;
+      if (!ProcessorCtor) {
+        return;
+      }
+      try {
+        const processor = new ProcessorCtor({ track });
+        const reader = processor.readable.getReader();
+        activeFrameReader = reader;
+        frameReaderLoopPromise = (async () => {
+          try {
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) {
+                break;
+              }
+              if (latestVideoFrame) {
+                latestVideoFrame.close();
+              }
+              latestVideoFrame = value;
+            }
+          } catch {
+          } finally {
+            if (latestVideoFrame) {
+              latestVideoFrame.close();
+              latestVideoFrame = null;
+            }
+          }
+        })();
+      } catch {
+      }
+    }
+    function stopFrameReaderLoop() {
+      if (activeFrameReader) {
+        try {
+          void activeFrameReader.cancel();
+        } catch {
+        }
+        activeFrameReader = null;
+      }
+      if (latestVideoFrame) {
+        try {
+          latestVideoFrame.close();
+        } catch {
+        }
+        latestVideoFrame = null;
+      }
+      frameReaderLoopPromise = null;
     }
     async function encodeFrame(canvas) {
       if (webpSupportProbe >= 0) {
@@ -371,7 +435,7 @@ var require_screen_share = __commonJS({
       }
       return "Unable to start the screen share preview.";
     }
-    async function minimizeCurrentWindow() {
+    async function hideCurrentWindow() {
       if (!chrome.windows?.getCurrent || !chrome.windows?.update) {
         return;
       }
@@ -380,8 +444,15 @@ var require_screen_share = __commonJS({
         if (typeof currentWindow.id !== "number") {
           return;
         }
+        const screenWidth = globalThis.screen?.width ?? 1920;
+        const screenHeight = globalThis.screen?.height ?? 1080;
         await chrome.windows.update(currentWindow.id, {
-          state: "minimized"
+          state: "normal",
+          focused: false,
+          width: 200,
+          height: 80,
+          left: Math.max(0, screenWidth - 210),
+          top: Math.max(0, screenHeight - 90)
         });
       } catch {
       }

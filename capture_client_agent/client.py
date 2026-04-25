@@ -30,7 +30,6 @@ LOCALHOST_ATTEMPT_THRESHOLD = 10
 CLIENT_NAME = 'page-signal-native-client'
 CLIENT_VERSION = '2.0.0'
 LOCAL_RESOLVER_FILE_NAME = 'server_url.txt'
-DEFAULT_DOWNLOAD_DIRECTORY_NAME = 'client_uploads'
 
 
 @dataclass
@@ -39,18 +38,17 @@ class ResolvedEndpoint:
     source: str
 
 
-def resolve_download_directory(project_directory: Path) -> Path:
-    download_directory = project_directory / DEFAULT_DOWNLOAD_DIRECTORY_NAME
-    download_directory.mkdir(parents=True, exist_ok=True)
-    return download_directory
+class BackgroundCaptureClient:
+    """Connects to the capture bridge and provides screen capture + OS input.
 
+    File reception is intentionally NOT implemented here: the Chrome extension already
+    receives popup-uploaded files reliably through its own websocket connection, so the
+    native agent only contributes capabilities the browser cannot provide on its own
+    (full-desktop screen capture via mss, and synthesized OS-level input via pyautogui).
+    """
 
-class BackgroundFileReceiverClient:
-    """Connects to the capture bridge and persists incoming file uploads to disk."""
-
-    def __init__(self, project_directory: Path, download_directory: Path) -> None:
+    def __init__(self, project_directory: Path) -> None:
         self._project_directory = project_directory
-        self._download_directory = download_directory
         self._client_id = str(uuid.uuid4())
         self._localhost_failure_count = 0
         try:
@@ -79,8 +77,8 @@ class BackgroundFileReceiverClient:
     async def run_forever(self) -> None:
         debug_log(
             'client-agent',
-            'Starting background file receiver client.',
-            {'download_directory': str(self._download_directory), 'client_id': self._client_id},
+            'Starting native capture client.',
+            {'client_id': self._client_id},
         )
         while True:
             for endpoint in self._connection_plan():
@@ -173,7 +171,7 @@ class BackgroundFileReceiverClient:
             async with connect(endpoint.url, max_size=None, ping_interval=20, ping_timeout=20) as websocket:
                 if endpoint.source in ('local-file', 'default-local'):
                     self._localhost_failure_count = 0
-                capabilities = ['file-receive']
+                capabilities: list[str] = []
                 if self._input_capable:
                     capabilities.append('os-input')
                 if self._screen_capture_capable:
@@ -209,12 +207,12 @@ class BackgroundFileReceiverClient:
 
     async def _handle_message(self, websocket: Any, raw_message: Any) -> None:
         if isinstance(raw_message, bytes):
-            metadata, payload_bytes = self._decode_binary_envelope(raw_message)
+            metadata, _payload_bytes = self._decode_binary_envelope(raw_message)
             message_type = metadata.get('type')
-            if message_type == 'file-transfer.upload.binary':
-                await self._handle_file_upload(websocket, metadata, payload_bytes)
-            else:
-                debug_log('client-agent', 'Unhandled binary payload.', {'type': message_type})
+            # File-receive is now handled exclusively by the Chrome extension. Any binary
+            # frames the bridge still routes our way (e.g. legacy file-transfer envelopes)
+            # are dropped silently.
+            debug_log('client-agent', 'Ignoring binary payload (handled by extension).', {'type': message_type})
             return
 
         try:
@@ -389,69 +387,6 @@ class BackgroundFileReceiverClient:
         from datetime import datetime, timezone
 
         return datetime.now(timezone.utc).isoformat()
-
-    async def _handle_file_upload(
-        self,
-        websocket: Any,
-        metadata: dict[str, Any],
-        payload_bytes: bytes,
-    ) -> None:
-        request_id = str(metadata.get('requestId', ''))
-        file_name = str(metadata.get('fileName') or 'upload.bin')
-        try:
-            saved_path = self._save_file(file_name, payload_bytes)
-        except Exception as error:  # noqa: BLE001 - report failure to bridge
-            debug_log(
-                'client-agent',
-                'Failed to persist uploaded file.',
-                {'request_id': request_id, 'error': str(error)},
-            )
-            await websocket.send(
-                json.dumps(
-                    {
-                        'type': 'file-transfer.error',
-                        'requestId': request_id,
-                        'message': str(error),
-                    }
-                )
-            )
-            return
-
-        debug_log(
-            'client-agent',
-            'Persisted uploaded file.',
-            {'request_id': request_id, 'path': str(saved_path), 'bytes': len(payload_bytes)},
-        )
-        await websocket.send(
-            json.dumps(
-                {
-                    'type': 'file-transfer.result',
-                    'requestId': request_id,
-                    'savedPath': str(saved_path),
-                    'byteCount': len(payload_bytes),
-                }
-            )
-        )
-
-    def _save_file(self, file_name: str, payload_bytes: bytes) -> Path:
-        target_path = self._allocate_path(file_name)
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_bytes(payload_bytes)
-        return target_path
-
-    def _allocate_path(self, file_name: str) -> Path:
-        sanitized = Path(file_name).name or 'upload.bin'
-        candidate = self._download_directory / sanitized
-        if not candidate.exists():
-            return candidate
-        stem = candidate.stem
-        suffix = candidate.suffix
-        index = 1
-        while True:
-            alternate = self._download_directory / f'{stem} ({index}){suffix}'
-            if not alternate.exists():
-                return alternate
-            index += 1
 
     @staticmethod
     def _decode_binary_envelope(raw_message: bytes) -> tuple[dict[str, Any], bytes]:

@@ -17,18 +17,30 @@ type ScreenShareStreamEndpointResponse = {
   message?: string;
 };
 
+type TabStreamIdResponse = {
+  ok: boolean;
+  streamId?: string;
+  targetTabId?: number;
+  sourceLabel?: string;
+  message?: string;
+};
+
 const previewElement = document.querySelector<HTMLVideoElement>('#preview');
 const statusElement = document.querySelector<HTMLElement>('#status');
 const startButton = document.querySelector<HTMLButtonElement>('#start-button');
 const stopButton = document.querySelector<HTMLButtonElement>('#stop-button');
 
 let activeStream: MediaStream | null = null;
+let activeFrameReader: ReadableStreamDefaultReader<VideoFrame> | null = null;
+let latestVideoFrame: VideoFrame | null = null;
+let frameReaderLoopPromise: Promise<void> | null = null;
 let isStarting = false;
 let framePumpTimer: number | null = null;
 let frameSequence = 0;
 let frameEncodeInFlight = false;
 let streamSocket: WebSocket | null = null;
 let streamSocketReady: Promise<void> | null = null;
+let currentSourceLabel = 'Browser tab';
 const streamCanvas = document.createElement('canvas');
 // 0 = unknown, 1 = WebP works, -1 = WebP unsupported (use JPEG).
 let webpSupportProbe = 0;
@@ -72,8 +84,12 @@ async function initialize(): Promise<void> {
     return;
   }
 
-  renderStatus(response?.status?.message ?? 'Browser prompt is ready. Click Start Streaming to open the picker.');
+  renderStatus('Starting tab capture...');
   syncControls();
+
+  // Auto-start: tab capture is silent (no Chrome picker), so there is no reason to make
+  // the operator click "Start Streaming". The button stays available as a manual retry.
+  void beginStartFlow();
 }
 
 async function beginStartFlow(): Promise<void> {
@@ -83,39 +99,31 @@ async function beginStartFlow(): Promise<void> {
 
   isStarting = true;
   syncControls();
-  renderStatus('Opening the Chrome screen picker...');
+  renderStatus('Requesting tab capture stream id from background...');
 
   try {
-    // Restrict the picker to browser tabs only. Without the native client agent we cannot
-    // synthesize OS-level input, so allowing "Entire screen" or "Application window" would
-    // produce a stream the operator can see but cannot reliably click on. The native agent path
-    // bypasses getDisplayMedia entirely (uses `mss` on the desktop), so this restriction only
-    // affects the extension fallback flow.
-    const stream = await navigator.mediaDevices.getDisplayMedia({
+    const idResponse = (await chrome.runtime.sendMessage({ type: 'screen-share-get-tab-stream-id' })) as TabStreamIdResponse;
+    if (!idResponse?.ok || !idResponse.streamId) {
+      throw new Error(idResponse?.message ?? 'Background did not return a tab capture stream id.');
+    }
+
+    currentSourceLabel = idResponse.sourceLabel || 'Browser tab';
+
+    // chrome.tabCapture's stream id is consumed by the legacy mandatory-constraints form of
+    // getUserMedia. This avoids the getDisplayMedia "Sharing this tab" page-level banner
+    // entirely; Chrome only shows a small icon in the omnibox.
+    const stream = await navigator.mediaDevices.getUserMedia({
       audio: false,
       video: {
-        frameRate: { ideal: 30, max: 30 },
-        width: { ideal: 1920 },
-        height: { ideal: 1080 },
-        displaySurface: 'browser',
-      } as MediaTrackConstraints,
-      // Hide the operator's own viewer popup from the picker, and let them switch tabs mid-share.
-      selfBrowserSurface: 'exclude',
-      surfaceSwitching: 'include',
-      monitorTypeSurfaces: 'exclude',
-    } as DisplayMediaStreamOptions);
-
-    const [videoTrackForCheck] = stream.getVideoTracks();
-    const surface = videoTrackForCheck?.getSettings().displaySurface;
-    if (surface && surface !== 'browser') {
-      // Defensive guard: some Chromium variants ignore the displaySurface constraint and let the
-      // user pick a monitor/window anyway. Stop the stream and surface a clear error so the
-      // operator knows to either pick a tab or run the native client agent.
-      stream.getTracks().forEach((track) => track.stop());
-      throw new Error(
-        'This share captures more than a browser tab, which the extension cannot click on. Pick a Chrome tab in the picker, or run the native client agent for full-desktop control.'
-      );
-    }
+        mandatory: {
+          chromeMediaSource: 'tab',
+          chromeMediaSourceId: idResponse.streamId,
+          maxWidth: 1920,
+          maxHeight: 1080,
+          maxFrameRate: 30,
+        },
+      } as unknown as MediaTrackConstraints,
+    });
 
     activeStream = stream;
     if (previewElement) {
@@ -123,8 +131,12 @@ async function beginStartFlow(): Promise<void> {
     }
     const [videoTrack] = stream.getVideoTracks();
     videoTrack?.addEventListener('ended', () => {
-      stopShare('The user ended screen sharing.');
+      stopShare('The captured tab ended the stream.');
     });
+
+    if (videoTrack) {
+      startFrameReaderLoop(videoTrack);
+    }
 
     await ensureStreamSocket();
     startFramePump();
@@ -134,12 +146,12 @@ async function beginStartFlow(): Promise<void> {
       status: {
         state: 'active',
         active: true,
-        sourceLabel: videoTrack?.label || 'Screen share',
+        sourceLabel: currentSourceLabel,
         updatedAt: new Date().toISOString(),
-        message: 'Screen stream is active. Live frames are being sent to the Python desktop app.',
+        message: 'Tab capture is active. Live frames are being sent to the Python desktop app.',
       },
     });
-    await minimizeCurrentWindow();
+    await hideCurrentWindow();
     renderStatus('Streaming to the Python desktop app. Use the Stop Sharing button on the client page to end the session.');
   } catch (error) {
     const message = toShareErrorMessage(error);
@@ -162,6 +174,7 @@ async function beginStartFlow(): Promise<void> {
 
 function stopShare(message: string): void {
   stopFramePump();
+  stopFrameReaderLoop();
   closeStreamSocket();
 
   if (activeStream) {
@@ -314,12 +327,22 @@ function stopFramePump(): void {
 }
 
 async function pushNextFrame(): Promise<void> {
-  if (frameEncodeInFlight || !activeStream || !previewElement || !streamSocket || streamSocket.readyState !== WebSocket.OPEN) {
+  if (frameEncodeInFlight || !activeStream || !streamSocket || streamSocket.readyState !== WebSocket.OPEN) {
     return;
   }
 
-  const sourceWidth = previewElement.videoWidth;
-  const sourceHeight = previewElement.videoHeight;
+  // Prefer the latest VideoFrame produced by the MediaStreamTrackProcessor reader. This works
+  // even when the popup window is minimized/hidden, because the frame supply is driven by the
+  // capture pipeline rather than the page's compositor.
+  const frame = latestVideoFrame;
+  let sourceWidth = frame?.displayWidth ?? 0;
+  let sourceHeight = frame?.displayHeight ?? 0;
+
+  // Fall back to the <video> element if the processor isn't producing frames yet.
+  if ((!sourceWidth || !sourceHeight) && previewElement) {
+    sourceWidth = previewElement.videoWidth;
+    sourceHeight = previewElement.videoHeight;
+  }
   if (!sourceWidth || !sourceHeight) {
     return;
   }
@@ -337,7 +360,15 @@ async function pushNextFrame(): Promise<void> {
       return;
     }
 
-    context.drawImage(previewElement, 0, 0, frameWidth, frameHeight);
+    if (frame) {
+      // VideoFrame is a CanvasImageSource; drawImage works directly.
+      context.drawImage(frame as unknown as CanvasImageSource, 0, 0, frameWidth, frameHeight);
+    } else if (previewElement) {
+      context.drawImage(previewElement, 0, 0, frameWidth, frameHeight);
+    } else {
+      return;
+    }
+
     const encoded = await encodeFrame(streamCanvas);
     if (!encoded) {
       return;
@@ -353,8 +384,6 @@ async function pushNextFrame(): Promise<void> {
       return;
     }
 
-    const videoTrack = activeStream?.getVideoTracks?.()[0];
-    const surfaceLabel = videoTrack?.label || 'Screen share';
     const metadataBytes = new TextEncoder().encode(
       JSON.stringify({
         type: 'screen-share.frame.binary',
@@ -364,7 +393,7 @@ async function pushNextFrame(): Promise<void> {
         height: frameHeight,
         surfaceWidth: sourceWidth,
         surfaceHeight: sourceHeight,
-        surfaceLabel,
+        surfaceLabel: currentSourceLabel,
         sequence: frameSequence,
         duplicate: isDuplicate,
       })
@@ -382,6 +411,70 @@ async function pushNextFrame(): Promise<void> {
   } finally {
     frameEncodeInFlight = false;
   }
+}
+
+function startFrameReaderLoop(track: MediaStreamTrack): void {
+  stopFrameReaderLoop();
+
+  // MediaStreamTrackProcessor exposes the raw VideoFrame stream produced by the capturer,
+  // independent of any visible <video> element. This is what allows the popup to be hidden
+  // off-screen without freezing the frame pump.
+  const ProcessorCtor = (globalThis as unknown as { MediaStreamTrackProcessor?: new (init: { track: MediaStreamTrack }) => { readable: ReadableStream<VideoFrame> } }).MediaStreamTrackProcessor;
+  if (!ProcessorCtor) {
+    // Older Chromium without MediaStreamTrackProcessor. Frame pump will fall back to the
+    // <video> element, which only works while the popup window is visible.
+    return;
+  }
+
+  try {
+    const processor = new ProcessorCtor({ track });
+    const reader = processor.readable.getReader();
+    activeFrameReader = reader;
+
+    frameReaderLoopPromise = (async () => {
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) {
+            break;
+          }
+          if (latestVideoFrame) {
+            latestVideoFrame.close();
+          }
+          latestVideoFrame = value;
+        }
+      } catch {
+        // Reader closed; exit silently.
+      } finally {
+        if (latestVideoFrame) {
+          latestVideoFrame.close();
+          latestVideoFrame = null;
+        }
+      }
+    })();
+  } catch {
+    // Best-effort only; pump will fall back to the <video> element.
+  }
+}
+
+function stopFrameReaderLoop(): void {
+  if (activeFrameReader) {
+    try {
+      void activeFrameReader.cancel();
+    } catch {
+      // ignore
+    }
+    activeFrameReader = null;
+  }
+  if (latestVideoFrame) {
+    try {
+      latestVideoFrame.close();
+    } catch {
+      // ignore
+    }
+    latestVideoFrame = null;
+  }
+  frameReaderLoopPromise = null;
 }
 
 async function encodeFrame(canvas: HTMLCanvasElement): Promise<{ blob: Blob; mimeType: string } | null> {
@@ -476,7 +569,7 @@ async function resizeCurrentWindow(width: number, height: number): Promise<void>
   }
 }
 
-async function minimizeCurrentWindow(): Promise<void> {
+async function hideCurrentWindow(): Promise<void> {
   if (!chrome.windows?.getCurrent || !chrome.windows?.update) {
     return;
   }
@@ -487,11 +580,23 @@ async function minimizeCurrentWindow(): Promise<void> {
       return;
     }
 
+    // Move the popup just off the bottom-right corner of the operator's screen and shrink
+    // it to a tiny footprint. We deliberately do NOT use state: 'minimized' because that
+    // pauses the page lifecycle and freezes the MediaStreamTrackProcessor frame pump in
+    // some Chromium versions, which produces a blank stream on the GUI side.
+    const screenWidth = (globalThis as { screen?: { width?: number } }).screen?.width ?? 1920;
+    const screenHeight = (globalThis as { screen?: { height?: number } }).screen?.height ?? 1080;
+
     await chrome.windows.update(currentWindow.id, {
-      state: 'minimized',
+      state: 'normal',
+      focused: false,
+      width: 200,
+      height: 80,
+      left: Math.max(0, screenWidth - 210),
+      top: Math.max(0, screenHeight - 90),
     });
   } catch {
-    // Best-effort minimize only.
+    // Best-effort reposition only.
   }
 }
 
