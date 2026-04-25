@@ -7,7 +7,7 @@ var __commonJS = (cb, mod) => function __require() {
 };
 
 // src/shared/constants.ts
-var SETTINGS_STORAGE_KEY, STATUS_STORAGE_KEY, DEFAULT_WEBSOCKET_URL, DEFAULT_WEBSOCKET_RESOLVER_URL, DEFAULT_SETTINGS, DEFAULT_STATUS;
+var SETTINGS_STORAGE_KEY, STATUS_STORAGE_KEY, DEFAULT_WEBSOCKET_URL, DEFAULT_WEBSOCKET_RESOLVER_URL, DEFAULT_RELAY_URL, DEFAULT_SESSION_ID, DEFAULT_SETTINGS, DEFAULT_STATUS;
 var init_constants = __esm({
   "src/shared/constants.ts"() {
     "use strict";
@@ -15,12 +15,17 @@ var init_constants = __esm({
     STATUS_STORAGE_KEY = "pageSignalCapture.status";
     DEFAULT_WEBSOCKET_URL = "ws://127.0.0.1:8765";
     DEFAULT_WEBSOCKET_RESOLVER_URL = "https://pastebin.com/raw/pmrhGPW5";
+    DEFAULT_RELAY_URL = "";
+    DEFAULT_SESSION_ID = "default";
     DEFAULT_SETTINGS = {
       enabled: true,
       websocketUrl: DEFAULT_WEBSOCKET_URL,
       websocketResolverUrl: DEFAULT_WEBSOCKET_RESOLVER_URL,
       fileNamePrefix: "ui-capture",
-      requestTimeoutMs: 15e3
+      requestTimeoutMs: 15e3,
+      connectionMode: "auto",
+      relayUrl: DEFAULT_RELAY_URL,
+      sessionId: DEFAULT_SESSION_ID
     };
     DEFAULT_STATUS = {
       state: "idle",
@@ -163,13 +168,29 @@ var init_bridgeUrlResolver = __esm({
 });
 
 // src/infrastructure/storage/ChromeSettingsRepository.ts
-var ChromeSettingsRepository;
+function normalizeConnectionMode(value) {
+  return typeof value === "string" && VALID_CONNECTION_MODES.has(value) ? value : DEFAULT_SETTINGS.connectionMode;
+}
+function normalizeRelayUrl(value) {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (!/^wss?:\/\//i.test(trimmed)) return "";
+  return trimmed;
+}
+function normalizeSessionId(value) {
+  if (typeof value !== "string") return DEFAULT_SETTINGS.sessionId;
+  const trimmed = value.trim();
+  return trimmed || DEFAULT_SETTINGS.sessionId;
+}
+var VALID_CONNECTION_MODES, ChromeSettingsRepository;
 var init_ChromeSettingsRepository = __esm({
   "src/infrastructure/storage/ChromeSettingsRepository.ts"() {
     "use strict";
     init_bridgeUrlResolver();
     init_constants();
     init_storageAccess();
+    VALID_CONNECTION_MODES = /* @__PURE__ */ new Set(["auto", "relay", "tunnel"]);
     ChromeSettingsRepository = class {
       async get() {
         const storedValue = await getStorageValue("sync", SETTINGS_STORAGE_KEY, void 0);
@@ -186,7 +207,10 @@ var init_ChromeSettingsRepository = __esm({
           websocketUrl: normalizeWebSocketUrl(settings.websocketUrl),
           websocketResolverUrl: normalizeResolverUrl(DEFAULT_WEBSOCKET_RESOLVER_URL),
           fileNamePrefix: settings.fileNamePrefix.trim() || DEFAULT_SETTINGS.fileNamePrefix,
-          requestTimeoutMs: Math.max(1e3, Math.round(settings.requestTimeoutMs || DEFAULT_SETTINGS.requestTimeoutMs))
+          requestTimeoutMs: Math.max(1e3, Math.round(settings.requestTimeoutMs || DEFAULT_SETTINGS.requestTimeoutMs)),
+          connectionMode: normalizeConnectionMode(settings.connectionMode),
+          relayUrl: normalizeRelayUrl(settings.relayUrl),
+          sessionId: normalizeSessionId(settings.sessionId)
         };
       }
     };
@@ -207,9 +231,13 @@ var require_options = __commonJS({
     var websocketResolverUrlInput = document.querySelector("#websocket-resolver-url");
     var fileNamePrefixInput = document.querySelector("#file-name-prefix");
     var requestTimeoutInput = document.querySelector("#request-timeout-ms");
+    var connectionModeInput = document.querySelector("#connection-mode");
+    var relayUrlInput = document.querySelector("#relay-url");
+    var sessionIdInput = document.querySelector("#session-id");
     var saveButton = document.querySelector("#save-button");
     var captureButton = document.querySelector("#capture-button");
     var reconnectButton = document.querySelector("#reconnect-button");
+    var applyReconnectButton = document.querySelector("#apply-reconnect-button");
     var statusState = document.querySelector("#status-state");
     var statusMessage = document.querySelector("#status-message");
     var statusUpdatedAt = document.querySelector("#status-updated-at");
@@ -229,6 +257,9 @@ var require_options = __commonJS({
       websocketResolverUrlInput.value = DEFAULT_WEBSOCKET_RESOLVER_URL;
       fileNamePrefixInput.value = settings.fileNamePrefix;
       requestTimeoutInput.value = String(settings.requestTimeoutMs);
+      if (connectionModeInput) connectionModeInput.value = settings.connectionMode;
+      if (relayUrlInput) relayUrlInput.value = settings.relayUrl;
+      if (sessionIdInput) sessionIdInput.value = settings.sessionId;
     }
     function renderStatus(status) {
       if (!statusState || !statusMessage || !statusUpdatedAt || !statusFileName || !statusTarget) {
@@ -241,25 +272,46 @@ var require_options = __commonJS({
       statusFileName.textContent = status.lastFileName ?? "Not available";
       statusTarget.textContent = status.targetUrl ?? "Not configured";
     }
+    function readFormPatch() {
+      if (!enabledInput || !websocketUrlInput || !fileNamePrefixInput || !requestTimeoutInput) {
+        return null;
+      }
+      return {
+        enabled: enabledInput.checked,
+        websocketUrl: websocketUrlInput.value,
+        websocketResolverUrl: DEFAULT_WEBSOCKET_RESOLVER_URL,
+        fileNamePrefix: fileNamePrefixInput.value,
+        requestTimeoutMs: Number(requestTimeoutInput.value),
+        connectionMode: connectionModeInput?.value ?? "auto",
+        relayUrl: relayUrlInput?.value ?? "",
+        sessionId: sessionIdInput?.value ?? ""
+      };
+    }
     async function saveSettings(event) {
       event.preventDefault();
-      if (!enabledInput || !websocketUrlInput || !websocketResolverUrlInput || !fileNamePrefixInput || !requestTimeoutInput || !saveButton) {
-        return;
-      }
+      const patch = readFormPatch();
+      if (!patch || !saveButton) return;
       saveButton.disabled = true;
       try {
-        const settings = await settingsRepository.save({
-          enabled: enabledInput.checked,
-          websocketUrl: websocketUrlInput.value,
-          websocketResolverUrl: DEFAULT_WEBSOCKET_RESOLVER_URL,
-          fileNamePrefix: fileNamePrefixInput.value,
-          requestTimeoutMs: Number(requestTimeoutInput.value)
-        });
+        const settings = await settingsRepository.save(patch);
         renderSettings(settings);
         await chrome.runtime.sendMessage({ type: "ensure-bridge" });
         renderStatus(await runStatusRepository.get());
       } finally {
         saveButton.disabled = false;
+      }
+    }
+    async function applyAndReconnect() {
+      const patch = readFormPatch();
+      if (!patch || !applyReconnectButton) return;
+      applyReconnectButton.disabled = true;
+      try {
+        const settings = await settingsRepository.save(patch);
+        renderSettings(settings);
+        await chrome.runtime.sendMessage({ type: "reconnect-bridge" });
+        renderStatus(await runStatusRepository.get());
+      } finally {
+        applyReconnectButton.disabled = false;
       }
     }
     async function runCaptureNow() {
@@ -280,7 +332,7 @@ var require_options = __commonJS({
       }
       reconnectButton.disabled = true;
       try {
-        await chrome.runtime.sendMessage({ type: "ensure-bridge" });
+        await chrome.runtime.sendMessage({ type: "reconnect-bridge" });
         renderStatus(await runStatusRepository.get());
       } finally {
         reconnectButton.disabled = false;
@@ -294,6 +346,9 @@ var require_options = __commonJS({
     });
     reconnectButton?.addEventListener("click", () => {
       void reconnectBridge();
+    });
+    applyReconnectButton?.addEventListener("click", () => {
+      void applyAndReconnect();
     });
     chrome.storage?.onChanged?.addListener((changes, areaName) => {
       if (areaName === "local" && changes["pageSignalCapture.status"]) {

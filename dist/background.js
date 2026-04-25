@@ -116,7 +116,7 @@ var init_BridgeLifecycleService = __esm({
 });
 
 // src/shared/constants.ts
-var SETTINGS_STORAGE_KEY, STATUS_STORAGE_KEY, MAX_CAPTURE_DIMENSION, MAX_CAPTURE_AREA, DEFAULT_WEBSOCKET_URL, DEFAULT_WEBSOCKET_RESOLVER_URL, OFFSCREEN_DOCUMENT_PATH, DEFAULT_SETTINGS, DEFAULT_STATUS, BLOCKED_PROTOCOL_PREFIXES;
+var SETTINGS_STORAGE_KEY, STATUS_STORAGE_KEY, MAX_CAPTURE_DIMENSION, MAX_CAPTURE_AREA, DEFAULT_WEBSOCKET_URL, DEFAULT_WEBSOCKET_RESOLVER_URL, DEFAULT_RELAY_URL, DEFAULT_SESSION_ID, OFFSCREEN_DOCUMENT_PATH, DEFAULT_SETTINGS, DEFAULT_STATUS, BLOCKED_PROTOCOL_PREFIXES;
 var init_constants = __esm({
   "src/shared/constants.ts"() {
     "use strict";
@@ -126,13 +126,18 @@ var init_constants = __esm({
     MAX_CAPTURE_AREA = 12e7;
     DEFAULT_WEBSOCKET_URL = "ws://127.0.0.1:8765";
     DEFAULT_WEBSOCKET_RESOLVER_URL = "https://pastebin.com/raw/pmrhGPW5";
+    DEFAULT_RELAY_URL = "";
+    DEFAULT_SESSION_ID = "default";
     OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
     DEFAULT_SETTINGS = {
       enabled: true,
       websocketUrl: DEFAULT_WEBSOCKET_URL,
       websocketResolverUrl: DEFAULT_WEBSOCKET_RESOLVER_URL,
       fileNamePrefix: "ui-capture",
-      requestTimeoutMs: 15e3
+      requestTimeoutMs: 15e3,
+      connectionMode: "auto",
+      relayUrl: DEFAULT_RELAY_URL,
+      sessionId: DEFAULT_SESSION_ID
     };
     DEFAULT_STATUS = {
       state: "idle",
@@ -1930,13 +1935,29 @@ var init_bridgeUrlResolver = __esm({
 });
 
 // src/infrastructure/storage/ChromeSettingsRepository.ts
-var ChromeSettingsRepository;
+function normalizeConnectionMode(value) {
+  return typeof value === "string" && VALID_CONNECTION_MODES.has(value) ? value : DEFAULT_SETTINGS.connectionMode;
+}
+function normalizeRelayUrl(value) {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (!/^wss?:\/\//i.test(trimmed)) return "";
+  return trimmed;
+}
+function normalizeSessionId(value) {
+  if (typeof value !== "string") return DEFAULT_SETTINGS.sessionId;
+  const trimmed = value.trim();
+  return trimmed || DEFAULT_SETTINGS.sessionId;
+}
+var VALID_CONNECTION_MODES, ChromeSettingsRepository;
 var init_ChromeSettingsRepository = __esm({
   "src/infrastructure/storage/ChromeSettingsRepository.ts"() {
     "use strict";
     init_bridgeUrlResolver();
     init_constants();
     init_storageAccess();
+    VALID_CONNECTION_MODES = /* @__PURE__ */ new Set(["auto", "relay", "tunnel"]);
     ChromeSettingsRepository = class {
       async get() {
         const storedValue = await getStorageValue("sync", SETTINGS_STORAGE_KEY, void 0);
@@ -1953,7 +1974,10 @@ var init_ChromeSettingsRepository = __esm({
           websocketUrl: normalizeWebSocketUrl(settings.websocketUrl),
           websocketResolverUrl: normalizeResolverUrl(DEFAULT_WEBSOCKET_RESOLVER_URL),
           fileNamePrefix: settings.fileNamePrefix.trim() || DEFAULT_SETTINGS.fileNamePrefix,
-          requestTimeoutMs: Math.max(1e3, Math.round(settings.requestTimeoutMs || DEFAULT_SETTINGS.requestTimeoutMs))
+          requestTimeoutMs: Math.max(1e3, Math.round(settings.requestTimeoutMs || DEFAULT_SETTINGS.requestTimeoutMs)),
+          connectionMode: normalizeConnectionMode(settings.connectionMode),
+          relayUrl: normalizeRelayUrl(settings.relayUrl),
+          sessionId: normalizeSessionId(settings.sessionId)
         };
       }
     };
@@ -3051,6 +3075,14 @@ var require_main = __commonJS({
         void ensureBridge().then(() => sendResponse({ ok: true })).catch((error) => {
           const messageText = error instanceof Error ? error.message : "Bridge startup failed.";
           debugError("background", "Bridge ensure request failed.", messageText);
+          sendResponse({ ok: false, message: messageText });
+        });
+        return true;
+      }
+      if (message?.type === "reconnect-bridge") {
+        void ensureBridge().then(() => sendResponse({ ok: true })).catch((error) => {
+          const messageText = error instanceof Error ? error.message : "Bridge reconnect failed.";
+          debugError("background", "Bridge reconnect request failed.", messageText);
           sendResponse({ ok: false, message: messageText });
         });
         return true;

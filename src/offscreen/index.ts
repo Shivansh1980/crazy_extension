@@ -14,12 +14,17 @@ import {
   SETTINGS_STORAGE_KEY
 } from '../shared/constants';
 
-type EndpointMode = 'pastebin' | 'github' | 'direct';
+type EndpointMode = 'pastebin' | 'github' | 'direct' | 'relay';
 
 type BridgeInboundMessage =
   | {
       type: 'capture.request';
       requestId: string;
+    }
+  | {
+      type: 'gui.connected';
+      sessionId?: string;
+      message?: string;
     }
   | {
       type: 'clipboard.write';
@@ -78,6 +83,8 @@ type BridgeOutboundMessage =
       clientId: string;
       name: string;
       version: string;
+      role?: string;
+      sessionId?: string;
       capabilities: string[];
     }
   | {
@@ -296,6 +303,8 @@ class ExtensionBridgeClient {
   private consecutiveConnectionFailures = 0;
   private nextEndpointMode: EndpointMode = 'pastebin';
   private localRetryAttempts = 0;
+  /** Step counter for relay-mode cycling: 0=relay, 1-3=local, 4=relay, then wraps. */
+  private relayCycleStep = 0;
   private startPromise: Promise<void> | null = null;
   private hasConnectedOnce = false;
   private pendingBridgeMessages: QueuedBridgeMessage[] = [];
@@ -389,6 +398,7 @@ class ExtensionBridgeClient {
       this.consecutiveConnectionFailures = 0;
       this.nextEndpointMode = 'pastebin';
       this.localRetryAttempts = 0;
+      this.relayCycleStep = 0;
       this.hasConnectedOnce = true;
       debugLog('offscreen', 'running...');
       debugLog('offscreen', 'WebSocket connection opened.', endpoint.targetUrl);
@@ -398,6 +408,8 @@ class ExtensionBridgeClient {
         clientId: this.clientId,
         name: BRIDGE_CLIENT_NAME,
         version: __EXTENSION_VERSION__,
+        role: 'extension-client',
+        sessionId: settings.sessionId || 'default',
         capabilities: ['capture.full-page', 'screen-share.preview']
       });
       this.flushPendingBridgeMessages();
@@ -491,6 +503,20 @@ class ExtensionBridgeClient {
       message = JSON.parse(payload) as BridgeInboundMessage;
     } catch {
       debugWarn('offscreen', 'Ignoring non-JSON websocket payload.');
+      return;
+    }
+
+    if (message.type === 'gui.connected') {
+      // Relay tells us a fresh GUI just paired (or we just joined a paired
+      // session). Re-publish current popup status, popup message history, and
+      // screen-share status so the GUI's UI reflects reality immediately.
+      // Force-clear the publish-dedupe cache so the snapshots actually go out
+      // even when nothing has changed since last time.
+      debugLog('offscreen', 'Relay reports GUI paired; re-publishing state.');
+      this.lastPublishedPopupStatusKey = null;
+      void this.publishPopupStatus();
+      void this.publishPopupMessageHistory();
+      void this.publishScreenShareStatus();
       return;
     }
 
@@ -1586,9 +1612,36 @@ class ExtensionBridgeClient {
   }
 
   private async resolveEndpoint(settings: ExtensionSettings, settingsChanged: boolean): Promise<ResolvedBridgeEndpoint> {
+    // ----- Relay mode: cycle relay -> local x3 -> relay x1 -> repeat. -----
+    if (settings.connectionMode === 'relay') {
+      const relayUrl = (settings.relayUrl || '').trim();
+      if (!relayUrl) {
+        // Misconfigured: relay mode chosen but no URL set. Fall back to local so
+        // the user can see the failure surfaced in the UI.
+        return { targetUrl: settings.websocketUrl, source: 'direct', resolverUrl: null };
+      }
+      if (settingsChanged) {
+        this.relayCycleStep = 0;
+      }
+      const step = this.relayCycleStep % 5;
+      // Steps 1, 2, 3 -> try local; steps 0 and 4 -> try relay.
+      if (step >= 1 && step <= 3) {
+        this.nextEndpointMode = 'direct';
+        return { targetUrl: settings.websocketUrl, source: 'direct', resolverUrl: null };
+      }
+      this.nextEndpointMode = 'relay';
+      return { targetUrl: relayUrl, source: 'direct', resolverUrl: null };
+    }
+
     const hasResolver = Boolean(settings.websocketResolverUrl);
+    const relayUrl = (settings.relayUrl || '').trim();
+    const allowRelayFallback = settings.connectionMode === 'auto' && Boolean(relayUrl);
 
     if (!hasResolver) {
+      // Auto mode with no resolver but a relay URL: still allow relay as a last resort.
+      if (this.nextEndpointMode === 'relay' && allowRelayFallback) {
+        return { targetUrl: relayUrl, source: 'direct', resolverUrl: null };
+      }
       return {
         targetUrl: settings.websocketUrl,
         source: 'direct',
@@ -1599,6 +1652,10 @@ class ExtensionBridgeClient {
     if (settingsChanged) {
       this.nextEndpointMode = 'pastebin';
       this.localRetryAttempts = 0;
+    }
+
+    if (this.nextEndpointMode === 'relay' && allowRelayFallback) {
+      return { targetUrl: relayUrl, source: 'direct', resolverUrl: null };
     }
 
     if (this.nextEndpointMode === 'direct') {
@@ -1658,6 +1715,26 @@ class ExtensionBridgeClient {
   }
 
   private recordFailedAttempt(source: ResolvedBridgeEndpoint['source']): void {
+    const settings = this.currentSettings;
+    const allowRelayFallback =
+      settings?.connectionMode === 'auto' && Boolean((settings?.relayUrl || '').trim());
+
+    // Relay mode: advance the relay->local x3->relay cycle.
+    if (settings?.connectionMode === 'relay') {
+      this.relayCycleStep = (this.relayCycleStep + 1) % 5;
+      return;
+    }
+
+    if (this.nextEndpointMode === 'relay') {
+      // Relay also failed: cycle back to pastebin (auto) or stick (relay-only).
+      if (settings?.connectionMode === 'relay') {
+        return; // stay in relay mode; relay client retries on its own.
+      }
+      this.nextEndpointMode = 'pastebin';
+      this.localRetryAttempts = 0;
+      return;
+    }
+
     if (source === 'resolver') {
       if (this.nextEndpointMode === 'pastebin') {
         this.nextEndpointMode = 'github';
@@ -1671,7 +1748,8 @@ class ExtensionBridgeClient {
 
     this.localRetryAttempts += 1;
     if (this.localRetryAttempts >= BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD) {
-      this.nextEndpointMode = 'pastebin';
+      // Auto mode with a relay configured: try relay before looping back to pastebin.
+      this.nextEndpointMode = allowRelayFallback ? 'relay' : 'pastebin';
       this.localRetryAttempts = 0;
       return;
     }

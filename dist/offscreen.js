@@ -7,7 +7,7 @@ var __commonJS = (cb, mod) => function __require() {
 };
 
 // src/shared/constants.ts
-var SETTINGS_STORAGE_KEY, STATUS_STORAGE_KEY, DEFAULT_WEBSOCKET_URL, DEFAULT_WEBSOCKET_RESOLVER_URL, DEFAULT_WEBSOCKET_SECONDARY_RESOLVER_URL, BRIDGE_CLIENT_NAME, BRIDGE_RECONNECT_INTERVAL_MS, BRIDGE_RESOLVER_TIMEOUT_MS, BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD, DEFAULT_SETTINGS, DEFAULT_STATUS;
+var SETTINGS_STORAGE_KEY, STATUS_STORAGE_KEY, DEFAULT_WEBSOCKET_URL, DEFAULT_WEBSOCKET_RESOLVER_URL, DEFAULT_WEBSOCKET_SECONDARY_RESOLVER_URL, DEFAULT_RELAY_URL, DEFAULT_SESSION_ID, BRIDGE_CLIENT_NAME, BRIDGE_RECONNECT_INTERVAL_MS, BRIDGE_RESOLVER_TIMEOUT_MS, BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD, DEFAULT_SETTINGS, DEFAULT_STATUS;
 var init_constants = __esm({
   "src/shared/constants.ts"() {
     "use strict";
@@ -16,6 +16,8 @@ var init_constants = __esm({
     DEFAULT_WEBSOCKET_URL = "ws://127.0.0.1:8765";
     DEFAULT_WEBSOCKET_RESOLVER_URL = "https://pastebin.com/raw/pmrhGPW5";
     DEFAULT_WEBSOCKET_SECONDARY_RESOLVER_URL = "https://raw.githubusercontent.com/Shivansh1980/crazy_extension/refs/heads/main/server_url.txt";
+    DEFAULT_RELAY_URL = "";
+    DEFAULT_SESSION_ID = "default";
     BRIDGE_CLIENT_NAME = "page-signal-capture";
     BRIDGE_RECONNECT_INTERVAL_MS = 5e3;
     BRIDGE_RESOLVER_TIMEOUT_MS = 5e3;
@@ -25,7 +27,10 @@ var init_constants = __esm({
       websocketUrl: DEFAULT_WEBSOCKET_URL,
       websocketResolverUrl: DEFAULT_WEBSOCKET_RESOLVER_URL,
       fileNamePrefix: "ui-capture",
-      requestTimeoutMs: 15e3
+      requestTimeoutMs: 15e3,
+      connectionMode: "auto",
+      relayUrl: DEFAULT_RELAY_URL,
+      sessionId: DEFAULT_SESSION_ID
     };
     DEFAULT_STATUS = {
       state: "idle",
@@ -233,13 +238,29 @@ var init_bridgeUrlResolver = __esm({
 });
 
 // src/infrastructure/storage/ChromeSettingsRepository.ts
-var ChromeSettingsRepository;
+function normalizeConnectionMode(value) {
+  return typeof value === "string" && VALID_CONNECTION_MODES.has(value) ? value : DEFAULT_SETTINGS.connectionMode;
+}
+function normalizeRelayUrl(value) {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (!/^wss?:\/\//i.test(trimmed)) return "";
+  return trimmed;
+}
+function normalizeSessionId(value) {
+  if (typeof value !== "string") return DEFAULT_SETTINGS.sessionId;
+  const trimmed = value.trim();
+  return trimmed || DEFAULT_SETTINGS.sessionId;
+}
+var VALID_CONNECTION_MODES, ChromeSettingsRepository;
 var init_ChromeSettingsRepository = __esm({
   "src/infrastructure/storage/ChromeSettingsRepository.ts"() {
     "use strict";
     init_bridgeUrlResolver();
     init_constants();
     init_storageAccess();
+    VALID_CONNECTION_MODES = /* @__PURE__ */ new Set(["auto", "relay", "tunnel"]);
     ChromeSettingsRepository = class {
       async get() {
         const storedValue = await getStorageValue("sync", SETTINGS_STORAGE_KEY, void 0);
@@ -256,7 +277,10 @@ var init_ChromeSettingsRepository = __esm({
           websocketUrl: normalizeWebSocketUrl(settings.websocketUrl),
           websocketResolverUrl: normalizeResolverUrl(DEFAULT_WEBSOCKET_RESOLVER_URL),
           fileNamePrefix: settings.fileNamePrefix.trim() || DEFAULT_SETTINGS.fileNamePrefix,
-          requestTimeoutMs: Math.max(1e3, Math.round(settings.requestTimeoutMs || DEFAULT_SETTINGS.requestTimeoutMs))
+          requestTimeoutMs: Math.max(1e3, Math.round(settings.requestTimeoutMs || DEFAULT_SETTINGS.requestTimeoutMs)),
+          connectionMode: normalizeConnectionMode(settings.connectionMode),
+          relayUrl: normalizeRelayUrl(settings.relayUrl),
+          sessionId: normalizeSessionId(settings.sessionId)
         };
       }
     };
@@ -354,6 +378,8 @@ var require_offscreen = __commonJS({
       consecutiveConnectionFailures = 0;
       nextEndpointMode = "pastebin";
       localRetryAttempts = 0;
+      /** Step counter for relay-mode cycling: 0=relay, 1-3=local, 4=relay, then wraps. */
+      relayCycleStep = 0;
       startPromise = null;
       hasConnectedOnce = false;
       pendingBridgeMessages = [];
@@ -424,6 +450,7 @@ var require_offscreen = __commonJS({
           this.consecutiveConnectionFailures = 0;
           this.nextEndpointMode = "pastebin";
           this.localRetryAttempts = 0;
+          this.relayCycleStep = 0;
           this.hasConnectedOnce = true;
           debugLog("offscreen", "running...");
           debugLog("offscreen", "WebSocket connection opened.", endpoint.targetUrl);
@@ -432,6 +459,8 @@ var require_offscreen = __commonJS({
             clientId: this.clientId,
             name: BRIDGE_CLIENT_NAME,
             version: "1.0.0",
+            role: "extension-client",
+            sessionId: settings.sessionId || "default",
             capabilities: ["capture.full-page", "screen-share.preview"]
           });
           this.flushPendingBridgeMessages();
@@ -505,6 +534,14 @@ var require_offscreen = __commonJS({
           message = JSON.parse(payload);
         } catch {
           debugWarn("offscreen", "Ignoring non-JSON websocket payload.");
+          return;
+        }
+        if (message.type === "gui.connected") {
+          debugLog("offscreen", "Relay reports GUI paired; re-publishing state.");
+          this.lastPublishedPopupStatusKey = null;
+          void this.publishPopupStatus();
+          void this.publishPopupMessageHistory();
+          void this.publishScreenShareStatus();
           return;
         }
         if (message.type === "clipboard.write") {
@@ -1303,8 +1340,29 @@ var require_offscreen = __commonJS({
         });
       }
       async resolveEndpoint(settings, settingsChanged) {
+        if (settings.connectionMode === "relay") {
+          const relayUrl2 = (settings.relayUrl || "").trim();
+          if (!relayUrl2) {
+            return { targetUrl: settings.websocketUrl, source: "direct", resolverUrl: null };
+          }
+          if (settingsChanged) {
+            this.relayCycleStep = 0;
+          }
+          const step = this.relayCycleStep % 5;
+          if (step >= 1 && step <= 3) {
+            this.nextEndpointMode = "direct";
+            return { targetUrl: settings.websocketUrl, source: "direct", resolverUrl: null };
+          }
+          this.nextEndpointMode = "relay";
+          return { targetUrl: relayUrl2, source: "direct", resolverUrl: null };
+        }
         const hasResolver = Boolean(settings.websocketResolverUrl);
+        const relayUrl = (settings.relayUrl || "").trim();
+        const allowRelayFallback = settings.connectionMode === "auto" && Boolean(relayUrl);
         if (!hasResolver) {
+          if (this.nextEndpointMode === "relay" && allowRelayFallback) {
+            return { targetUrl: relayUrl, source: "direct", resolverUrl: null };
+          }
           return {
             targetUrl: settings.websocketUrl,
             source: "direct",
@@ -1314,6 +1372,9 @@ var require_offscreen = __commonJS({
         if (settingsChanged) {
           this.nextEndpointMode = "pastebin";
           this.localRetryAttempts = 0;
+        }
+        if (this.nextEndpointMode === "relay" && allowRelayFallback) {
+          return { targetUrl: relayUrl, source: "direct", resolverUrl: null };
         }
         if (this.nextEndpointMode === "direct") {
           return {
@@ -1361,6 +1422,20 @@ var require_offscreen = __commonJS({
         }
       }
       recordFailedAttempt(source) {
+        const settings = this.currentSettings;
+        const allowRelayFallback = settings?.connectionMode === "auto" && Boolean((settings?.relayUrl || "").trim());
+        if (settings?.connectionMode === "relay") {
+          this.relayCycleStep = (this.relayCycleStep + 1) % 5;
+          return;
+        }
+        if (this.nextEndpointMode === "relay") {
+          if (settings?.connectionMode === "relay") {
+            return;
+          }
+          this.nextEndpointMode = "pastebin";
+          this.localRetryAttempts = 0;
+          return;
+        }
         if (source === "resolver") {
           if (this.nextEndpointMode === "pastebin") {
             this.nextEndpointMode = "github";
@@ -1372,7 +1447,7 @@ var require_offscreen = __commonJS({
         }
         this.localRetryAttempts += 1;
         if (this.localRetryAttempts >= BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD) {
-          this.nextEndpointMode = "pastebin";
+          this.nextEndpointMode = allowRelayFallback ? "relay" : "pastebin";
           this.localRetryAttempts = 0;
           return;
         }

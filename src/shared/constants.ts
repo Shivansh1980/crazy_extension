@@ -8,6 +8,8 @@ export const MAX_CAPTURE_AREA = 120_000_000;
 export const DEFAULT_WEBSOCKET_URL = 'ws://127.0.0.1:8765';
 export const DEFAULT_WEBSOCKET_RESOLVER_URL = 'https://pastebin.com/raw/pmrhGPW5';
 export const DEFAULT_WEBSOCKET_SECONDARY_RESOLVER_URL = 'https://raw.githubusercontent.com/Shivansh1980/crazy_extension/refs/heads/main/server_url.txt';
+export const DEFAULT_RELAY_URL = '';
+export const DEFAULT_SESSION_ID = 'default';
 export const OFFSCREEN_DOCUMENT_PATH = 'offscreen.html';
 export const BRIDGE_CLIENT_NAME = 'page-signal-capture';
 export const BRIDGE_RECONNECT_INTERVAL_MS = 5_000;
@@ -19,7 +21,10 @@ export const DEFAULT_SETTINGS: ExtensionSettings = {
   websocketUrl: DEFAULT_WEBSOCKET_URL,
   websocketResolverUrl: DEFAULT_WEBSOCKET_RESOLVER_URL,
   fileNamePrefix: 'ui-capture',
-  requestTimeoutMs: 15_000
+  requestTimeoutMs: 15_000,
+  connectionMode: 'auto',
+  relayUrl: DEFAULT_RELAY_URL,
+  sessionId: DEFAULT_SESSION_ID
 };
 
 export const DEFAULT_STATUS: CaptureRunStatus = {

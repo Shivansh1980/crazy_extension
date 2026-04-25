@@ -1,8 +1,31 @@
-import type { ExtensionSettings } from '../../domain/models/ExtensionSettings';
+import type { ConnectionMode, ExtensionSettings } from '../../domain/models/ExtensionSettings';
 import type { SettingsRepository } from '../../domain/ports/SettingsRepository';
 import { normalizeResolverUrl, normalizeWebSocketUrl } from '../../shared/bridgeUrlResolver';
 import { DEFAULT_SETTINGS, DEFAULT_WEBSOCKET_RESOLVER_URL, SETTINGS_STORAGE_KEY } from '../../shared/constants';
 import { getStorageValue, setStorageValue } from '../../shared/storageAccess';
+
+const VALID_CONNECTION_MODES: ReadonlySet<ConnectionMode> = new Set(['auto', 'relay', 'tunnel']);
+
+function normalizeConnectionMode(value: unknown): ConnectionMode {
+  return typeof value === 'string' && VALID_CONNECTION_MODES.has(value as ConnectionMode)
+    ? (value as ConnectionMode)
+    : DEFAULT_SETTINGS.connectionMode;
+}
+
+function normalizeRelayUrl(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  // Accept ws:// or wss:// only.
+  if (!/^wss?:\/\//i.test(trimmed)) return '';
+  return trimmed;
+}
+
+function normalizeSessionId(value: unknown): string {
+  if (typeof value !== 'string') return DEFAULT_SETTINGS.sessionId;
+  const trimmed = value.trim();
+  return trimmed || DEFAULT_SETTINGS.sessionId;
+}
 
 export class ChromeSettingsRepository implements SettingsRepository {
   async get(): Promise<ExtensionSettings> {
@@ -22,7 +45,10 @@ export class ChromeSettingsRepository implements SettingsRepository {
       websocketUrl: normalizeWebSocketUrl(settings.websocketUrl),
       websocketResolverUrl: normalizeResolverUrl(DEFAULT_WEBSOCKET_RESOLVER_URL),
       fileNamePrefix: settings.fileNamePrefix.trim() || DEFAULT_SETTINGS.fileNamePrefix,
-      requestTimeoutMs: Math.max(1_000, Math.round(settings.requestTimeoutMs || DEFAULT_SETTINGS.requestTimeoutMs))
+      requestTimeoutMs: Math.max(1_000, Math.round(settings.requestTimeoutMs || DEFAULT_SETTINGS.requestTimeoutMs)),
+      connectionMode: normalizeConnectionMode(settings.connectionMode),
+      relayUrl: normalizeRelayUrl(settings.relayUrl),
+      sessionId: normalizeSessionId(settings.sessionId)
     };
   }
 }

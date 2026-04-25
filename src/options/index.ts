@@ -1,5 +1,5 @@
 import type { CaptureRunStatus } from '../domain/models/CaptureRunStatus';
-import type { ExtensionSettings } from '../domain/models/ExtensionSettings';
+import type { ConnectionMode, ExtensionSettings } from '../domain/models/ExtensionSettings';
 import { ChromeRunStatusRepository } from '../infrastructure/storage/ChromeRunStatusRepository';
 import { ChromeSettingsRepository } from '../infrastructure/storage/ChromeSettingsRepository';
 import { DEFAULT_WEBSOCKET_RESOLVER_URL } from '../shared/constants';
@@ -13,9 +13,13 @@ const websocketUrlInput = document.querySelector<HTMLInputElement>('#websocket-u
 const websocketResolverUrlInput = document.querySelector<HTMLInputElement>('#websocket-resolver-url');
 const fileNamePrefixInput = document.querySelector<HTMLInputElement>('#file-name-prefix');
 const requestTimeoutInput = document.querySelector<HTMLInputElement>('#request-timeout-ms');
+const connectionModeInput = document.querySelector<HTMLSelectElement>('#connection-mode');
+const relayUrlInput = document.querySelector<HTMLInputElement>('#relay-url');
+const sessionIdInput = document.querySelector<HTMLInputElement>('#session-id');
 const saveButton = document.querySelector<HTMLButtonElement>('#save-button');
 const captureButton = document.querySelector<HTMLButtonElement>('#capture-button');
 const reconnectButton = document.querySelector<HTMLButtonElement>('#reconnect-button');
+const applyReconnectButton = document.querySelector<HTMLButtonElement>('#apply-reconnect-button');
 
 const statusState = document.querySelector<HTMLElement>('#status-state');
 const statusMessage = document.querySelector<HTMLElement>('#status-message');
@@ -39,6 +43,9 @@ function renderSettings(settings: ExtensionSettings): void {
   websocketResolverUrlInput.value = DEFAULT_WEBSOCKET_RESOLVER_URL;
   fileNamePrefixInput.value = settings.fileNamePrefix;
   requestTimeoutInput.value = String(settings.requestTimeoutMs);
+  if (connectionModeInput) connectionModeInput.value = settings.connectionMode;
+  if (relayUrlInput) relayUrlInput.value = settings.relayUrl;
+  if (sessionIdInput) sessionIdInput.value = settings.sessionId;
 }
 
 function renderStatus(status: CaptureRunStatus): void {
@@ -54,29 +61,53 @@ function renderStatus(status: CaptureRunStatus): void {
   statusTarget.textContent = status.targetUrl ?? 'Not configured';
 }
 
+function readFormPatch(): Partial<ExtensionSettings> | null {
+  if (!enabledInput || !websocketUrlInput || !fileNamePrefixInput || !requestTimeoutInput) {
+    return null;
+  }
+  return {
+    enabled: enabledInput.checked,
+    websocketUrl: websocketUrlInput.value,
+    websocketResolverUrl: DEFAULT_WEBSOCKET_RESOLVER_URL,
+    fileNamePrefix: fileNamePrefixInput.value,
+    requestTimeoutMs: Number(requestTimeoutInput.value),
+    connectionMode: (connectionModeInput?.value ?? 'auto') as ConnectionMode,
+    relayUrl: relayUrlInput?.value ?? '',
+    sessionId: sessionIdInput?.value ?? ''
+  };
+}
+
 async function saveSettings(event: SubmitEvent): Promise<void> {
   event.preventDefault();
 
-  if (!enabledInput || !websocketUrlInput || !websocketResolverUrlInput || !fileNamePrefixInput || !requestTimeoutInput || !saveButton) {
-    return;
-  }
+  const patch = readFormPatch();
+  if (!patch || !saveButton) return;
 
   saveButton.disabled = true;
-
   try {
-    const settings = await settingsRepository.save({
-      enabled: enabledInput.checked,
-      websocketUrl: websocketUrlInput.value,
-      websocketResolverUrl: DEFAULT_WEBSOCKET_RESOLVER_URL,
-      fileNamePrefix: fileNamePrefixInput.value,
-      requestTimeoutMs: Number(requestTimeoutInput.value)
-    });
-
+    const settings = await settingsRepository.save(patch);
     renderSettings(settings);
     await chrome.runtime.sendMessage({ type: 'ensure-bridge' });
     renderStatus(await runStatusRepository.get());
   } finally {
     saveButton.disabled = false;
+  }
+}
+
+async function applyAndReconnect(): Promise<void> {
+  const patch = readFormPatch();
+  if (!patch || !applyReconnectButton) return;
+
+  applyReconnectButton.disabled = true;
+  try {
+    const settings = await settingsRepository.save(patch);
+    renderSettings(settings);
+    // Tell the background to tear down the current connection and rebuild
+    // using the new settings (mode/relay/session may have changed).
+    await chrome.runtime.sendMessage({ type: 'reconnect-bridge' });
+    renderStatus(await runStatusRepository.get());
+  } finally {
+    applyReconnectButton.disabled = false;
   }
 }
 
@@ -103,7 +134,7 @@ async function reconnectBridge(): Promise<void> {
   reconnectButton.disabled = true;
 
   try {
-    await chrome.runtime.sendMessage({ type: 'ensure-bridge' });
+    await chrome.runtime.sendMessage({ type: 'reconnect-bridge' });
     renderStatus(await runStatusRepository.get());
   } finally {
     reconnectButton.disabled = false;
@@ -120,6 +151,10 @@ captureButton?.addEventListener('click', () => {
 
 reconnectButton?.addEventListener('click', () => {
   void reconnectBridge();
+});
+
+applyReconnectButton?.addEventListener('click', () => {
+  void applyAndReconnect();
 });
 
 chrome.storage?.onChanged?.addListener((changes, areaName) => {

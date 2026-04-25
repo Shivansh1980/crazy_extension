@@ -1,0 +1,40 @@
+# docker-compose for the PageSignal Relay.
+#
+# Usage from inside the live_server/ folder:
+#   1. cp .env.example .env
+#   2. python live_server.py hash-password 'mypassword'   # paste into RELAY_PASSWORD_HASH
+#   3. docker compose up -d
+#
+# The relay listens on the host's :8765 by default. Place a TLS-terminating
+# reverse proxy (Caddy / Nginx / Traefik) in front for production wss://.
+
+services:
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pagesignal-relay:latest
+    container_name: pagesignal-relay
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${RELAY_HOST_PORT:-8765}:8765"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import urllib.request, sys
+          urllib.request.urlopen('http://127.0.0.1:8765/healthz', timeout=3).read()
+          sys.exit(0)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

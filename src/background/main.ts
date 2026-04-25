@@ -1263,6 +1263,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === 'reconnect-bridge') {
+    void ensureBridge()
+      .then(() => sendResponse({ ok: true }))
+      .catch((error) => {
+        const messageText = error instanceof Error ? error.message : 'Bridge reconnect failed.';
+        debugError('background', 'Bridge reconnect request failed.', messageText);
+        sendResponse({ ok: false, message: messageText });
+      });
+    return true;
+  }
+
   if (message?.type === 'bridge-popup-show') {
     void showPagePopup(String(message.text ?? ''))
       .then((status) => sendResponse({ ok: true, status, action: status.action }))

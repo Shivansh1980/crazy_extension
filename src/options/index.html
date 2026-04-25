@@ -230,6 +230,28 @@
             </div>
 
             <div class="field">
+              <label for="connection-mode">Connection mode</label>
+              <select id="connection-mode" name="connectionMode" style="width: 100%; padding: 14px 16px; border-radius: 16px; border: 1px solid var(--border); background: rgba(255, 255, 255, 0.92); color: var(--text);">
+                <option value="auto">Auto — try local, then resolver, then relay</option>
+                <option value="relay">Relay — always use the relay server</option>
+                <option value="tunnel">Tunnel — local + resolver only (no relay)</option>
+              </select>
+              <p class="hint">Pick how the extension should reach the Python GUI. Auto is recommended.</p>
+            </div>
+
+            <div class="field">
+              <label for="relay-url">Relay WebSocket URL</label>
+              <input id="relay-url" name="relayUrl" type="url" placeholder="wss://relay.example.com/ws" />
+              <p class="hint">Used by Relay mode and as the last resort in Auto mode. Leave blank to disable relay.</p>
+            </div>
+
+            <div class="field">
+              <label for="session-id">Relay session id</label>
+              <input id="session-id" name="sessionId" type="text" placeholder="default" />
+              <p class="hint">Must match the SESSION_ID configured on the GUI side. One extension per session.</p>
+            </div>
+
+            <div class="field">
               <label for="websocket-url">Desktop bridge WebSocket URL</label>
               <input id="websocket-url" name="websocketUrl" type="text" placeholder="ws://127.0.0.1:8765" />
               <p class="hint">Used as the direct fallback bridge target. Keep this as your local server unless you want a different default.</p>
@@ -253,6 +275,7 @@
 
             <div class="actions">
               <button class="primary" id="save-button" type="submit">Save settings</button>
+              <button class="primary" id="apply-reconnect-button" type="button">Apply &amp; reconnect</button>
               <button class="secondary" id="reconnect-button" type="button">Reconnect bridge</button>
               <button class="secondary" id="capture-button" type="button">Run capture now</button>
             </div>
