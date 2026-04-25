@@ -1265,7 +1265,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.type === 'reconnect-bridge') {
-    void ensureBridge()
+    void bridgeLifecycleService.forceReconnect()
       .then(() => sendResponse({ ok: true }))
       .catch((error) => {
         const messageText = error instanceof Error ? error.message : 'Bridge reconnect failed.';

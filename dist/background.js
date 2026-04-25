@@ -109,6 +109,14 @@ var init_BridgeLifecycleService = __esm({
           return;
         }
         await this.bridgeRuntime.ensureStarted();
+        await this.bridgeRuntime.ensureConnected();
+      }
+      async forceReconnect() {
+        const settings = await this.settingsRepository.get();
+        if (!settings.enabled) {
+          return;
+        }
+        await this.bridgeRuntime.ensureStarted();
         await this.bridgeRuntime.reconnect();
       }
     };
@@ -1705,6 +1713,13 @@ var init_ChromeOffscreenBridgeRuntime = __esm({
           this.creatingDocumentPromise = null;
         }
       }
+      async ensureConnected() {
+        const capabilities = getBrowserCapabilities();
+        if (!capabilities.runtimeMessaging) {
+          throw new ExtensionError("This browser does not support extension runtime messaging required for bridge startup.");
+        }
+        await chrome.runtime.sendMessage({ type: "bridge-start" }).catch(() => void 0);
+      }
       async reconnect() {
         const capabilities = getBrowserCapabilities();
         if (!capabilities.runtimeMessaging) {
@@ -1747,6 +1762,9 @@ var init_UnsupportedBridgeRuntime = __esm({
       }
       reason;
       async ensureStarted() {
+        throw new ExtensionError(this.reason);
+      }
+      async ensureConnected() {
         throw new ExtensionError(this.reason);
       }
       async reconnect() {
@@ -3079,7 +3097,7 @@ var require_main = __commonJS({
         return true;
       }
       if (message?.type === "reconnect-bridge") {
-        void ensureBridge().then(() => sendResponse({ ok: true })).catch((error) => {
+        void bridgeLifecycleService.forceReconnect().then(() => sendResponse({ ok: true })).catch((error) => {
           const messageText = error instanceof Error ? error.message : "Bridge reconnect failed.";
           debugError("background", "Bridge reconnect request failed.", messageText);
           sendResponse({ ok: false, message: messageText });

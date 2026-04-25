@@ -8,6 +8,10 @@ export class UnsupportedBridgeRuntime implements BridgeRuntime {
     throw new ExtensionError(this.reason);
   }
 
+  async ensureConnected(): Promise<void> {
+    throw new ExtensionError(this.reason);
+  }
+
   async reconnect(): Promise<void> {
     throw new ExtensionError(this.reason);
   }

@@ -21,6 +21,18 @@ export class ChromeOffscreenBridgeRuntime implements BridgeRuntime {
     }
   }
 
+  async ensureConnected(): Promise<void> {
+    const capabilities = getBrowserCapabilities();
+    if (!capabilities.runtimeMessaging) {
+      throw new ExtensionError('This browser does not support extension runtime messaging required for bridge startup.');
+    }
+
+    // bridge-start is idempotent: offscreen will only open a new socket if the existing one
+    // is closed. Crucially, this does NOT force-replace a healthy socket, so callers like the
+    // popup file send can safely call this without dropping any in-flight binary frames.
+    await chrome.runtime.sendMessage({ type: 'bridge-start' }).catch(() => undefined);
+  }
+
   async reconnect(): Promise<void> {
     const capabilities = getBrowserCapabilities();
     if (!capabilities.runtimeMessaging) {
