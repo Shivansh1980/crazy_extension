@@ -1010,10 +1010,6 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
           cursor: pointer;
           transition: transform 120ms ease, filter 120ms ease, border-color 120ms ease;
         }
-        button.send {
-          background: linear-gradient(135deg, var(--popup-accent), var(--popup-accent-soft));
-          color: #fff;
-        }
         button.control:hover,
         button.copy:hover,
         button.upload:hover,
@@ -1627,6 +1623,7 @@ var init_ChromeFullPageCaptureGateway = __esm({
       async capture(tab, settings) {
         const debuggee = { tabId: tab.id };
         await this.debuggerClient.attach(debuggee);
+        let viewportOverridden = false;
         try {
           await this.debuggerClient.sendCommand(debuggee, "Page.enable");
           const layoutMetrics = await this.debuggerClient.sendCommand(debuggee, "Page.getLayoutMetrics");
@@ -1634,11 +1631,18 @@ var init_ChromeFullPageCaptureGateway = __esm({
           const widthCssPx = Math.max(1, Math.ceil(layoutMetrics.contentSize.width));
           const heightCssPx = Math.max(1, Math.ceil(layoutMetrics.contentSize.height));
           const scale = this.computeCaptureScale(widthCssPx, heightCssPx, devicePixelRatio);
+          await this.debuggerClient.sendCommand(debuggee, "Emulation.setDeviceMetricsOverride", {
+            width: widthCssPx,
+            height: heightCssPx,
+            deviceScaleFactor: devicePixelRatio,
+            mobile: false
+          });
+          viewportOverridden = true;
+          await this.waitForRelayout(tab.id);
           const result = await this.debuggerClient.sendCommand(debuggee, "Page.captureScreenshot", {
             format: "png",
             fromSurface: true,
-            captureBeyondViewport: true,
-            optimizeForSpeed: true,
+            captureBeyondViewport: false,
             clip: {
               x: 0,
               y: 0,
@@ -1662,7 +1666,25 @@ var init_ChromeFullPageCaptureGateway = __esm({
           const message = error instanceof Error ? error.message : "Unknown screenshot failure.";
           throw new ExtensionError(`Full-page capture failed: ${message}`);
         } finally {
+          if (viewportOverridden) {
+            await this.debuggerClient.sendCommand(debuggee, "Emulation.clearDeviceMetricsOverride").catch(() => void 0);
+          }
           await this.debuggerClient.detach(debuggee).catch(() => void 0);
+        }
+      }
+      async waitForRelayout(tabId) {
+        const capabilities = getBrowserCapabilities();
+        if (!capabilities.scriptingApi) {
+          return;
+        }
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId },
+            func: () => new Promise((resolve) => {
+              requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+            })
+          });
+        } catch {
         }
       }
       async readDevicePixelRatio(tabId) {

@@ -234,8 +234,6 @@ var require_options = __commonJS({
     var connectionModeInput = document.querySelector("#connection-mode");
     var relayUrlInput = document.querySelector("#relay-url");
     var sessionIdInput = document.querySelector("#session-id");
-    var saveButton = document.querySelector("#save-button");
-    var captureButton = document.querySelector("#capture-button");
     var reconnectButton = document.querySelector("#reconnect-button");
     var applyReconnectButton = document.querySelector("#apply-reconnect-button");
     var statusState = document.querySelector("#status-state");
@@ -287,21 +285,8 @@ var require_options = __commonJS({
         sessionId: sessionIdInput?.value ?? ""
       };
     }
-    async function saveSettings(event) {
-      event.preventDefault();
-      const patch = readFormPatch();
-      if (!patch || !saveButton) return;
-      saveButton.disabled = true;
-      try {
-        const settings = await settingsRepository.save(patch);
-        renderSettings(settings);
-        await chrome.runtime.sendMessage({ type: "ensure-bridge" });
-        renderStatus(await runStatusRepository.get());
-      } finally {
-        saveButton.disabled = false;
-      }
-    }
-    async function applyAndReconnect() {
+    async function applyAndReconnect(event) {
+      event?.preventDefault();
       const patch = readFormPatch();
       if (!patch || !applyReconnectButton) return;
       applyReconnectButton.disabled = true;
@@ -312,18 +297,6 @@ var require_options = __commonJS({
         renderStatus(await runStatusRepository.get());
       } finally {
         applyReconnectButton.disabled = false;
-      }
-    }
-    async function runCaptureNow() {
-      if (!captureButton) {
-        return;
-      }
-      captureButton.disabled = true;
-      try {
-        await chrome.runtime.sendMessage({ type: "capture-now" });
-        renderStatus(await runStatusRepository.get());
-      } finally {
-        captureButton.disabled = false;
       }
     }
     async function reconnectBridge() {
@@ -339,16 +312,15 @@ var require_options = __commonJS({
       }
     }
     form?.addEventListener("submit", (event) => {
-      void saveSettings(event);
-    });
-    captureButton?.addEventListener("click", () => {
-      void runCaptureNow();
+      void applyAndReconnect(event);
     });
     reconnectButton?.addEventListener("click", () => {
       void reconnectBridge();
     });
-    applyReconnectButton?.addEventListener("click", () => {
-      void applyAndReconnect();
+    applyReconnectButton?.addEventListener("click", (event) => {
+      if (event.target.type !== "submit") {
+        void applyAndReconnect();
+      }
     });
     chrome.storage?.onChanged?.addListener((changes, areaName) => {
       if (areaName === "local" && changes["pageSignalCapture.status"]) {

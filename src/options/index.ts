@@ -16,8 +16,6 @@ const requestTimeoutInput = document.querySelector<HTMLInputElement>('#request-t
 const connectionModeInput = document.querySelector<HTMLSelectElement>('#connection-mode');
 const relayUrlInput = document.querySelector<HTMLInputElement>('#relay-url');
 const sessionIdInput = document.querySelector<HTMLInputElement>('#session-id');
-const saveButton = document.querySelector<HTMLButtonElement>('#save-button');
-const captureButton = document.querySelector<HTMLButtonElement>('#capture-button');
 const reconnectButton = document.querySelector<HTMLButtonElement>('#reconnect-button');
 const applyReconnectButton = document.querySelector<HTMLButtonElement>('#apply-reconnect-button');
 
@@ -77,24 +75,9 @@ function readFormPatch(): Partial<ExtensionSettings> | null {
   };
 }
 
-async function saveSettings(event: SubmitEvent): Promise<void> {
-  event.preventDefault();
+async function applyAndReconnect(event?: SubmitEvent): Promise<void> {
+  event?.preventDefault();
 
-  const patch = readFormPatch();
-  if (!patch || !saveButton) return;
-
-  saveButton.disabled = true;
-  try {
-    const settings = await settingsRepository.save(patch);
-    renderSettings(settings);
-    await chrome.runtime.sendMessage({ type: 'ensure-bridge' });
-    renderStatus(await runStatusRepository.get());
-  } finally {
-    saveButton.disabled = false;
-  }
-}
-
-async function applyAndReconnect(): Promise<void> {
   const patch = readFormPatch();
   if (!patch || !applyReconnectButton) return;
 
@@ -102,27 +85,11 @@ async function applyAndReconnect(): Promise<void> {
   try {
     const settings = await settingsRepository.save(patch);
     renderSettings(settings);
-    // Tell the background to tear down the current connection and rebuild
-    // using the new settings (mode/relay/session may have changed).
+    // Save + force a clean reconnect using the new settings.
     await chrome.runtime.sendMessage({ type: 'reconnect-bridge' });
     renderStatus(await runStatusRepository.get());
   } finally {
     applyReconnectButton.disabled = false;
-  }
-}
-
-async function runCaptureNow(): Promise<void> {
-  if (!captureButton) {
-    return;
-  }
-
-  captureButton.disabled = true;
-
-  try {
-    await chrome.runtime.sendMessage({ type: 'capture-now' });
-    renderStatus(await runStatusRepository.get());
-  } finally {
-    captureButton.disabled = false;
   }
 }
 
@@ -142,19 +109,19 @@ async function reconnectBridge(): Promise<void> {
 }
 
 form?.addEventListener('submit', (event) => {
-  void saveSettings(event);
-});
-
-captureButton?.addEventListener('click', () => {
-  void runCaptureNow();
+  void applyAndReconnect(event);
 });
 
 reconnectButton?.addEventListener('click', () => {
   void reconnectBridge();
 });
 
-applyReconnectButton?.addEventListener('click', () => {
-  void applyAndReconnect();
+applyReconnectButton?.addEventListener('click', (event) => {
+  // Type=submit on this button means the form submit handler already runs; the click handler
+  // is a no-op safety net for the case where the button is detached from the form.
+  if ((event.target as HTMLButtonElement).type !== 'submit') {
+    void applyAndReconnect();
+  }
 });
 
 chrome.storage?.onChanged?.addListener((changes, areaName) => {

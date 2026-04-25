@@ -649,10 +649,6 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
           cursor: pointer;
           transition: transform 120ms ease, filter 120ms ease, border-color 120ms ease;
         }
-        button.send {
-          background: linear-gradient(135deg, var(--popup-accent), var(--popup-accent-soft));
-          color: #fff;
-        }
         button.control:hover,
         button.copy:hover,
         button.upload:hover,
