@@ -645,6 +645,30 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
     host2.style.setProperty("--popup-font-family", fontFamily);
     host2.style.setProperty("--popup-shadow", darkPage ? "0 28px 70px rgba(2, 6, 23, 0.52)" : "0 24px 60px rgba(15, 23, 42, 0.22)");
   }
+  function arrayBufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    const CHUNK_SIZE = 32768;
+    const parts = [];
+    for (let offset = 0; offset < bytes.length; offset += CHUNK_SIZE) {
+      const chunk = bytes.subarray(offset, Math.min(offset + CHUNK_SIZE, bytes.length));
+      parts.push(String.fromCharCode.apply(null, Array.from(chunk)));
+    }
+    return btoa(parts.join(""));
+  }
+  function fileToBase64(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.addEventListener("load", () => {
+        const result = typeof reader.result === "string" ? reader.result : "";
+        const commaIndex = result.indexOf(",");
+        resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : result);
+      });
+      reader.addEventListener("error", () => {
+        reject(reader.error ?? new Error("FileReader failed to read the selected file."));
+      });
+      reader.readAsDataURL(file);
+    });
+  }
   async function copyTextToClipboard(text2) {
     if (typeof ClipboardItem !== "undefined" && navigator.clipboard?.write) {
       try {
@@ -1213,18 +1237,27 @@ function injectOrUpdatePopupInPage(text, tabId, pageUrl) {
         if (selectedFile) {
           pendingOperations.push(
             (async () => {
-              const fileBuffer = await selectedFile.arrayBuffer();
-              await chrome.runtime.sendMessage({
+              const fileBytesBase64 = await fileToBase64(selectedFile);
+              console.log("[page-signal-popup] sending popup-file-send", {
+                fileName: selectedFile.name,
+                size: selectedFile.size,
+                base64Length: fileBytesBase64.length
+              });
+              const response = await chrome.runtime.sendMessage({
                 type: "popup-file-send",
                 payload: {
                   uploadId: crypto.randomUUID(),
                   fileName: selectedFile.name,
                   mimeType: selectedFile.type || "application/octet-stream",
                   byteCount: selectedFile.size,
-                  fileBytes: fileBuffer,
+                  fileBytesBase64,
                   pageUrl: location.href
                 }
               });
+              console.log("[page-signal-popup] popup-file-send response", response);
+              if (response && response.ok === false) {
+                throw new Error(typeof response.message === "string" ? response.message : "Popup file send rejected.");
+              }
             })()
           );
         }
@@ -2115,25 +2148,41 @@ var require_main = __commonJS({
     }
     async function resolveScreenShareTabId() {
       let targetTabId = latestScreenShareOverlayTabId;
+      if (targetTabId !== null) {
+        try {
+          await chrome.tabs.get(targetTabId);
+        } catch {
+          targetTabId = null;
+          latestScreenShareOverlayTabId = null;
+        }
+      }
+      if (targetTabId === null) {
+        try {
+          const candidateTabs = await chrome.tabs.query({ active: true, windowType: "normal" });
+          const usable = candidateTabs.find((tab) => {
+            if (!tab.id || !tab.url) {
+              return false;
+            }
+            return !BLOCKED_PROTOCOL_PREFIXES.some((prefix) => tab.url.startsWith(prefix));
+          });
+          if (usable?.id !== void 0) {
+            targetTabId = usable.id;
+          }
+        } catch (error) {
+          debugError("background", "Failed to enumerate browser tabs for remote input fallback.", error);
+        }
+      }
       if (targetTabId === null) {
         const activeTab = await activeTabGateway.getActiveCapturableTab();
         targetTabId = activeTab?.id ?? null;
       }
       if (targetTabId === null) {
-        throw new Error("No shared browser tab is available for remote input delivery.");
+        throw new Error("No shared browser tab is available for remote input delivery. Switch to a regular browser tab and retry, or run the native client agent for OS-level control.");
       }
       return targetTabId;
     }
     async function focusScreenShareTab(targetTabId) {
-      try {
-        const tab = await chrome.tabs.get(targetTabId);
-        if (typeof tab.windowId === "number" && chrome.windows?.update) {
-          await chrome.windows.update(tab.windowId, { focused: true });
-        }
-        await chrome.tabs.update(targetTabId, { active: true });
-      } catch (error) {
-        debugError("background", "Unable to focus shared tab before remote input.", error);
-      }
+      void targetTabId;
     }
     async function dispatchScreenShareInput(payload) {
       if (!latestScreenShareStatus.active) {
@@ -3123,16 +3172,17 @@ var require_main = __commonJS({
           try {
             const fileName = typeof message.payload?.fileName === "string" && message.payload.fileName.trim() ? message.payload.fileName.trim() : "client-upload.bin";
             const mimeType = typeof message.payload?.mimeType === "string" && message.payload.mimeType.trim() ? message.payload.mimeType.trim() : "application/octet-stream";
-            const fileBytes = message.payload?.fileBytes;
-            if (!(fileBytes instanceof ArrayBuffer)) {
-              throw new Error("The popup file upload did not contain a valid binary payload.");
+            const fileBytesBase64 = typeof message.payload?.fileBytesBase64 === "string" ? message.payload.fileBytesBase64 : "";
+            if (!fileBytesBase64) {
+              throw new Error("The popup file upload did not contain a base64 binary payload.");
             }
+            debugLog("background", "Forwarding popup file upload to bridge.", { fileName, mimeType, base64Length: fileBytesBase64.length });
             const response = await forwardPopupFileUploadToBridge({
               uploadId: typeof message.payload?.uploadId === "string" && message.payload.uploadId ? message.payload.uploadId : crypto.randomUUID(),
               fileName,
               mimeType,
-              byteCount: typeof message.payload?.byteCount === "number" ? message.payload.byteCount : fileBytes.byteLength,
-              fileBytes,
+              byteCount: typeof message.payload?.byteCount === "number" ? message.payload.byteCount : 0,
+              fileBytesBase64,
               pageUrl: sender.tab?.url ?? (typeof message.payload?.pageUrl === "string" ? message.payload.pageUrl : null),
               tabId: sender.tab?.id ?? (typeof message.payload?.tabId === "number" ? message.payload.tabId : null),
               sentAt: (/* @__PURE__ */ new Date()).toISOString()

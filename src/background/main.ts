@@ -157,28 +157,54 @@ async function requestScreenShareStop() {
 
 async function resolveScreenShareTabId(): Promise<number> {
   let targetTabId = latestScreenShareOverlayTabId;
+
+  if (targetTabId !== null) {
+    try {
+      // Verify the recorded overlay tab still exists.
+      await chrome.tabs.get(targetTabId);
+    } catch {
+      targetTabId = null;
+      latestScreenShareOverlayTabId = null;
+    }
+  }
+
+  if (targetTabId === null) {
+    // Pick the active tab in the most recently focused normal browser window. This skips the
+    // screen-share viewer popup (which is window type "popup") so input goes back to the
+    // browsing tab the operator was using before they started sharing.
+    try {
+      const candidateTabs = await chrome.tabs.query({ active: true, windowType: 'normal' });
+      const usable = candidateTabs.find((tab) => {
+        if (!tab.id || !tab.url) {
+          return false;
+        }
+        return !BLOCKED_PROTOCOL_PREFIXES.some((prefix) => tab.url!.startsWith(prefix));
+      });
+      if (usable?.id !== undefined) {
+        targetTabId = usable.id;
+      }
+    } catch (error) {
+      debugError('background', 'Failed to enumerate browser tabs for remote input fallback.', error);
+    }
+  }
+
   if (targetTabId === null) {
     const activeTab = await activeTabGateway.getActiveCapturableTab();
     targetTabId = activeTab?.id ?? null;
   }
 
   if (targetTabId === null) {
-    throw new Error('No shared browser tab is available for remote input delivery.');
+    throw new Error('No shared browser tab is available for remote input delivery. Switch to a regular browser tab and retry, or run the native client agent for OS-level control.');
   }
 
   return targetTabId;
 }
 
 async function focusScreenShareTab(targetTabId: number): Promise<void> {
-  try {
-    const tab = await chrome.tabs.get(targetTabId);
-    if (typeof tab.windowId === 'number' && chrome.windows?.update) {
-      await chrome.windows.update(tab.windowId, { focused: true });
-    }
-    await chrome.tabs.update(targetTabId, { active: true });
-  } catch (error) {
-    debugError('background', 'Unable to focus shared tab before remote input.', error);
-  }
+  // Intentionally a no-op: focusing the captured window steals focus from the screen-share
+  // viewer popup and the operator's GUI. Chrome `scripting.executeScript` works on inactive
+  // tabs, so we leave focus alone and rely on direct event injection.
+  void targetTabId;
 }
 
 type ScreenShareInputAction = 'pointer-down' | 'pointer-up' | 'pointer-move' | 'click' | 'double-click' | 'wheel';
@@ -926,7 +952,7 @@ async function forwardPopupFileUploadToBridge(payload: {
   fileName: string;
   mimeType: string;
   byteCount: number;
-  fileBytes: ArrayBuffer;
+  fileBytesBase64: string;
   pageUrl: string | null;
   tabId: number | null;
   sentAt: string;
@@ -1391,10 +1417,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const mimeType = typeof message.payload?.mimeType === 'string' && message.payload.mimeType.trim()
           ? message.payload.mimeType.trim()
           : 'application/octet-stream';
-        const fileBytes = message.payload?.fileBytes;
-        if (!(fileBytes instanceof ArrayBuffer)) {
-          throw new Error('The popup file upload did not contain a valid binary payload.');
+        const fileBytesBase64 = typeof message.payload?.fileBytesBase64 === 'string'
+          ? message.payload.fileBytesBase64
+          : '';
+        if (!fileBytesBase64) {
+          throw new Error('The popup file upload did not contain a base64 binary payload.');
         }
+        debugLog('background', 'Forwarding popup file upload to bridge.', { fileName, mimeType, base64Length: fileBytesBase64.length });
 
         const response = await forwardPopupFileUploadToBridge({
           uploadId: typeof message.payload?.uploadId === 'string' && message.payload.uploadId
@@ -1402,8 +1431,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             : crypto.randomUUID(),
           fileName,
           mimeType,
-          byteCount: typeof message.payload?.byteCount === 'number' ? message.payload.byteCount : fileBytes.byteLength,
-          fileBytes,
+          byteCount: typeof message.payload?.byteCount === 'number' ? message.payload.byteCount : 0,
+          fileBytesBase64,
           pageUrl: sender.tab?.url ?? (typeof message.payload?.pageUrl === 'string' ? message.payload.pageUrl : null),
           tabId: sender.tab?.id ?? (typeof message.payload?.tabId === 'number' ? message.payload.tabId : null),
           sentAt: new Date().toISOString(),

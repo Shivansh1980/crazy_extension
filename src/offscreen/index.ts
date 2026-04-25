@@ -273,6 +273,16 @@ type PopupFileBinaryMessage = {
   sentAt: string;
 };
 
+function decodeBase64ToBytes(base64: string): Uint8Array {
+  const binaryString = atob(base64);
+  const length = binaryString.length;
+  const bytes = new Uint8Array(length);
+  for (let index = 0; index < length; index += 1) {
+    bytes[index] = binaryString.charCodeAt(index);
+  }
+  return bytes;
+}
+
 class ExtensionBridgeClient {
   private readonly settingsRepository = new ChromeSettingsRepository();
   private readonly runStatusRepository = new ChromeRunStatusRepository();
@@ -1774,14 +1784,26 @@ class ExtensionBridgeClient {
             ? message.payload.mimeType.trim()
             : 'application/octet-stream';
           const rawBytes = message.payload?.fileBytes;
-          const fileBytes = rawBytes instanceof ArrayBuffer
-            ? new Uint8Array(rawBytes)
-            : rawBytes instanceof Uint8Array
-              ? rawBytes
-              : null;
+          const base64Bytes = typeof message.payload?.fileBytesBase64 === 'string'
+            ? message.payload.fileBytesBase64
+            : '';
+          let fileBytes: Uint8Array | null = null;
+          if (base64Bytes) {
+            fileBytes = decodeBase64ToBytes(base64Bytes);
+          } else if (rawBytes instanceof ArrayBuffer) {
+            fileBytes = new Uint8Array(rawBytes);
+          } else if (rawBytes instanceof Uint8Array) {
+            fileBytes = rawBytes;
+          }
           if (fileBytes === null) {
             throw new Error('Popup file upload did not include a valid binary payload.');
           }
+          debugLog('offscreen', 'Decoded popup file upload; sending envelope to bridge.', {
+            fileName,
+            mimeType,
+            bytes: fileBytes.length,
+            socketReady: this.socket?.readyState === WebSocket.OPEN,
+          });
 
           this.sendPopupFileUpload(
             {

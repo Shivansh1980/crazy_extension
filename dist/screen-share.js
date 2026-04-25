@@ -67,9 +67,22 @@ var require_screen_share = __commonJS({
           video: {
             frameRate: { ideal: 30, max: 30 },
             width: { ideal: 1920 },
-            height: { ideal: 1080 }
-          }
+            height: { ideal: 1080 },
+            displaySurface: "browser"
+          },
+          // Hide the operator's own viewer popup from the picker, and let them switch tabs mid-share.
+          selfBrowserSurface: "exclude",
+          surfaceSwitching: "include",
+          monitorTypeSurfaces: "exclude"
         });
+        const [videoTrackForCheck] = stream.getVideoTracks();
+        const surface = videoTrackForCheck?.getSettings().displaySurface;
+        if (surface && surface !== "browser") {
+          stream.getTracks().forEach((track) => track.stop());
+          throw new Error(
+            "This share captures more than a browser tab, which the extension cannot click on. Pick a Chrome tab in the picker, or run the native client agent for full-desktop control."
+          );
+        }
         activeStream = stream;
         if (previewElement) {
           previewElement.srcObject = stream;

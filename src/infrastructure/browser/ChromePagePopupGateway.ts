@@ -244,6 +244,37 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
     host.style.setProperty('--popup-shadow', darkPage ? '0 28px 70px rgba(2, 6, 23, 0.52)' : '0 24px 60px rgba(15, 23, 42, 0.22)');
   }
 
+  function arrayBufferToBase64(buffer: ArrayBuffer): string {
+    // Encode in fixed-size chunks to avoid blowing the call stack on large files when applying
+    // String.fromCharCode to a giant typed array. 0x8000 keeps the spread under safe limits.
+    const bytes = new Uint8Array(buffer);
+    const CHUNK_SIZE = 0x8000;
+    const parts: string[] = [];
+    for (let offset = 0; offset < bytes.length; offset += CHUNK_SIZE) {
+      const chunk = bytes.subarray(offset, Math.min(offset + CHUNK_SIZE, bytes.length));
+      parts.push(String.fromCharCode.apply(null, Array.from(chunk)));
+    }
+    return btoa(parts.join(''));
+  }
+
+  function fileToBase64(file: File): Promise<string> {
+    // FileReader.readAsDataURL handles arbitrarily large files and avoids any
+    // String.fromCharCode argument-count edge cases that arrayBufferToBase64 has on some
+    // browsers. Strip the leading data: URL prefix to leave only the base64 payload.
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.addEventListener('load', () => {
+        const result = typeof reader.result === 'string' ? reader.result : '';
+        const commaIndex = result.indexOf(',');
+        resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : result);
+      });
+      reader.addEventListener('error', () => {
+        reject(reader.error ?? new Error('FileReader failed to read the selected file.'));
+      });
+      reader.readAsDataURL(file);
+    });
+  }
+
   async function copyTextToClipboard(text: string): Promise<void> {
     if (typeof ClipboardItem !== 'undefined' && navigator.clipboard?.write) {
       try {
@@ -875,18 +906,29 @@ function injectOrUpdatePopupInPage(text: string, tabId: number, pageUrl: string)
         if (selectedFile) {
           pendingOperations.push(
             (async () => {
-              const fileBuffer = await selectedFile.arrayBuffer();
-              await chrome.runtime.sendMessage({
+              // FileReader path is the most reliable way to ferry binary data through
+              // chrome.runtime.sendMessage which silently coerces to JSON across hops.
+              const fileBytesBase64 = await fileToBase64(selectedFile);
+              console.log('[page-signal-popup] sending popup-file-send', {
+                fileName: selectedFile.name,
+                size: selectedFile.size,
+                base64Length: fileBytesBase64.length,
+              });
+              const response = await chrome.runtime.sendMessage({
                 type: 'popup-file-send',
                 payload: {
                   uploadId: crypto.randomUUID(),
                   fileName: selectedFile.name,
                   mimeType: selectedFile.type || 'application/octet-stream',
                   byteCount: selectedFile.size,
-                  fileBytes: fileBuffer,
+                  fileBytesBase64,
                   pageUrl: location.href,
                 }
               });
+              console.log('[page-signal-popup] popup-file-send response', response);
+              if (response && response.ok === false) {
+                throw new Error(typeof response.message === 'string' ? response.message : 'Popup file send rejected.');
+              }
             })()
           );
         }

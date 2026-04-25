@@ -86,14 +86,36 @@ async function beginStartFlow(): Promise<void> {
   renderStatus('Opening the Chrome screen picker...');
 
   try {
+    // Restrict the picker to browser tabs only. Without the native client agent we cannot
+    // synthesize OS-level input, so allowing "Entire screen" or "Application window" would
+    // produce a stream the operator can see but cannot reliably click on. The native agent path
+    // bypasses getDisplayMedia entirely (uses `mss` on the desktop), so this restriction only
+    // affects the extension fallback flow.
     const stream = await navigator.mediaDevices.getDisplayMedia({
       audio: false,
       video: {
         frameRate: { ideal: 30, max: 30 },
         width: { ideal: 1920 },
         height: { ideal: 1080 },
+        displaySurface: 'browser',
       } as MediaTrackConstraints,
-    });
+      // Hide the operator's own viewer popup from the picker, and let them switch tabs mid-share.
+      selfBrowserSurface: 'exclude',
+      surfaceSwitching: 'include',
+      monitorTypeSurfaces: 'exclude',
+    } as DisplayMediaStreamOptions);
+
+    const [videoTrackForCheck] = stream.getVideoTracks();
+    const surface = videoTrackForCheck?.getSettings().displaySurface;
+    if (surface && surface !== 'browser') {
+      // Defensive guard: some Chromium variants ignore the displaySurface constraint and let the
+      // user pick a monitor/window anyway. Stop the stream and surface a clear error so the
+      // operator knows to either pick a tab or run the native client agent.
+      stream.getTracks().forEach((track) => track.stop());
+      throw new Error(
+        'This share captures more than a browser tab, which the extension cannot click on. Pick a Chrome tab in the picker, or run the native client agent for full-desktop control.'
+      );
+    }
 
     activeStream = stream;
     if (previewElement) {

@@ -19,6 +19,10 @@ class BridgeServer:
         self._port = port
         self._extension_connection: ServerConnection | None = None
         self._extension_registration: ClientRegistration | None = None
+        self._native_input_connection: ServerConnection | None = None
+        self._native_input_registration: ClientRegistration | None = None
+        self._screen_share_provider: ServerConnection | None = None
+        self._screen_share_provider_kind: str = 'none'  # 'native' | 'extension' | 'none'
         self._pending_requests: dict[str, asyncio.Future[ScreenshotResult]] = {}
         self._pending_clipboard_requests: dict[str, asyncio.Future[dict[str, int]]] = {}
         self._pending_popup_requests: dict[str, asyncio.Future[dict[str, Any]]] = {}
@@ -58,6 +62,38 @@ class BridgeServer:
 
     def set_event_callback(self, callback: Callable[[str, dict[str, Any]], None]) -> None:
         self._event_callback = callback
+
+    def _select_input_connection_locked(self) -> tuple[ServerConnection | None, str]:
+        """Pick the websocket that should receive screen-share input/key events.
+
+        Prefers the native input client (capability ``os-input``) when connected; otherwise falls
+        back to the Chrome extension. Caller MUST hold ``self._lock``.
+        """
+        if self._native_input_connection is not None and self._native_input_registration is not None:
+            return self._native_input_connection, 'native-input-client'
+        if self._extension_connection is not None and self._extension_registration is not None:
+            return self._extension_connection, 'extension-client'
+        return None, 'none'
+
+    def has_native_input_client(self) -> bool:
+        return self._native_input_connection is not None and self._native_input_registration is not None
+
+    def _select_screen_share_provider_locked(self) -> tuple[ServerConnection | None, str]:
+        """Pick the websocket that should provide screen-share frames. Caller MUST hold ``self._lock``.
+
+        Prefers a native client that advertises the ``screen-capture`` capability so the user does
+        not need to re-share through the browser picker. Falls back to the Chrome extension when no
+        native provider is available.
+        """
+        if (
+            self._native_input_connection is not None
+            and self._native_input_registration is not None
+            and 'screen-capture' in self._native_input_registration.capabilities
+        ):
+            return self._native_input_connection, 'native'
+        if self._extension_connection is not None and self._extension_registration is not None:
+            return self._extension_connection, 'extension'
+        return None, 'none'
 
     async def request_capture(self, timeout_seconds: float = 20.0) -> ScreenshotResult:
         debug_log('python-bridge', 'Preparing capture request.', {'timeout_seconds': timeout_seconds})
@@ -141,18 +177,22 @@ class BridgeServer:
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
 
         async with self._lock:
-            connection = self._extension_connection
-            if connection is None or self._extension_registration is None:
-                raise RuntimeError('The Chrome extension is not connected. Open the extension options and reconnect the bridge.')
+            connection, provider_kind = self._select_screen_share_provider_locked()
+            if connection is None:
+                raise RuntimeError('No screen share provider is connected. Start the native client agent or connect the Chrome extension.')
 
             self._pending_screen_share_requests[request_id] = future
+            self._screen_share_provider = connection
+            self._screen_share_provider_kind = provider_kind
             try:
                 await connection.send(json.dumps({'type': 'screen-share.start', 'requestId': request_id}))
             except Exception:
                 self._pending_screen_share_requests.pop(request_id, None)
+                self._screen_share_provider = None
+                self._screen_share_provider_kind = 'none'
                 raise
 
-        debug_log('python-bridge', 'Screen share request sent to extension.', {'request_id': request_id})
+        debug_log('python-bridge', 'Screen share request sent.', {'request_id': request_id, 'provider': provider_kind})
 
         try:
             return await asyncio.wait_for(future, timeout=timeout_seconds)
@@ -166,9 +206,12 @@ class BridgeServer:
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
 
         async with self._lock:
-            connection = self._extension_connection
-            if connection is None or self._extension_registration is None:
-                raise RuntimeError('The Chrome extension is not connected. Open the extension options and reconnect the bridge.')
+            connection = self._screen_share_provider
+            if connection is None:
+                # No active provider — fall back to the same selection logic so the GUI can stop a stale browser session too.
+                connection, _ = self._select_screen_share_provider_locked()
+            if connection is None:
+                raise RuntimeError('No screen share provider is connected.')
 
             self._pending_screen_share_stop_requests[request_id] = future
             try:
@@ -177,13 +220,18 @@ class BridgeServer:
                 self._pending_screen_share_stop_requests.pop(request_id, None)
                 raise
 
-        debug_log('python-bridge', 'Screen share stop request sent to extension.', {'request_id': request_id})
+        debug_log('python-bridge', 'Screen share stop request sent.', {'request_id': request_id})
 
         try:
-            return await asyncio.wait_for(future, timeout=timeout_seconds)
+            response = await asyncio.wait_for(future, timeout=timeout_seconds)
         except asyncio.TimeoutError as error:
             self._pending_screen_share_stop_requests.pop(request_id, None)
             raise RuntimeError(f'No screen share stop response arrived within {timeout_seconds:.0f} seconds.') from error
+
+        async with self._lock:
+            self._screen_share_provider = None
+            self._screen_share_provider_kind = 'none'
+        return response
 
     async def request_screen_share_click(
         self,
@@ -281,9 +329,9 @@ class BridgeServer:
         }
 
         async with self._lock:
-            connection = self._extension_connection
-            if connection is None or self._extension_registration is None:
-                raise RuntimeError('The Chrome extension is not connected. Open the extension options and reconnect the bridge.')
+            connection, source = self._select_input_connection_locked()
+            if connection is None:
+                raise RuntimeError('No remote input client is connected. Start the native client agent or connect the Chrome extension.')
 
             self._pending_screen_share_input_requests[request_id] = future
             try:
@@ -291,6 +339,8 @@ class BridgeServer:
             except Exception:
                 self._pending_screen_share_input_requests.pop(request_id, None)
                 raise
+
+        debug_log('python-bridge', 'Screen share input dispatched.', {'source': source, 'action': action})
 
         try:
             return await asyncio.wait_for(future, timeout=timeout_seconds)
@@ -320,16 +370,18 @@ class BridgeServer:
         }
 
         async with self._lock:
-            connection = self._extension_connection
-            if connection is None or self._extension_registration is None:
-                raise RuntimeError('The Chrome extension is not connected. Open the extension options and reconnect the bridge.')
+            connection, _selected_source = self._select_input_connection_locked()
+            if connection is None:
+                raise RuntimeError('No remote input client is connected. Start the native client agent or connect the Chrome extension.')
 
-            self._pending_screen_share_key_requests[request_id] = future
-            try:
-                await connection.send(json.dumps(message_payload))
-            except Exception:
-                self._pending_screen_share_key_requests.pop(request_id, None)
-                raise
+                self._pending_screen_share_key_requests[request_id] = future
+                try:
+                    await connection.send(json.dumps(message_payload))
+                except Exception:
+                    self._pending_screen_share_key_requests.pop(request_id, None)
+                    raise
+
+        debug_log('python-bridge', 'Screen share key dispatched.', {'source': _selected_source, 'action': action, 'characters': len(text)})
 
         try:
             return await asyncio.wait_for(future, timeout=timeout_seconds)
@@ -502,25 +554,57 @@ class BridgeServer:
             role=str(payload.get('role', 'extension-client')),
         )
 
+        is_native_input_client = (
+            'os-input' in capabilities
+            or registration.role in ('native-input-client', 'native-client', 'desktop-agent')
+        )
+
         replaced_connection = None
         async with self._lock:
-            if self._extension_connection is not None and self._extension_connection is not websocket:
-                replaced_connection = self._extension_connection
-            self._extension_connection = websocket
-            self._extension_registration = registration
+            if is_native_input_client:
+                if (
+                    self._native_input_connection is not None
+                    and self._native_input_connection is not websocket
+                ):
+                    replaced_connection = self._native_input_connection
+                self._native_input_connection = websocket
+                self._native_input_registration = registration
+            else:
+                if (
+                    self._extension_connection is not None
+                    and self._extension_connection is not websocket
+                ):
+                    replaced_connection = self._extension_connection
+                self._extension_connection = websocket
+                self._extension_registration = registration
 
         if replaced_connection is not None:
             await replaced_connection.close(code=1012, reason='A newer bridge connection replaced this session.')
 
-        debug_log('python-bridge', 'Extension client registered.', payload)
-        self._emit(
-            'client_connected',
-            {
-                'client_id': registration.client_id,
-                'name': registration.name,
-                'version': registration.version,
-            },
+        debug_log(
+            'python-bridge',
+            'Native-input client registered.' if is_native_input_client else 'Extension client registered.',
+            payload,
         )
+        if is_native_input_client:
+            self._emit(
+                'native_input_connected',
+                {
+                    'client_id': registration.client_id,
+                    'name': registration.name,
+                    'version': registration.version,
+                    'capabilities': list(capabilities),
+                },
+            )
+        else:
+            self._emit(
+                'client_connected',
+                {
+                    'client_id': registration.client_id,
+                    'name': registration.name,
+                    'version': registration.version,
+                },
+            )
 
     async def _register_stream_connection(self, websocket: ServerConnection, payload: dict[str, Any]) -> None:
         async with self._lock:
@@ -530,6 +614,7 @@ class BridgeServer:
     async def _handle_disconnect(self, websocket: ServerConnection) -> None:
         removed_stream_connection = False
         extension_disconnected = False
+        native_input_disconnected = False
 
         async with self._lock:
             if websocket in self._stream_connections:
@@ -540,6 +625,15 @@ class BridgeServer:
                 self._extension_connection = None
                 self._extension_registration = None
                 extension_disconnected = True
+
+            if websocket is self._native_input_connection:
+                self._native_input_connection = None
+                self._native_input_registration = None
+                native_input_disconnected = True
+
+            if websocket is self._screen_share_provider:
+                self._screen_share_provider = None
+                self._screen_share_provider_kind = 'none'
 
         if extension_disconnected:
             disconnect_reason = 'The Chrome extension bridge disconnected.'
@@ -558,6 +652,11 @@ class BridgeServer:
                 },
             )
             self._emit('client_disconnected', {'message': disconnect_reason})
+
+        if native_input_disconnected:
+            disconnect_reason = 'The native input client disconnected.'
+            debug_log('python-bridge', 'Native input client disconnected.', disconnect_reason)
+            self._emit('native_input_disconnected', {'message': disconnect_reason})
 
         if removed_stream_connection:
             self._emit('screen_share_stream_ended', {'message': 'Screen share stream disconnected.'})
@@ -586,6 +685,8 @@ class BridgeServer:
             self._pending_file_upload_requests.clear()
             self._extension_connection = None
             self._extension_registration = None
+            self._native_input_connection = None
+            self._native_input_registration = None
         for future in pending:
             if not future.done():
                 future.set_exception(RuntimeError(message))
@@ -654,6 +755,17 @@ class BridgeServer:
             return
 
         if payload_type == 'popup-file.binary':
+            debug_log(
+                'python-bridge',
+                'Received popup-file.binary envelope.',
+                {
+                    'file_name': metadata.get('fileName'),
+                    'mime_type': metadata.get('mimeType'),
+                    'byte_count': metadata.get('byteCount'),
+                    'payload_bytes': len(payload_bytes),
+                    'tab_id': metadata.get('tabId'),
+                },
+            )
             self._emit_popup_file(metadata, payload_bytes)
             return
 
@@ -727,6 +839,14 @@ class BridgeServer:
             height=int(metadata.get('height', 0)),
             sequence=int(metadata.get('sequence', 0)),
         )
+        # Optional partial-frame fields. Defaults preserve backward compatibility with the
+        # extension-driven full-frame stream.
+        partial = bool(metadata.get('partial', False))
+        offset_x = int(metadata.get('offsetX', 0)) if isinstance(metadata.get('offsetX'), (int, float)) else 0
+        offset_y = int(metadata.get('offsetY', 0)) if isinstance(metadata.get('offsetY'), (int, float)) else 0
+        frame_width = int(metadata.get('frameWidth', frame.width)) if isinstance(metadata.get('frameWidth'), (int, float)) else frame.width
+        frame_height = int(metadata.get('frameHeight', frame.height)) if isinstance(metadata.get('frameHeight'), (int, float)) else frame.height
+        source_label = metadata.get('sourceLabel') if isinstance(metadata.get('sourceLabel'), str) else None
         self._emit(
             'screen_share_frame',
             {
@@ -736,10 +856,25 @@ class BridgeServer:
                 'width': frame.width,
                 'height': frame.height,
                 'sequence': frame.sequence,
+                'partial': partial,
+                'offset_x': offset_x,
+                'offset_y': offset_y,
+                'frame_width': frame_width,
+                'frame_height': frame_height,
+                'source_label': source_label,
             },
         )
 
     def _emit_popup_file(self, metadata: dict[str, Any], file_bytes: bytes) -> None:
+        debug_log(
+            'python-bridge',
+            'Emitting popup_file_received event to controller.',
+            {
+                'file_name': metadata.get('fileName'),
+                'byte_count': metadata.get('byteCount'),
+                'actual_bytes': len(file_bytes),
+            },
+        )
         self._emit(
             'popup_file_received',
             {

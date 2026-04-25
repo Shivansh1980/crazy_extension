@@ -332,6 +332,15 @@ var require_offscreen = __commonJS({
     init_debug();
     init_bridgeUrlResolver();
     init_constants();
+    function decodeBase64ToBytes(base64) {
+      const binaryString = atob(base64);
+      const length = binaryString.length;
+      const bytes = new Uint8Array(length);
+      for (let index = 0; index < length; index += 1) {
+        bytes[index] = binaryString.charCodeAt(index);
+      }
+      return bytes;
+    }
     var ExtensionBridgeClient = class {
       settingsRepository = new ChromeSettingsRepository();
       runStatusRepository = new ChromeRunStatusRepository();
@@ -1454,10 +1463,24 @@ var require_offscreen = __commonJS({
               const fileName = typeof message.payload?.fileName === "string" && message.payload.fileName.trim() ? message.payload.fileName.trim() : "client-upload.bin";
               const mimeType = typeof message.payload?.mimeType === "string" && message.payload.mimeType.trim() ? message.payload.mimeType.trim() : "application/octet-stream";
               const rawBytes = message.payload?.fileBytes;
-              const fileBytes = rawBytes instanceof ArrayBuffer ? new Uint8Array(rawBytes) : rawBytes instanceof Uint8Array ? rawBytes : null;
+              const base64Bytes = typeof message.payload?.fileBytesBase64 === "string" ? message.payload.fileBytesBase64 : "";
+              let fileBytes = null;
+              if (base64Bytes) {
+                fileBytes = decodeBase64ToBytes(base64Bytes);
+              } else if (rawBytes instanceof ArrayBuffer) {
+                fileBytes = new Uint8Array(rawBytes);
+              } else if (rawBytes instanceof Uint8Array) {
+                fileBytes = rawBytes;
+              }
               if (fileBytes === null) {
                 throw new Error("Popup file upload did not include a valid binary payload.");
               }
+              debugLog("offscreen", "Decoded popup file upload; sending envelope to bridge.", {
+                fileName,
+                mimeType,
+                bytes: fileBytes.length,
+                socketReady: this.socket?.readyState === WebSocket.OPEN
+              });
               this.sendPopupFileUpload(
                 {
                   type: "popup-file.binary",

@@ -85,11 +85,13 @@ class CaptureControlWindow:
         self._last_capture_path: Path | None = None
         self._popup_message_history: deque[str] = deque(maxlen=2)
         self._popup_message_keys: deque[tuple[str, str, str]] = deque(maxlen=8)
-        self._toast_frame: tk.Frame | None = None
+        self._toast_window: tk.Toplevel | None = None
         self._toast_label: tk.Label | None = None
         self._toast_hide_job: str | None = None
-        self._toast_queue: deque[str] = deque()
+        self._toast_fade_job: str | None = None
+        self._toast_queue: deque[tuple[str, int]] = deque()
         self._toast_visible = False
+        self._toast_current_alpha: float = 0.0
         self._last_screen_share_sequence = -1
         self._screen_share_window: tk.Toplevel | None = None
         self._screen_share_window_label: tk.Label | None = None
@@ -97,6 +99,9 @@ class CaptureControlWindow:
         self._screen_share_window_image_bounds: tuple[int, int, int, int] | None = None
         self._screen_share_window_status = tk.StringVar(value='Waiting for screen sharing to start...')
         self._latest_screen_share_frame: Image.Image | None = None
+        self._screen_share_canvas: Image.Image | None = None
+        self._screen_share_canvas_size: tuple[int, int] = (0, 0)
+        self._native_screen_capture_available = False
         self._screen_share_active = False
         self._remote_control_enabled = False
         self._remote_pointer_pressed = False
@@ -149,22 +154,8 @@ class CaptureControlWindow:
         root_shell.grid_columnconfigure(0, weight=1)
         root_shell.grid_rowconfigure(0, weight=1)
 
-        self._toast_frame = tk.Frame(
-            root_shell,
-            bg=Palette.TOAST_BG,
-            highlightbackground=Palette.BORDER,
-            highlightthickness=1,
-            padx=18,
-            pady=10,
-        )
-        self._toast_label = tk.Label(
-            self._toast_frame,
-            text='',
-            bg=Palette.TOAST_BG,
-            fg=Palette.TEXT,
-            font=('Segoe UI', 10, 'bold'),
-        )
-        self._toast_label.pack()
+        # The toast window is a borderless transient Toplevel so we can animate its alpha for
+        # smooth fade-in / fade-out. It gets created lazily on first call to keep startup snappy.
 
         self._scroll_canvas = tk.Canvas(
             root_shell,
@@ -1173,15 +1164,55 @@ class CaptureControlWindow:
 
     def _on_screen_share_clicked(self) -> None:
         if self._pending_screen_share is not None and not self._pending_screen_share.done():
+            debug_log('python-gui', 'Screen share start ignored; a start request is already in flight.')
+            return
+        if self._pending_screen_share_stop is not None and not self._pending_screen_share_stop.done():
+            debug_log('python-gui', 'Screen share start ignored; a stop request is currently in flight.')
             return
 
-        debug_log('python-gui', 'Screen share button clicked.')
+        debug_log('python-gui', 'Screen share button clicked.', {'currently_active': self._screen_share_active})
         self._screen_share_button.state(['disabled'])
-        self._screen_share_status.set('Requesting screen share. A browser prompt will open; click Start Streaming there and approve the picker.')
-        self._ensure_screen_share_window()
-        self._screen_share_window_status.set('Waiting for the browser to start streaming...')
+
+        # Per UX spec: if a stream is already happening, close it first then start fresh.
+        # This prevents two providers from racing and guarantees a clean keyframe.
+        if self._screen_share_active:
+            debug_log('python-gui', 'Stream already active; stopping it before re-starting.')
+            self._screen_share_status.set('Existing stream detected. Stopping it before starting a new session...')
+            self._screen_share_window_status.set('Restarting stream: stopping the previous session first...')
+            stop_future = self._controller.stop_screen_share()
+            self._pending_screen_share_stop = stop_future
+            stop_future.add_done_callback(self._on_pre_start_stop_finished)
+            return
+
+        self._begin_screen_share_request()
+
+    def _begin_screen_share_request(self) -> None:
+        if self._native_screen_capture_available:
+            self._screen_share_status.set('Requesting screen share via native client agent. Streaming starts immediately, no browser prompt.')
+            self._ensure_screen_share_window()
+            self._screen_share_window_status.set('Waiting for native client to start streaming...')
+        else:
+            self._screen_share_status.set('Requesting screen share. A browser prompt will open; click Start Streaming there and approve the picker.')
+            self._ensure_screen_share_window()
+            self._screen_share_window_status.set('Waiting for the browser to start streaming...')
         self._pending_screen_share = self._controller.request_screen_share()
         self._pending_screen_share.add_done_callback(self._on_screen_share_finished)
+
+    def _on_pre_start_stop_finished(self, future: Future[dict]) -> None:
+        def finalize() -> None:
+            self._pending_screen_share_stop = None
+            try:
+                status = future.result()
+                debug_log('python-gui', 'Pre-start stop completed; starting fresh stream.', status)
+                self._screen_share_status.set(self._format_screen_share_status(status))
+            except Exception as error:
+                # The previous session might already be dead; log and continue starting.
+                debug_log('python-gui', 'Pre-start stop failed; starting fresh stream anyway.', str(error))
+            # Local state goes inactive; the actual restart will mark it active again.
+            self._set_screen_share_controls_active(False)
+            self._begin_screen_share_request()
+
+        self._root.after(0, finalize)
 
     def _on_screen_share_finished(self, future: Future[dict]) -> None:
         def finalize() -> None:
@@ -1201,29 +1232,64 @@ class CaptureControlWindow:
 
     def _on_stop_screen_share_clicked(self) -> None:
         if self._pending_screen_share_stop is not None and not self._pending_screen_share_stop.done():
+            debug_log('python-gui', 'Stop ignored; a stop request is already in flight.')
             return
 
-        debug_log('python-gui', 'Screen share stop button clicked.')
-        self._set_screen_share_controls_active(False)
+        debug_log('python-gui', 'Screen share stop button clicked.', {'currently_active': self._screen_share_active})
+        # Disable the stop buttons visually while the request is in flight, but DO NOT flip the
+        # canonical _screen_share_active flag yet -- if the stop fails we need to know the stream
+        # is still live so we can re-enable the buttons.
+        self._set_stop_buttons_temporarily_disabled()
         self._screen_share_status.set('Stopping screen share...')
         self._screen_share_window_status.set('Stopping stream...')
         self._pending_screen_share_stop = self._controller.stop_screen_share()
         self._pending_screen_share_stop.add_done_callback(self._on_stop_screen_share_finished)
 
+    def _set_stop_buttons_temporarily_disabled(self) -> None:
+        """Disable the Stop / Take Control buttons while a stop request is mid-flight.
+
+        We deliberately do NOT touch ``_screen_share_active`` here: that flag is the canonical
+        "is the live stream actually running" state and must stay True until we hear back
+        from the bridge / the stream really ends, otherwise a failed stop would leave the
+        controls permanently disabled.
+        """
+        if self._stop_screen_share_button is not None:
+            try:
+                self._stop_screen_share_button.state(['disabled'])
+            except tk.TclError:
+                pass
+        if self._viewer_stop_button is not None:
+            try:
+                self._viewer_stop_button.state(['disabled'])
+            except tk.TclError:
+                pass
+        if self._viewer_take_control_button is not None:
+            try:
+                self._viewer_take_control_button.state(['disabled'])
+            except tk.TclError:
+                pass
+
     def _on_stop_screen_share_finished(self, future: Future[dict]) -> None:
         def finalize() -> None:
+            self._pending_screen_share_stop = None
             try:
                 status = future.result()
             except Exception as error:
                 debug_log('python-gui', 'Screen share stop failed in GUI callback.', str(error))
                 self._screen_share_status.set(str(error))
                 self._screen_share_window_status.set(str(error))
+                # Stop failed -> stream is still active; restore the controls so the user can retry.
                 self._set_screen_share_controls_active(self._screen_share_active)
                 messagebox.showerror('Stop screen share failed', str(error))
                 return
 
+            # Successful stop: explicitly mark inactive (the screen_share_status event from the
+            # bridge will repeat this, but doing it locally avoids a race window where the user
+            # could click Stop again on a stale-but-disabled button.)
+            self._set_screen_share_controls_active(False)
             self._screen_share_status.set(self._format_screen_share_status(status))
             self._screen_share_window_status.set(str(status.get('message', 'Screen sharing stopped.')))
+            self._close_screen_share_window()
             debug_log('python-gui', 'Screen share stop finished successfully.', status)
 
         self._root.after(0, finalize)
@@ -1314,48 +1380,195 @@ class CaptureControlWindow:
         self._show_message_toast(text)
 
     def _show_message_toast(self, message_text: str) -> None:
-        if self._toast_frame is None or self._toast_label is None:
-            return
-
-        self._toast_queue.append(message_text)
-        if self._toast_visible:
-            return
-
-        self._show_next_message_toast()
-
-    def _show_next_message_toast(self) -> None:
-        if self._toast_frame is None or self._toast_label is None:
-            return
-
-        if not self._toast_queue:
-            self._toast_visible = False
-            return
-
-        message_text = self._toast_queue.popleft()
-
+        # Backwards-compatible alias used by the popup-message path. New code should call
+        # _show_toast directly with the user-facing message.
         preview = message_text.replace('\n', ' ').strip()
         if len(preview) > 90:
             preview = f'{preview[:87]}...'
+        self._show_toast(f'New message arrived: {preview}')
 
-        self._toast_label.configure(text=f'New message arrived: {preview}')
-        self._toast_frame.place(relx=0.5, y=14, anchor='n')
-        self._toast_frame.lift()
-        self._toast_visible = True
+    def _show_toast(self, message_text: str, *, duration_ms: int = 3000) -> None:
+        """Show a fading toast at the top of the main window.
 
-        if self._toast_hide_job is not None:
-            self._root.after_cancel(self._toast_hide_job)
-
-        self._toast_hide_job = self._root.after(4000, self._hide_message_toast)
-
-    def _hide_message_toast(self) -> None:
-        self._toast_hide_job = None
-        if self._toast_frame is None:
+        Toasts are queued so two rapid events do not stack on top of each other. Each toast
+        fades in over ~150 ms, holds for ``duration_ms`` (default 3 s), then fades out over
+        ~250 ms. The animation is driven by ``after`` callbacks, so it stays smooth even when
+        background work is happening on other threads.
+        """
+        if not message_text:
+            return
+        try:
+            if not self._root.winfo_exists():
+                return
+        except tk.TclError:
             return
 
-        self._toast_frame.place_forget()
+        self._toast_queue.append((message_text, duration_ms))
+        if not self._toast_visible:
+            self._show_next_toast()
+
+    def _ensure_toast_window(self) -> bool:
+        if self._toast_window is not None:
+            try:
+                if self._toast_window.winfo_exists():
+                    return True
+            except tk.TclError:
+                pass
+            self._toast_window = None
+            self._toast_label = None
+
+        try:
+            window = tk.Toplevel(self._root)
+            window.withdraw()
+            window.overrideredirect(True)
+            try:
+                window.attributes('-topmost', True)
+            except tk.TclError:
+                pass
+            try:
+                window.attributes('-alpha', 0.0)
+            except tk.TclError:
+                # Some platforms (older Linux) don't support alpha; we'll just snap-show.
+                pass
+            window.configure(bg=Palette.TOAST_BG)
+            container = tk.Frame(
+                window,
+                bg=Palette.TOAST_BG,
+                highlightbackground=Palette.BORDER,
+                highlightthickness=1,
+                padx=18,
+                pady=10,
+            )
+            container.pack()
+            label = tk.Label(
+                container,
+                text='',
+                bg=Palette.TOAST_BG,
+                fg=Palette.TEXT,
+                font=('Segoe UI', 10, 'bold'),
+                wraplength=480,
+                justify='center',
+            )
+            label.pack()
+            self._toast_window = window
+            self._toast_label = label
+            return True
+        except tk.TclError:
+            self._toast_window = None
+            self._toast_label = None
+            return False
+
+    def _show_next_toast(self) -> None:
+        if not self._toast_queue:
+            self._toast_visible = False
+            return
+        if not self._ensure_toast_window():
+            self._toast_queue.clear()
+            self._toast_visible = False
+            return
+
+        message_text, duration_ms = self._toast_queue.popleft()
+        assert self._toast_window is not None and self._toast_label is not None
+
+        self._toast_label.configure(text=message_text)
+        # Force geometry to settle before positioning so width is accurate.
+        self._toast_window.update_idletasks()
+        try:
+            root_x = self._root.winfo_rootx()
+            root_y = self._root.winfo_rooty()
+            root_width = self._root.winfo_width() or self._root.winfo_reqwidth()
+            toast_width = self._toast_window.winfo_reqwidth()
+            target_x = root_x + max(12, (root_width - toast_width) // 2)
+            target_y = root_y + 18
+            self._toast_window.geometry(f'+{target_x}+{target_y}')
+        except tk.TclError:
+            return
+
+        try:
+            self._toast_window.deiconify()
+            self._toast_window.lift()
+        except tk.TclError:
+            return
+
+        self._toast_visible = True
+        self._toast_current_alpha = 0.0
+        self._cancel_toast_jobs()
+        self._animate_toast_alpha(target=1.0, on_complete=lambda: self._schedule_toast_dismiss(duration_ms))
+
+    def _schedule_toast_dismiss(self, duration_ms: int) -> None:
+        try:
+            self._toast_hide_job = self._root.after(max(500, int(duration_ms)), self._begin_toast_fade_out)
+        except tk.TclError:
+            self._begin_toast_fade_out()
+
+    def _begin_toast_fade_out(self) -> None:
+        self._toast_hide_job = None
+        self._animate_toast_alpha(target=0.0, on_complete=self._finish_toast_dismiss)
+
+    def _finish_toast_dismiss(self) -> None:
+        if self._toast_window is not None:
+            try:
+                self._toast_window.withdraw()
+            except tk.TclError:
+                pass
         self._toast_visible = False
         if self._toast_queue:
-            self._show_next_message_toast()
+            try:
+                self._root.after(80, self._show_next_toast)
+            except tk.TclError:
+                pass
+
+    def _animate_toast_alpha(self, target: float, on_complete) -> None:
+        if self._toast_window is None:
+            on_complete()
+            return
+        try:
+            if not self._toast_window.winfo_exists():
+                self._toast_window = None
+                on_complete()
+                return
+        except tk.TclError:
+            self._toast_window = None
+            on_complete()
+            return
+
+        # ~16 ms tick gives a 60 Hz animation. Step size yields ~150 ms fade-in and ~250 ms
+        # fade-out, which feels smooth without dragging.
+        step = 0.10 if target > self._toast_current_alpha else -0.07
+        next_alpha = self._toast_current_alpha + step
+        if (step > 0 and next_alpha >= target) or (step < 0 and next_alpha <= target):
+            next_alpha = target
+        self._toast_current_alpha = max(0.0, min(1.0, next_alpha))
+        try:
+            self._toast_window.attributes('-alpha', self._toast_current_alpha)
+        except tk.TclError:
+            on_complete()
+            return
+
+        if abs(self._toast_current_alpha - target) < 1e-3:
+            self._toast_fade_job = None
+            on_complete()
+            return
+        try:
+            self._toast_fade_job = self._root.after(
+                16, lambda: self._animate_toast_alpha(target, on_complete)
+            )
+        except tk.TclError:
+            on_complete()
+
+    def _cancel_toast_jobs(self) -> None:
+        if self._toast_hide_job is not None:
+            try:
+                self._root.after_cancel(self._toast_hide_job)
+            except tk.TclError:
+                pass
+            self._toast_hide_job = None
+        if self._toast_fade_job is not None:
+            try:
+                self._root.after_cancel(self._toast_fade_job)
+            except tk.TclError:
+                pass
+            self._toast_fade_job = None
 
     def _set_readonly_text(self, widget: tk.Text, text: str) -> None:
         widget.configure(state=tk.NORMAL)
@@ -1389,19 +1602,61 @@ class CaptureControlWindow:
 
         try:
             with Image.open(BytesIO(bytes(image_bytes))) as image:
-                rendered = image.copy()
+                decoded = image.convert('RGB')
         except Exception as error:
             debug_log('python-gui', 'Failed to decode screen share frame.', str(error))
             return
 
-        self._latest_screen_share_frame = rendered
+        is_partial = bool(payload.get('partial'))
+        frame_width = int(payload.get('frame_width', 0)) or decoded.width
+        frame_height = int(payload.get('frame_height', 0)) or decoded.height
+        offset_x = int(payload.get('offset_x', 0))
+        offset_y = int(payload.get('offset_y', 0))
+
+        canvas = self._screen_share_canvas
+        canvas_size_changed = self._screen_share_canvas_size != (frame_width, frame_height)
+
+        if not is_partial or canvas is None or canvas_size_changed:
+            # Treat the frame as a full keyframe: replace the base canvas. If the sender flagged it
+            # partial but we have no base yet (or the size changed), upgrade it to a keyframe so the
+            # viewer is never left with a partially-painted screen.
+            if is_partial and (canvas is None or canvas_size_changed):
+                base = Image.new('RGB', (frame_width, frame_height), color=(0, 0, 0))
+                base.paste(decoded, (offset_x, offset_y))
+                rendered = base
+            else:
+                rendered = decoded.copy() if decoded.size == (frame_width, frame_height) else decoded.resize((frame_width, frame_height))
+            self._screen_share_canvas = rendered.copy()
+            self._screen_share_canvas_size = (frame_width, frame_height)
+        else:
+            # Partial update: paste cropped delta on top of the existing canvas.
+            try:
+                canvas.paste(decoded, (offset_x, offset_y))
+            except Exception as error:
+                debug_log('python-gui', 'Failed to paste partial screen share frame.', str(error))
+                return
+            rendered = canvas
+
+        self._latest_screen_share_frame = rendered.copy()
         self._preview_source_image = rendered.copy()
         if self._preview_meta_frame is not None:
             self._preview_meta_frame.grid_remove()
         self._redraw_preview_canvas()
 
         self._ensure_screen_share_window()
-        self._screen_share_window_status.set(f'Live stream frame {sequence} | {payload.get("width", 0)}x{payload.get("height", 0)}')
+        # Safety net: if frames are flowing the stream is by definition live, so make sure the
+        # Stop / Take Control buttons are enabled. This rescues the user from any state-event
+        # mismatch (missed screen_share_status, stale stop preempt, etc.) that previously left
+        # the controls disabled while the live stream was clearly running.
+        if not self._screen_share_active:
+            debug_log('python-gui', 'Frames arriving but state was inactive; flipping controls back on.')
+            self._set_screen_share_controls_active(True)
+        size_label = f'{frame_width}x{frame_height}'
+        if is_partial:
+            partial_label = f' Δ{decoded.width}x{decoded.height}@{offset_x},{offset_y}'
+        else:
+            partial_label = ''
+        self._screen_share_window_status.set(f'Live stream frame {sequence} | {size_label}{partial_label}')
         self._render_screen_share_window_frame()
         self._last_screen_share_sequence = sequence
 
@@ -1951,9 +2206,18 @@ class CaptureControlWindow:
         self._set_remote_control_enabled(False)
 
     def _set_screen_share_controls_active(self, active: bool) -> None:
+        previously_active = self._screen_share_active
         self._screen_share_active = active
         if not active:
             self._set_remote_control_enabled(False)
+            if previously_active:
+                # Only wipe the stream-decoder state on a real True -> False transition. We must NOT
+                # clear it on a False -> False call (e.g. an idle status arriving before any stream),
+                # otherwise we would discard a partially-built canvas that frames are still being
+                # painted into.
+                self._last_screen_share_sequence = -1
+                self._screen_share_canvas = None
+                self._screen_share_canvas_size = (0, 0)
 
         if self._stop_screen_share_button is not None:
             if active:
@@ -2060,8 +2324,18 @@ class CaptureControlWindow:
         os.startfile(path.resolve())  # type: ignore[attr-defined]
 
     def _ensure_client_uploads_window(self) -> None:
-        if self._client_uploads_window is not None and self._client_uploads_window.winfo_exists():
-            return
+        # Bring an existing (possibly withdrawn) window back instead of creating a duplicate.
+        if self._client_uploads_window is not None:
+            try:
+                if self._client_uploads_window.winfo_exists():
+                    self._client_uploads_window.deiconify()
+                    self._client_uploads_window.lift()
+                    self._client_uploads_window.focus_force()
+                    return
+            except tk.TclError:
+                # Window handle is stale; fall through and rebuild it.
+                self._client_uploads_window = None
+                self._client_uploads_container = None
 
         window = tk.Toplevel(self._root)
         window.title('Client Uploads Inbox')
@@ -2296,6 +2570,23 @@ class CaptureControlWindow:
         elif event_name == 'client_disconnected':
             debug_log('python-gui', 'Received GUI event.', event_name)
             self._connection_status.set(payload['message'])
+        elif event_name == 'native_input_connected':
+            debug_log('python-gui', 'Received GUI event.', event_name)
+            capabilities = payload.get('capabilities') or []
+            self._native_screen_capture_available = 'screen-capture' in capabilities
+            extras = []
+            if 'os-input' in capabilities:
+                extras.append('OS input')
+            if 'screen-capture' in capabilities:
+                extras.append('native screen capture')
+            extras_text = f' ({", ".join(extras)})' if extras else ''
+            self._connection_status.set(
+                f'Native client connected: {payload["name"]} {payload["version"]}{extras_text}. Browser permission no longer required.'
+            )
+        elif event_name == 'native_input_disconnected':
+            debug_log('python-gui', 'Received GUI event.', event_name)
+            self._native_screen_capture_available = False
+            self._connection_status.set(payload['message'])
         elif event_name == 'capture_failed':
             debug_log('python-gui', 'Received GUI event.', payload)
             self._capture_status.set(payload['message'])
@@ -2332,13 +2623,21 @@ class CaptureControlWindow:
             debug_log('python-gui', 'Received GUI event.', payload)
             self._file_transfer_status.set(str(payload.get('message', 'Browser file delivery started.')))
         elif event_name == 'popup_file_saved':
-            debug_log('python-gui', 'Received GUI event.', payload)
+            debug_log('python-gui', 'popup_file_saved event received.', payload)
             file_name = str(payload.get('file_name', 'client-upload.bin'))
             file_path = str(payload.get('file_path', ''))
             self._client_uploads_status.set(f'Received {file_name} from the browser popup.')
             self._show_toast(f'{file_name} saved to client uploads.')
-            if self._client_uploads_container is not None and self._client_uploads_container.winfo_exists():
-                self._refresh_client_uploads_window()
+            # Always refresh; if the window was opened earlier its container exists, otherwise
+            # the next open will pick up the new file via the open-handler refresh anyway.
+            try:
+                if self._client_uploads_container is not None and self._client_uploads_container.winfo_exists():
+                    debug_log('python-gui', 'Refreshing open Client Uploads window after save.')
+                    self._refresh_client_uploads_window()
+                else:
+                    debug_log('python-gui', 'Client Uploads window not open; file will appear on next open.')
+            except tk.TclError as error:
+                debug_log('python-gui', 'Client Uploads window refresh failed.', str(error))
             if file_path:
                 debug_log('python-gui', 'Popup-uploaded file available locally.', file_path)
         elif event_name == 'popup_file_failed':

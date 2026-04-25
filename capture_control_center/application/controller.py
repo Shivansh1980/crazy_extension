@@ -130,9 +130,16 @@ class CaptureController:
 
     def _handle_bridge_event(self, event_name: str, payload: dict[str, Any]) -> None:
         if event_name == 'popup_file_received':
-            self._loop.call_soon_threadsafe(
-                lambda payload=payload: asyncio.create_task(self._store_popup_file(payload))
+            debug_log(
+                'python-controller',
+                'Scheduling popup file save.',
+                {'file_name': payload.get('file_name'), 'byte_count': payload.get('byte_count')},
             )
+            # run_coroutine_threadsafe is safe whether _handle_bridge_event runs on the loop
+            # thread (the typical case) or some other thread. Using it instead of
+            # call_soon_threadsafe + create_task gives us a Future we can await on if needed
+            # and avoids a subtle race where the lambda captured an already-completed payload.
+            asyncio.run_coroutine_threadsafe(self._store_popup_file(payload), self._loop)
             return
 
         self._enqueue_event(event_name, payload)
@@ -210,6 +217,16 @@ class CaptureController:
         )
 
     async def _store_popup_file(self, payload: dict[str, Any]) -> None:
+        debug_log(
+            'python-controller',
+            'Storing popup-uploaded file.',
+            {
+                'file_name': payload.get('file_name'),
+                'mime_type': payload.get('mime_type'),
+                'byte_count': payload.get('byte_count'),
+                'tab_id': payload.get('tab_id'),
+            },
+        )
         try:
             file_bytes = payload.get('file_bytes')
             if not isinstance(file_bytes, (bytes, bytearray)):
@@ -229,7 +246,11 @@ class CaptureController:
             self._enqueue_event('popup_file_failed', {'message': str(error)})
             return
 
-        debug_log('python-controller', 'Popup-uploaded file saved locally.', str(saved_file.file_path))
+        debug_log(
+            'python-controller',
+            'Popup-uploaded file saved locally; enqueuing popup_file_saved.',
+            {'file_path': str(saved_file.file_path), 'byte_count': saved_file.byte_count},
+        )
         self._enqueue_event('popup_file_saved', self._serialize_received_file(saved_file))
 
     def _serialize_received_file(self, record: ReceivedClientFile) -> dict[str, Any]:
