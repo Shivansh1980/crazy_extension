@@ -35,7 +35,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 try:  # pragma: no cover - optional fast path
     import dxcam  # type: ignore
@@ -86,7 +86,7 @@ class _DxcamBackend:
     def available(self) -> bool:
         return dxcam is not None and Image is not None
 
-    def grab(self) -> Optional['Image.Image']:
+    def grab(self) -> Optional[Any]:
         if not self.available:
             return None
         with self._lock:
@@ -143,7 +143,7 @@ class _MssBackend:
     def available(self) -> bool:
         return mss is not None and Image is not None
 
-    def grab(self) -> Optional['Image.Image']:
+    def grab(self) -> Optional[Any]:
         if not self.available:
             return None
         try:
@@ -263,7 +263,7 @@ def get_backend_chain() -> CaptureBackendChain:
         return _chain
 
 
-def grab_one(max_width: int = 0) -> Optional[Tuple['Image.Image', str, Tuple[int, int]]]:
+def grab_one(max_width: int = 0) -> Optional[Tuple[Any, str, Tuple[int, int]]]:
     """Convenience helper: grab one frame, optionally downscaled.
 
     Returns ``(PIL.Image, backend_name, (original_w, original_h))`` or ``None``.
