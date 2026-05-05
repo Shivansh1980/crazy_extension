@@ -1,15 +1,62 @@
+# Dependencies / local environments
 node_modules/
 .venv/
-images/
+venv/
+env/
+
+# Local configuration and runtime state
+.env
+!.env.example
+!live_server/.env.example
 .vscode/
+images/
+client_uploads/
+*.log
+*.tmp
+*.temp
+
+# Python cache / tooling
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# OS/editor noise
 Thumbs.db
 .DS_Store
+desktop.ini
+
+# Chrome extension build output (rebuild with build_extension.bat)
+/dist/
+*.js.map
+
+# Legacy/native-client build output paths
 capture_client_agent/build/
 capture_client_agent/dist/
 capture_client_agent/PageSignalNativeClient.spec
+
+# PyInstaller native-client intermediates (rebuild with capture_client_agent/exe/build.bat)
+capture_client_agent/exe/build/
+capture_client_agent/exe/PageSignalNativeClient.spec
+capture_client_agent/exe/dist/*
+!capture_client_agent/exe/dist/
+!capture_client_agent/exe/dist/*.exe
+
+# C# native-agent intermediates and non-deliverable output
+capture_client_agent/dll/build/
+capture_client_agent/dll/obj/
+capture_client_agent/dll/dist/*
+!capture_client_agent/dll/dist/
+!capture_client_agent/dll/dist/*.dll
+!capture_client_agent/dll/dist/*.exe
+*.pdb
+*.obj
+*.ilk
+*.exp
+*.lib
 
