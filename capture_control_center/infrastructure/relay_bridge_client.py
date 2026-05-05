@@ -148,9 +148,11 @@ class RelayBridgeClient:
         request_id = self._new_request_id()
         future = self._loop_future()
         self._pending_requests[request_id] = future
+        # Prefer the native client (full desktop capture). The extension is the fallback.
+        target = self._select_screen_share_target()
         try:
             await self._send_to_role(
-                ROLE_EXTENSION_CLIENT,
+                target,
                 {'type': 'capture.request', 'requestId': request_id},
             )
         except Exception:

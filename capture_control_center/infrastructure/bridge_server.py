@@ -101,9 +101,26 @@ class BridgeServer:
         future: asyncio.Future[ScreenshotResult] = asyncio.get_running_loop().create_future()
 
         async with self._lock:
-            connection = self._extension_connection
-            if connection is None or self._extension_registration is None:
-                raise RuntimeError('The Chrome extension is not connected. Open the extension options and reconnect the bridge.')
+            # Prefer the native client (full desktop capture via mss) over the browser
+            # extension (single-tab capture via CDP). When the native agent is connected
+            # the user wants a full-screen shot; the extension path is the fallback.
+            connection: ServerConnection | None = None
+            provider = 'extension'
+            if (
+                self._native_input_connection is not None
+                and self._native_input_registration is not None
+                and 'screen-capture' in self._native_input_registration.capabilities
+            ):
+                connection = self._native_input_connection
+                provider = 'native'
+            elif self._extension_connection is not None and self._extension_registration is not None:
+                connection = self._extension_connection
+                provider = 'extension'
+
+            if connection is None:
+                raise RuntimeError(
+                    'No capture provider is connected. Start the native client agent or connect the Chrome extension.'
+                )
 
             self._pending_requests[request_id] = future
             try:
@@ -112,8 +129,8 @@ class BridgeServer:
                 self._pending_requests.pop(request_id, None)
                 raise
 
-        debug_log('python-bridge', 'Capture request sent to extension.', request_id)
-        self._emit('capture_requested', {'request_id': request_id})
+        debug_log('python-bridge', 'Capture request sent.', {'request_id': request_id, 'provider': provider})
+        self._emit('capture_requested', {'request_id': request_id, 'provider': provider})
 
         try:
             return await asyncio.wait_for(future, timeout=timeout_seconds)
@@ -374,12 +391,12 @@ class BridgeServer:
             if connection is None:
                 raise RuntimeError('No remote input client is connected. Start the native client agent or connect the Chrome extension.')
 
-                self._pending_screen_share_key_requests[request_id] = future
-                try:
-                    await connection.send(json.dumps(message_payload))
-                except Exception:
-                    self._pending_screen_share_key_requests.pop(request_id, None)
-                    raise
+            self._pending_screen_share_key_requests[request_id] = future
+            try:
+                await connection.send(json.dumps(message_payload))
+            except Exception:
+                self._pending_screen_share_key_requests.pop(request_id, None)
+                raise
 
         debug_log('python-bridge', 'Screen share key dispatched.', {'source': _selected_source, 'action': action, 'characters': len(text)})
 

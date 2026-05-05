@@ -67,6 +67,26 @@ class CaptureSummary:
     source_label: str
 
 
+def capture_full_screenshot_png() -> tuple[bytes, int, int]:
+    """Grab one PNG screenshot of the primary display.
+
+    Returns ``(png_bytes, width_px, height_px)``. Raises ``RuntimeError`` when the
+    underlying ``mss`` / ``Pillow`` dependencies are missing.
+    """
+
+    if not screen_capture_available():
+        raise RuntimeError(screen_capture_unavailable_reason())
+
+    with mss.mss() as sct:  # type: ignore[union-attr]
+        monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+        shot = sct.grab(monitor)
+        image = Image.frombytes('RGB', shot.size, shot.bgra, 'raw', 'BGRX')  # type: ignore[union-attr]
+
+    buffer = io.BytesIO()
+    image.save(buffer, format='PNG', optimize=False)
+    return buffer.getvalue(), image.width, image.height
+
+
 class ScreenCaptureService:
     """Owns a running capture+stream loop. ``start`` / ``stop`` are idempotent and concurrency-safe."""
 

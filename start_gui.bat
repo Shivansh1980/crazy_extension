@@ -61,6 +61,11 @@ if "%SETUP_ONLY%"=="1" (
   exit /b 0
 )
 
+REM Make sure a native client is running before the GUI comes up. The launcher is
+REM idempotent (skips if already running) and prefers EXE -> C# DLL host -> Python
+REM module. Run hidden so it doesn't steal focus from the GUI.
+call "%~dp0start_native_client.bat" --silent
+
 echo Starting Capture Control Center...
 %VENV_PYTHON% -m capture_control_center.app
 exit /b %errorlevel%
