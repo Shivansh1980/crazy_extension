@@ -5,6 +5,123 @@ Page Signal Capture now consists of two cooperating applications:
 - A Manifest V3 Chrome extension that maintains a resilient local WebSocket client in an offscreen document and captures full-page screenshots on demand.
 - A Python desktop control center that exposes the WebSocket server, lets the user trigger captures from a GUI, previews the latest image, saves each screenshot into an `images` folder under the current working directory, can push raw text or code into the browser clipboard, and can show the same text inside a draggable in-page popup.
 
+## Setup — first time on a fresh Windows machine
+
+Pick the path that matches who you are. **Do these once**, then use the
+day-to-day commands at the end.
+
+### Path A — End user (no source code, just want it running)
+
+Prereqs:
+
+- Windows 10 / 11.
+- Python 3.11+ on `PATH` (Microsoft Store install is fine — confirm with
+  `python --version`).
+- Google Chrome (or Edge / Brave).
+
+Steps:
+
+1. Clone or download this repo and open a PowerShell prompt in its root folder.
+2. **Start the control center** — first run sets up the venv and installs every
+   dependency automatically:
+   ```powershell
+   .\start_gui.bat
+   ```
+   This creates `.venv\`, runs `pip install -r requirements.txt` (which now
+   includes the optional `dxcam` package on Windows for HW-accelerated screen
+   capture — see [Robust desktop screen capture](#robust-desktop-screen-capture)),
+   and launches the Tkinter GUI. Leave the window open; it is the WebSocket
+   server.
+3. **Build the Chrome extension** (only needed once unless `src/` changes):
+   ```powershell
+   .\build_extension.bat
+   ```
+   This requires Node.js 20+. It produces a `dist\` folder.
+4. **Load the extension** in Chrome:
+   - Go to `chrome://extensions`, enable **Developer mode** (top right).
+   - Click **Load unpacked** and select the `dist\` folder produced in step 3.
+   - The extension icon should appear and connect to the GUI within ~5 seconds.
+5. **Start the native client** (needed for screen-share / OS input — *not*
+   for browser screenshots, which the extension handles itself):
+   ```powershell
+   .\capture_client_agent\start.bat
+   ```
+   It runs supervised: if it ever crashes it auto-restarts after 3 s. For a
+   detached, hidden, always-on launcher use:
+   ```powershell
+   .\capture_client_agent\start.bat --silent
+   ```
+   Logs land in `%TEMP%\PageSignalNativeClient.out.log`.
+
+That's everything. Click **Capture screenshot** in the GUI to verify the
+browser <-> server <-> agent loop.
+
+### Path B — Developer (working on the source)
+
+Same prereqs as Path A, plus:
+
+- Node.js 20+.
+- (Optional) Visual Studio Code or any editor.
+- (Optional) The .NET Framework 4.x C# compiler — preinstalled on
+  Win 10/11; only needed if you rebuild the C# DLL/host.
+
+Steps:
+
+```powershell
+# 1. JS / extension deps + first build
+npm.cmd install
+npm.cmd run build              # or: .\build_extension.bat
+
+# 2. Python deps + GUI (creates .venv automatically)
+.\start_gui.bat
+
+# 3. (optional) one-shot venv setup without launching the GUI
+.\start_gui.bat --setup-only
+
+# 4. (optional) rebuild the C# native agent (DLL + x64 + x86 hosts)
+cd capture_client_agent\dll
+.\build.bat
+cd ..\..
+
+# 5. (optional) rebuild the single-file PyInstaller exe of the native client
+cd capture_client_agent\exe
+.\build.bat
+cd ..\..
+```
+
+Then load `dist\` in `chrome://extensions` (Developer mode → Load unpacked).
+
+### Day-to-day commands
+
+| You want to... | Command |
+|---|---|
+| Start the GUI + WebSocket server | `.\start_gui.bat` |
+| Start the native client (visible, supervised) | `.\capture_client_agent\start.bat` |
+| Start the native client (silent, detached, always-on) | `.\capture_client_agent\start.bat --silent` |
+| Rebuild the Chrome extension after editing `src/` | `.\build_extension.bat` |
+| Rebuild the C# agent after editing `dll\src\` | `.\capture_client_agent\dll\build.bat` |
+| Rebuild the single-file native-client EXE | `.\capture_client_agent\exe\build.bat` |
+| Verify the screen-capture chain (which backends are live) | `python -c "from capture_client_agent.capture_backends import get_backend_chain; print(get_backend_chain().available_backends)"` |
+
+### Common first-run problems
+
+- **GUI says "no client connected"**: the extension's offscreen document still
+  needs to find a bridge endpoint. Either let the resolver chain run (it tries
+  Pastebin → GitHub raw → `ws://127.0.0.1:8765` automatically with 5 s
+  backoff) or open the extension Options page and set the URL manually.
+- **Screenshots arrive but screen-share frames are black**: the foreground
+  app is hardware-accelerated. Make sure `dxcam` installed cleanly
+  (`pip show dxcam`); see
+  [Robust desktop screen capture](#robust-desktop-screen-capture) for the
+  full story and the deliberate Windows protections that no user-mode
+  capture method can bypass.
+- **`PageSignalAgentHost.exe` triggers SmartScreen**: expected for unsigned
+  builds. See [capture_client_agent/dll/README.md](capture_client_agent/dll/README.md)
+  for the self-signing PowerShell script.
+- **`start.bat` keeps respawning the agent in a loop**: that's the supervisor
+  doing its job (3 s restart on any exit). Check
+  `%TEMP%\PageSignalNativeClient.out.log` for the actual error.
+
 ## Architecture
 
 - `src/domain`: extension models and ports.
@@ -61,6 +178,29 @@ File transfer flow:
 The extension still uses the Chrome DevTools Protocol through `chrome.debugger` and `Page.captureScreenshot`. That remains the fastest high-fidelity path for full-page screenshots because it avoids scroll-and-stitch artifacts and preserves device-aware detail that downstream AI analysis needs.
 
 To avoid oversized screenshots that can fail on extremely long pages, the capture gateway computes an optimal scale using both a maximum dimension cap and a maximum pixel-area cap.
+
+## Robust desktop screen capture
+
+The native client agent (used for the screen-share feature, not browser-page
+capture) goes through a fallback chain so hardware-accelerated content
+(videos, games, GPU-rasterized Chrome) is captured instead of returning black
+frames:
+
+1. **DXGI Desktop Duplication** (via the optional `dxcam` package) — catches
+   HW-accel content and layered windows.
+2. **GDI BitBlt** (`mss`) — universal fallback for everything else.
+
+The chain auto-demotes a backend that returns black frames or fails, then
+re-promotes after a short cooldown so transient GPU/RDP events don't
+permanently disable the fast path. Full documentation lives in
+[capture_client_agent/README.md](capture_client_agent/README.md#robust-screen-capture-no-more-black-frames-on-videos--games)
+and the C# DLL equivalent in
+[capture_client_agent/dll/README.md](capture_client_agent/dll/README.md#robust-screen-capture).
+
+What **cannot** be captured by any user-mode method (deliberate Windows
+protections — list these up-front to clients):
+`WDA_EXCLUDEFROMCAPTURE` windows, DRM video (Widevine/PlayReady), the UAC
+secure desktop, and other-session windows.
 
 ## Local development
 

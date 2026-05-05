@@ -90,6 +90,25 @@ dual-arch operation.
 - **`--all`** loops over every running match and reports a non-zero exit if any
   individual injection failed.
 
+## Robust screen capture
+
+The C# `BitBlt` path (in [src/ScreenCapture.cs](src/ScreenCapture.cs)) is now
+invoked with the `SRCCOPY | CAPTUREBLT` flag combination so **layered /
+transparent windows** (notification toasts, tooltips, some IME popups) are
+included in the capture instead of being silently dropped by GDI+.
+
+A cheap pixel-grid sample (`LooksAllBlack`) checks every captured frame; when
+GDI is defeated by hardware-accelerated content (videos, games,
+GPU-rasterized Chrome) it logs a clear warning so operators know to switch to
+the Python agent (which has the DXGI Desktop Duplication fallback via
+`dxcam` — see [../README.md](../README.md#robust-screen-capture-no-more-black-frames-on-videos--games)).
+
+Things the C# host **cannot** capture in any user-mode code path — these are
+deliberate Windows protections, not bugs:
+`SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` windows, DRM-protected
+video (Widevine/PlayReady), the UAC secure desktop, and other-session
+windows. Only a kernel driver bypasses these.
+
 ## Build
 
 Open any cmd / PowerShell prompt and run:

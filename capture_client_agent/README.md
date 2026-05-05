@@ -17,6 +17,8 @@ capture_client_agent/
 ├── client.py                       WebSocket client + resolver chain
 ├── input_dispatcher.py             pyautogui-based OS input
 ├── screen_capture.py               mss + Pillow capture & streaming
+├── capture_backends.py             robust capture chain (DXGI → GDI fallback,
+│                                    auto-demote on black frames)
 │
 ├── exe/                            PyInstaller build (Python -> single .exe)
 │   ├── build.bat                   one-shot build script
@@ -88,6 +90,69 @@ automatically without anyone touching anything.
 Log location for the silent path: `%TEMP%\PageSignalNativeClient.out.log`
 (includes `[native-client][supervisor] iteration N launching: ...` and
 `child exited code=...` lines whenever a respawn happens).
+
+## Robust screen capture (no more black frames on videos / games)
+
+Plain `BitBlt`-based capture (what `mss` uses, and what GDI+ does under the
+hood) returns **pure-black frames** when the foreground content is
+hardware-accelerated — YouTube/Netflix video, DirectX/OpenGL games, modern
+Chrome with GPU rasterization, etc. That isn't a bug in our code; those
+surfaces live on the GPU and never touch the GDI surface.
+
+[`capture_backends.py`](capture_backends.py) wraps every capture call in a
+fallback chain so the agent keeps producing usable frames:
+
+| Order | Backend | Catches |
+|---|---|---|
+| 1 | `dxcam` (DXGI Desktop Duplication API) | HW-accelerated video, GPU-rasterized Chrome, DirectX windowed games, layered windows |
+| 2 | `mss` (GDI BitBlt) | Universal fallback — always works for normal apps |
+
+Selection logic:
+
+1. Try `dxcam` first (camera created lazily and reused across frames).
+2. If a backend fails or returns a frame that's ≥99% near-black, it's
+   **demoted for 30 s** and the next backend handles the same tick.
+3. The demotion expires automatically, so a transient device-lost (RDP resize,
+   GPU driver reset, monitor unplugged) doesn't permanently disable the fast
+   path.
+
+`dxcam` is listed in [requirements.txt](../requirements.txt) as an optional
+Windows-only extra (`dxcam>=0.0.5; sys_platform == "win32"`). The chain falls
+back gracefully when it isn't installed — you'll just be on the `mss`-only
+path, which behaves exactly like the old code.
+
+### What still cannot be captured (Windows-level protections)
+
+No user-mode method works for these — only a kernel driver helps. They are
+**deliberate Windows protections**, not agent bugs. List them up-front in any
+demo so clients aren't surprised:
+
+- `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` windows (banking apps,
+  password managers, MS Teams in some configurations — Win 10 2004+).
+- DRM-protected video surfaces (Widevine L1, PlayReady).
+- The UAC secure desktop and the lock screen (only LOCAL_SYSTEM can see those).
+- Other-session windows when the agent runs as the wrong user.
+
+### Quick check on a deployed machine
+
+```powershell
+python -c "from capture_client_agent.capture_backends import get_backend_chain; c=get_backend_chain(); print(c.available_backends); f=c.grab(); print(f and (f.backend, f.width, f.height))"
+```
+
+Expected output with both deps installed:
+
+```
+['dxgi-dd', 'gdi-mss']
+('dxgi-dd', 1920, 1080)
+```
+
+With only `mss` installed: `['gdi-mss']` and `('gdi-mss', …)`.
+
+The DLL/EXE C# host has its own equivalent: `BitBlt` is called with the
+`SRCCOPY | CAPTUREBLT` flags so layered windows (toasts, tooltips, IME popups)
+are included, and a pixel-sample check logs a clear warning when the GDI path
+is defeated by HW-accel content. See [dll/README.md](dll/README.md) for
+details.
 
 ## Builds
 
