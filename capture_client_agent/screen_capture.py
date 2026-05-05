@@ -37,6 +37,11 @@ except Exception as import_error:  # noqa: BLE001
 else:
     _PIL_IMPORT_ERROR = None
 
+from capture_client_agent.capture_backends import (
+    get_backend_chain,
+    grab_one as _backend_grab_one,
+)
+
 
 CAPTURE_INTERVAL_SECONDS = 1.0 / 15  # 15 FPS target
 KEYFRAME_INTERVAL_SECONDS = 2.0
@@ -70,17 +75,19 @@ class CaptureSummary:
 def capture_full_screenshot_png() -> tuple[bytes, int, int]:
     """Grab one PNG screenshot of the primary display.
 
-    Returns ``(png_bytes, width_px, height_px)``. Raises ``RuntimeError`` when the
-    underlying ``mss`` / ``Pillow`` dependencies are missing.
+    Returns ``(png_bytes, width_px, height_px)``. Raises ``RuntimeError`` when no
+    capture backend is available. Uses the robust backend chain so HW-accelerated
+    content is captured reliably whenever ``dxcam`` is installed; falls back to
+    GDI (mss) automatically.
     """
 
     if not screen_capture_available():
         raise RuntimeError(screen_capture_unavailable_reason())
 
-    with mss.mss() as sct:  # type: ignore[union-attr]
-        monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-        shot = sct.grab(monitor)
-        image = Image.frombytes('RGB', shot.size, shot.bgra, 'raw', 'BGRX')  # type: ignore[union-attr]
+    grabbed = _backend_grab_one()
+    if grabbed is None:
+        raise RuntimeError('All screen-capture backends failed (see debug log).')
+    image, _backend, _original = grabbed
 
     buffer = io.BytesIO()
     image.save(buffer, format='PNG', optimize=False)
@@ -148,8 +155,20 @@ class ScreenCaptureService:
 
     @staticmethod
     def _probe_primary_monitor() -> CaptureSummary:
+        # Probe via the backend chain so dxcam (when available) reports the same
+        # geometry the streaming loop will actually capture.
+        chain = get_backend_chain()
+        captured = chain.grab()
+        if captured is not None:
+            label_suffix = f' [{captured.backend}]'
+            return CaptureSummary(
+                width=captured.width,
+                height=captured.height,
+                monitor_index=1,
+                source_label=f'Primary display ({captured.width}x{captured.height}){label_suffix}',
+            )
+        # Fall back to mss for geometry only when no backend can grab right now.
         with mss.mss() as sct:  # type: ignore[union-attr]
-            # mss.monitors[0] is the union of all displays; index 1 is the primary monitor.
             monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
             width = int(monitor.get('width') or 0)
             height = int(monitor.get('height') or 0)
@@ -204,12 +223,13 @@ class ScreenCaptureService:
             self._last_keyframe_at = now
 
     def _capture_and_encode(self) -> tuple[bytes, bool] | None:
-        with mss.mss() as sct:  # type: ignore[union-attr]
-            monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-            shot = sct.grab(monitor)
-            current = Image.frombytes('RGB', shot.size, shot.bgra, 'raw', 'BGRX')  # type: ignore[union-attr]
+        captured = get_backend_chain().grab()
+        if captured is None:
+            # Every backend failed this tick; skip and let the next tick retry.
+            return None
+        current = captured.image
+        original_size = (current.width, current.height)
 
-        original_size = current.size
         if current.width > MAX_FRAME_WIDTH_PX:
             new_width = MAX_FRAME_WIDTH_PX
             new_height = int(round(current.height * (MAX_FRAME_WIDTH_PX / current.width)))

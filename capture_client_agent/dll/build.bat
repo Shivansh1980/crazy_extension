@@ -34,7 +34,7 @@ if not exist "%OUT%" mkdir "%OUT%"
 set AGENT_SRCS="%SRC%\Agent.cs" "%SRC%\InputDispatcher.cs" "%SRC%\Logger.cs" "%SRC%\Resolver.cs" "%SRC%\ScreenCapture.cs" "%SRC%\WireProtocol.cs"
 
 echo [build] compiling PageSignalAgent.dll (AnyCPU) ...
-"%CSC64%" /nologo /target:library /platform:anycpu ^
+"%CSC64%" /nologo /target:library /platform:anycpu /unsafe ^
     /out:"%OUT%\PageSignalAgent.dll" ^
     /reference:"System.dll" ^
     /reference:"System.Core.dll" ^

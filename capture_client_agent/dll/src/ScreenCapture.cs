@@ -13,8 +13,29 @@ namespace PageSignal.NativeAgent
     internal static class ScreenCapture
     {
         [DllImport("user32.dll")] private static extern int GetSystemMetrics(int nIndex);
+        [DllImport("user32.dll")] private static extern IntPtr GetDC(IntPtr hWnd);
+        [DllImport("user32.dll")] private static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+        [DllImport("gdi32.dll")] private static extern bool BitBlt(
+            IntPtr hdcDest, int xDest, int yDest, int wDest, int hDest,
+            IntPtr hdcSrc, int xSrc, int ySrc, uint rop);
+
         private const int SM_CXSCREEN = 0;
         private const int SM_CYSCREEN = 1;
+        // CAPTUREBLT (0x40000000) tells BitBlt to include layered windows in the
+        // capture. Without it, modern transparent / topmost windows (notification
+        // toasts, tooltips, some IME popups) come back missing. Combined with
+        // SRCCOPY (0x00CC0020) this matches the behavior of the Win+PrtSc path.
+        private const uint SRCCOPY = 0x00CC0020;
+        private const uint CAPTUREBLT = 0x40000000;
+        private const uint SCREEN_BLT_FLAGS = SRCCOPY | CAPTUREBLT;
+
+        // A frame is treated as "all black" \u2014 the classic GDI-vs-HW-acceleration
+        // failure mode \u2014 if it has zero non-near-black pixels in a small sample.
+        // We use this to log a warning so operators know the capture stack is
+        // hitting a protected / GPU-only window rather than silently shipping a
+        // black frame to the dashboard.
+        private const int BLACK_PIXEL_THRESHOLD = 8;
+        private const int BLACK_FRAME_SAMPLE_STRIDE = 64;
 
         public static void GetPrimarySize(out int w, out int h)
         {
@@ -23,15 +44,108 @@ namespace PageSignal.NativeAgent
             if (w <= 0 || h <= 0) { w = 1920; h = 1080; }
         }
 
+        /// <summary>
+        /// Capture the primary screen into a freshly-allocated Bitmap using GDI
+        /// BitBlt with the CAPTUREBLT flag. Caller owns the Bitmap.
+        /// </summary>
+        private static Bitmap CapturePrimaryBitmap(out bool looksBlack)
+        {
+            int w, h;
+            GetPrimarySize(out w, out h);
+            var bmp = new Bitmap(w, h, PixelFormat.Format24bppRgb);
+            bool blitOk = false;
+            using (var g = Graphics.FromImage(bmp))
+            {
+                IntPtr hdcDst = IntPtr.Zero;
+                IntPtr hdcSrc = IntPtr.Zero;
+                try
+                {
+                    hdcDst = g.GetHdc();
+                    hdcSrc = GetDC(IntPtr.Zero);
+                    if (hdcSrc != IntPtr.Zero && hdcDst != IntPtr.Zero)
+                    {
+                        blitOk = BitBlt(hdcDst, 0, 0, w, h, hdcSrc, 0, 0, SCREEN_BLT_FLAGS);
+                    }
+                }
+                catch
+                {
+                    blitOk = false;
+                }
+                finally
+                {
+                    if (hdcSrc != IntPtr.Zero) ReleaseDC(IntPtr.Zero, hdcSrc);
+                    if (hdcDst != IntPtr.Zero) g.ReleaseHdc(hdcDst);
+                }
+
+                if (!blitOk)
+                {
+                    // Fallback: GDI+ CopyFromScreen (no CAPTUREBLT, but still
+                    // covers the common case). Better than a blank frame.
+                    g.CopyFromScreen(0, 0, 0, 0, new Size(w, h), CopyPixelOperation.SourceCopy);
+                }
+            }
+
+            looksBlack = LooksAllBlack(bmp);
+            if (looksBlack)
+            {
+                Logger.Log(
+                    "screen-capture",
+                    "Captured frame looks all-black; foreground content is likely hardware-accelerated " +
+                    "or protected (DRM / WDA_EXCLUDEFROMCAPTURE). Install the Python agent for DXGI " +
+                    "Desktop Duplication coverage.");
+            }
+            return bmp;
+        }
+
+        private static bool LooksAllBlack(Bitmap bmp)
+        {
+            // Sample a sparse grid (cheap: <2k reads even at 4K) and look for
+            // any pixel with R+G+B above the threshold.
+            int w = bmp.Width, h = bmp.Height;
+            if (w < 4 || h < 4) return false;
+            BitmapData data = null;
+            try
+            {
+                data = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+                int stride = data.Stride;
+                IntPtr scan0 = data.Scan0;
+                unsafe
+                {
+                    byte* p = (byte*)scan0.ToPointer();
+                    for (int y = 0; y < h; y += BLACK_FRAME_SAMPLE_STRIDE)
+                    {
+                        byte* row = p + y * stride;
+                        for (int x = 0; x < w; x += BLACK_FRAME_SAMPLE_STRIDE)
+                        {
+                            byte* px = row + x * 3;
+                            if (px[0] > BLACK_PIXEL_THRESHOLD ||
+                                px[1] > BLACK_PIXEL_THRESHOLD ||
+                                px[2] > BLACK_PIXEL_THRESHOLD)
+                            {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                if (data != null) bmp.UnlockBits(data);
+            }
+        }
+
         public static byte[] CaptureFullScreenshotPng(out int width, out int height)
         {
-            GetPrimarySize(out width, out height);
-            using (var bmp = new Bitmap(width, height, PixelFormat.Format24bppRgb))
+            bool _;
+            using (var bmp = CapturePrimaryBitmap(out _))
             {
-                using (var g = Graphics.FromImage(bmp))
-                {
-                    g.CopyFromScreen(0, 0, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
-                }
+                width = bmp.Width;
+                height = bmp.Height;
                 using (var ms = new MemoryStream())
                 {
                     bmp.Save(ms, ImageFormat.Png);
@@ -42,15 +156,10 @@ namespace PageSignal.NativeAgent
 
         public static byte[] CaptureFullScreenshotJpeg(int quality, int maxWidth, out int width, out int height)
         {
-            int sw, sh;
-            GetPrimarySize(out sw, out sh);
-
-            using (var bmp = new Bitmap(sw, sh, PixelFormat.Format24bppRgb))
+            bool _;
+            using (var bmp = CapturePrimaryBitmap(out _))
             {
-                using (var g = Graphics.FromImage(bmp))
-                {
-                    g.CopyFromScreen(0, 0, 0, 0, new Size(sw, sh), CopyPixelOperation.SourceCopy);
-                }
+                int sw = bmp.Width, sh = bmp.Height;
 
                 Bitmap toEncode = bmp;
                 bool ownsScaled = false;

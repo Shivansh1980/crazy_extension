@@ -2,4 +2,9 @@ websockets>=15.0.0,<16.0.0
 Pillow>=11.0.0,<12.0.0
 pyautogui>=0.9.54,<1.0.0
 mss>=9.0.1,<11.0.0
+# Optional but strongly recommended on Windows: enables DXGI Desktop Duplication
+# capture so hardware-accelerated content (videos, games, GPU-rasterized Chrome)
+# is captured instead of returning black frames. Falls back to mss automatically
+# when not installed or unsupported.
+dxcam>=0.0.5; sys_platform == "win32"
 bcrypt>=4.0.0,<5.0.0
