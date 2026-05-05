@@ -1,19 +1,19 @@
 @echo off
 REM ===========================================================================
-REM capture_client_agent\build.bat
+REM capture_client_agent\exe\build.bat
 REM ---------------------------------------------------------------------------
 REM Bundles the capture_client_agent Python package into a single shareable
 REM Windows executable using PyInstaller. The resulting exe is fully self
 REM contained: it does not need Python, a virtualenv, or any wheels installed
 REM on the target machine. Just copy the produced exe to any Windows box and
-REM double-click it (or hand it to start.bat).
+REM double-click it (or hand it to capture_client_agent\start.bat).
 REM
-REM Output: capture_client_agent\dist\PageSignalNativeClient.exe
+REM Output: capture_client_agent\exe\dist\PageSignalNativeClient.exe
 REM ===========================================================================
 setlocal EnableExtensions EnableDelayedExpansion
 
 REM --- Resolve repo root ----------------------------------------------------
-cd /d "%~dp0\.."
+cd /d "%~dp0\..\.."
 if errorlevel 1 (
   echo Failed to switch to the repository root.
   exit /b 1
@@ -105,9 +105,9 @@ if errorlevel 1 (
 
 REM --- Clean previous artifacts --------------------------------------------
 echo Cleaning previous native client build artifacts...
-if exist "capture_client_agent\build" rmdir /s /q "capture_client_agent\build"
-if exist "capture_client_agent\dist" rmdir /s /q "capture_client_agent\dist"
-if exist "capture_client_agent\PageSignalNativeClient.spec" del /q "capture_client_agent\PageSignalNativeClient.spec"
+if exist "capture_client_agent\exe\build" rmdir /s /q "capture_client_agent\exe\build"
+if exist "capture_client_agent\exe\dist"  rmdir /s /q "capture_client_agent\exe\dist"
+if exist "capture_client_agent\exe\PageSignalNativeClient.spec" del /q "capture_client_agent\exe\PageSignalNativeClient.spec"
 
 REM --- Build the single-file executable ------------------------------------
 echo Building PageSignalNativeClient.exe (single-file, sharable)...
@@ -119,9 +119,9 @@ REM extracts to a temp dir at runtime, but the artifact you ship is one file.
   --clean ^
   --onefile ^
   --name PageSignalNativeClient ^
-  --distpath capture_client_agent\dist ^
-  --workpath capture_client_agent\build ^
-  --specpath capture_client_agent ^
+  --distpath capture_client_agent\exe\dist ^
+  --workpath capture_client_agent\exe\build ^
+  --specpath capture_client_agent\exe ^
   --collect-submodules pyautogui ^
   --collect-submodules mss ^
   --collect-submodules PIL ^
@@ -136,13 +136,13 @@ if errorlevel 1 (
   exit /b 1
 )
 
-if not exist "capture_client_agent\dist\PageSignalNativeClient.exe" (
-  echo Expected output capture_client_agent\dist\PageSignalNativeClient.exe was not produced.
+if not exist "capture_client_agent\exe\dist\PageSignalNativeClient.exe" (
+  echo Expected output capture_client_agent\exe\dist\PageSignalNativeClient.exe was not produced.
   exit /b 1
 )
 
 REM --- Sanity check: confirm the produced file is a non-trivial PE binary --
-for %%I in ("capture_client_agent\dist\PageSignalNativeClient.exe") do set "EXE_SIZE=%%~zI"
+for %%I in ("capture_client_agent\exe\dist\PageSignalNativeClient.exe") do set "EXE_SIZE=%%~zI"
 if not defined EXE_SIZE (
   echo Unable to read the size of the produced executable.
   exit /b 1
@@ -155,8 +155,8 @@ if %EXE_SIZE% LSS 1000000 (
 echo.
 echo ===========================================================================
 echo Native client built successfully:
-echo   %CD%\capture_client_agent\dist\PageSignalNativeClient.exe
-echo Share this single exe; users can double-click it or use start.bat.
+echo   %CD%\capture_client_agent\exe\dist\PageSignalNativeClient.exe
+echo Share this single exe; users can double-click it or use capture_client_agent\start.bat.
 echo ===========================================================================
 exit /b 0
 

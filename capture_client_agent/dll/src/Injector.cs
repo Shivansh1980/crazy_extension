@@ -36,6 +36,10 @@ namespace PageSignal.NativeAgent.Host
         {
             try
             {
+                // Best-effort: enable SeDebugPrivilege so we can OpenProcess on elevated
+                // / cross-session targets when running under an elevated/admin token.
+                TryEnableDebugPrivilege();
+
                 if (args == null || args.Length == 0 || string.Equals(args[0], "run", StringComparison.OrdinalIgnoreCase))
                 {
                     return RunInProcess();
@@ -202,14 +206,21 @@ namespace PageSignal.NativeAgent.Host
             {
                 // Architecture sanity check: x86 host can't inject into x64 target and vice-versa.
                 bool targetIsWow64 = IsTargetWow64(hProc);
-                bool targetIsX64 = Environment.Is64BitOperatingSystem && !targetIsWow64;
                 bool hostIsX64 = IntPtr.Size == 8;
+                // On a 64-bit OS, a non-Wow64 process is x64; on a 32-bit OS every process is x86.
+                bool targetIsX64 = Environment.Is64BitOperatingSystem && !targetIsWow64;
                 if (targetIsX64 != hostIsX64)
                 {
+                    // Try to relay to the sibling-bitness host EXE shipped next to this one.
+                    int relayed;
+                    if (TryRelayToSiblingHost(pid, dllPath, targetIsX64, out relayed))
+                        return relayed;
+
                     Console.Error.WriteLine(
                         "Architecture mismatch: host is " + (hostIsX64 ? "x64" : "x86")
                         + " but target pid " + pid + " is " + (targetIsX64 ? "x64" : "x86")
-                        + ". Rebuild PageSignalAgentHost.exe with the matching /platform.");
+                        + ". Run the matching host EXE (PageSignalAgentHost.exe for x64, "
+                        + "PageSignalAgentHost.x86.exe for x86) or rebuild with the matching /platform.");
                     return 12;
                 }
 
@@ -336,6 +347,115 @@ namespace PageSignal.NativeAgent.Host
         {
             bool wow;
             return IsWow64Process(hProc, out wow) && wow;
+        }
+
+        // ----------------- arch-mismatch fallback -----------------
+
+        // Re-runs this same command using the sibling-bitness host EXE (PageSignalAgentHost.exe
+        // <-> PageSignalAgentHost.x86.exe). Returns true and the child's exit code if the
+        // sibling was found and executed; false if no sibling EXE is shipped next to us.
+        private static bool TryRelayToSiblingHost(int pid, string dllPath, bool targetIsX64, out int exitCode)
+        {
+            exitCode = 0;
+            try
+            {
+                string here = Path.GetDirectoryName(typeof(Program).Assembly.Location);
+                string sibling = Path.Combine(here, targetIsX64 ? "PageSignalAgentHost.exe" : "PageSignalAgentHost.x86.exe");
+                if (!File.Exists(sibling)) return false;
+
+                Console.WriteLine("[PageSignal] target is " + (targetIsX64 ? "x64" : "x86")
+                    + "; relaying to sibling host: " + Path.GetFileName(sibling));
+
+                var psi = new ProcessStartInfo(sibling)
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = false,
+                };
+                psi.ArgumentList_AddSafe("inject");
+                psi.ArgumentList_AddSafe(pid.ToString());
+                psi.ArgumentList_AddSafe(dllPath);
+
+                using (var child = Process.Start(psi))
+                {
+                    if (child == null) return false;
+                    child.WaitForExit();
+                    exitCode = child.ExitCode;
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("[PageSignal] sibling-host relay failed: " + ex.Message);
+                return false;
+            }
+        }
+
+        // ----------------- SeDebugPrivilege -----------------
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LUID { public uint LowPart; public int HighPart; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LUID_AND_ATTRIBUTES { public LUID Luid; public uint Attributes; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct TOKEN_PRIVILEGES { public uint PrivilegeCount; public LUID_AND_ATTRIBUTES Privileges; }
+
+        private const uint TOKEN_ADJUST_PRIVILEGES = 0x0020;
+        private const uint TOKEN_QUERY = 0x0008;
+        private const uint SE_PRIVILEGE_ENABLED = 0x00000002;
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool LookupPrivilegeValue(string lpSystemName, string lpName, out LUID lpLuid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges,
+            ref TOKEN_PRIVILEGES NewState, uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentProcess();
+
+        private static void TryEnableDebugPrivilege()
+        {
+            try
+            {
+                IntPtr token;
+                if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out token))
+                    return;
+                try
+                {
+                    LUID luid;
+                    if (!LookupPrivilegeValue(null, "SeDebugPrivilege", out luid)) return;
+                    var tp = new TOKEN_PRIVILEGES
+                    {
+                        PrivilegeCount = 1,
+                        Privileges = new LUID_AND_ATTRIBUTES { Luid = luid, Attributes = SE_PRIVILEGE_ENABLED }
+                    };
+                    AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+                }
+                finally { CloseHandle(token); }
+            }
+            catch { /* best effort */ }
+        }
+    }
+
+    // Tiny shim so the relay code reads naturally on .NET Framework (no ProcessStartInfo.ArgumentList).
+    internal static class ProcessStartInfoExtensions
+    {
+        public static void ArgumentList_AddSafe(this ProcessStartInfo psi, string arg)
+        {
+            if (string.IsNullOrEmpty(psi.Arguments)) psi.Arguments = QuoteIfNeeded(arg);
+            else psi.Arguments += " " + QuoteIfNeeded(arg);
+        }
+
+        private static string QuoteIfNeeded(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "\"\"";
+            if (s.IndexOfAny(new[] { ' ', '\t', '"' }) < 0) return s;
+            return "\"" + s.Replace("\"", "\\\"") + "\"";
         }
     }
 }

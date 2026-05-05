@@ -12,6 +12,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Net.WebSockets;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -31,6 +32,7 @@ namespace PageSignal.NativeAgent
 
         public static void StartBackground()
         {
+            TryEnablePerMonitorV2DpiAwareness();
             lock (_lock)
             {
                 if (_worker != null && _worker.IsAlive) return;
@@ -50,6 +52,7 @@ namespace PageSignal.NativeAgent
 
         public static void Start()
         {
+            TryEnablePerMonitorV2DpiAwareness();
             CancellationTokenSource cts;
             lock (_lock)
             {
@@ -68,6 +71,33 @@ namespace PageSignal.NativeAgent
             if (cts != null) try { cts.Cancel(); } catch { }
             if (w != null && w != Thread.CurrentThread) try { w.Join(2500); } catch { }
             Logger.Log("agent", "stop requested");
+        }
+
+        // ----------------- PerMonitorV2 DPI awareness -----------------
+        // Belt-and-braces: the host EXE manifest already declares PerMonitorV2, but when the
+        // managed agent is loaded into a third-party process via DLL injection that process'
+        // manifest takes precedence. Try to escalate to PerMonitorV2 programmatically; if the
+        // host has already locked DPI awareness this call simply returns false and we move on.
+        private const int DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4;
+        private const int DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE = -3;
+
+        [DllImport("user32.dll")]
+        private static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+
+        [DllImport("shcore.dll")]
+        private static extern int SetProcessDpiAwareness(int value); // 2 = PerMonitor
+
+        [DllImport("user32.dll")]
+        private static extern bool SetProcessDPIAware();
+
+        private static int _dpiInitialized; // 0 = no, 1 = yes (Interlocked)
+        private static void TryEnablePerMonitorV2DpiAwareness()
+        {
+            if (Interlocked.Exchange(ref _dpiInitialized, 1) == 1) return;
+            try { if (SetProcessDpiAwarenessContext(new IntPtr(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))) return; } catch { }
+            try { if (SetProcessDpiAwarenessContext(new IntPtr(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE))) return; } catch { }
+            try { if (SetProcessDpiAwareness(2) == 0) return; } catch { }
+            try { SetProcessDPIAware(); } catch { }
         }
 
         private static string ProjectDirectory()
