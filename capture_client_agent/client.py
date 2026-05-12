@@ -13,6 +13,7 @@ from urllib.request import urlopen
 from websockets.asyncio.client import connect
 
 from capture_client_agent.input_dispatcher import OsInputDispatcher
+from capture_client_agent.native_popup import NativePopupService
 from capture_client_agent.screen_capture import (
     ScreenCaptureService,
     capture_full_screenshot_png,
@@ -75,6 +76,15 @@ class BackgroundCaptureClient:
             self._screen_capture_service = None
             self._screen_capture_capable = False
             debug_log('client-agent', 'Screen capture disabled.', {'error': screen_capture_unavailable_reason()})
+
+        try:
+            self._native_popup: NativePopupService | None = NativePopupService()
+            self._native_popup_capable = True
+            debug_log('client-agent', 'Native popup service ready.')
+        except RuntimeError as error:
+            self._native_popup = None
+            self._native_popup_capable = False
+            debug_log('client-agent', 'Native popup disabled.', {'error': str(error)})
 
     async def run_forever(self) -> None:
         debug_log(
@@ -197,6 +207,8 @@ class BackgroundCaptureClient:
                     capabilities.append('os-input')
                 if self._screen_capture_capable:
                     capabilities.append('screen-capture')
+                if self._native_popup_capable:
+                    capabilities.append('native-popup')
                 await websocket.send(
                     json.dumps(
                         {
@@ -228,11 +240,11 @@ class BackgroundCaptureClient:
 
     async def _handle_message(self, websocket: Any, raw_message: Any) -> None:
         if isinstance(raw_message, bytes):
-            metadata, _payload_bytes = self._decode_binary_envelope(raw_message)
+            metadata, payload_bytes = self._decode_binary_envelope(raw_message)
             message_type = metadata.get('type')
-            # File-receive is now handled exclusively by the Chrome extension. Any binary
-            # frames the bridge still routes our way (e.g. legacy file-transfer envelopes)
-            # are dropped silently.
+            if message_type == 'file-transfer.upload.binary':
+                await self._handle_native_popup_file_upload(websocket, metadata, payload_bytes)
+                return
             debug_log('client-agent', 'Ignoring binary payload (handled by extension).', {'type': message_type})
             return
 
@@ -258,7 +270,76 @@ class BackgroundCaptureClient:
         if message_type == 'screen-share.stop':
             await self._handle_screen_share_stop(websocket, payload)
             return
+        if message_type == 'popup.show':
+            await self._handle_native_popup_show(websocket, payload)
+            return
         debug_log('client-agent', 'Received text payload.', {'type': message_type})
+
+    async def _send_json(self, websocket: Any, payload: dict[str, Any]) -> None:
+        await websocket.send(json.dumps(payload))
+
+    async def _send_binary_envelope(self, websocket: Any, metadata: dict[str, Any], payload_bytes: bytes) -> None:
+        await websocket.send(self._build_binary_envelope(metadata, payload_bytes))
+
+    def _bind_native_popup_bridge(self, websocket: Any) -> None:
+        if self._native_popup is None:
+            return
+        loop = asyncio.get_running_loop()
+
+        async def send_json(payload: dict[str, Any]) -> None:
+            await self._send_json(websocket, payload)
+
+        async def send_binary(metadata: dict[str, Any], payload_bytes: bytes) -> None:
+            await self._send_binary_envelope(websocket, metadata, payload_bytes)
+
+        self._native_popup.bind_bridge(loop, send_json, send_binary)
+
+    async def _handle_native_popup_show(self, websocket: Any, payload: dict[str, Any]) -> None:
+        request_id = str(payload.get('requestId', ''))
+        if self._native_popup is None:
+            await self._send_json(
+                websocket,
+                {
+                    'type': 'popup.error',
+                    'requestId': request_id,
+                    'message': 'Native popup is unavailable on this agent.',
+                },
+            )
+            return
+        self._bind_native_popup_bridge(websocket)
+        try:
+            status = await self._native_popup.show(str(payload.get('text', '')))
+        except Exception as error:  # noqa: BLE001
+            await self._send_json(
+                websocket,
+                {'type': 'popup.error', 'requestId': request_id, 'message': str(error)},
+            )
+            return
+        await self._send_json(
+            websocket,
+            {'type': 'popup.result', 'requestId': request_id, 'action': status.get('action', 'updated'), 'status': status},
+        )
+
+    async def _handle_native_popup_file_upload(self, websocket: Any, metadata: dict[str, Any], payload_bytes: bytes) -> None:
+        request_id = str(metadata.get('requestId', ''))
+        if self._native_popup is None:
+            await self._send_json(
+                websocket,
+                {'type': 'file-transfer.error', 'requestId': request_id, 'message': 'Native popup is unavailable on this agent.'},
+            )
+            return
+        self._bind_native_popup_bridge(websocket)
+        try:
+            result = await self._native_popup.receive_file(
+                str(metadata.get('fileName', 'shared-file.bin')),
+                payload_bytes,
+                str(metadata.get('mimeType', 'application/octet-stream')),
+            )
+        except Exception as error:  # noqa: BLE001
+            await self._send_json(websocket, {'type': 'file-transfer.error', 'requestId': request_id, 'message': str(error)})
+            return
+        result['requestId'] = request_id
+        await self._send_json(websocket, result)
 
     async def _handle_capture_request(self, websocket: Any, payload: dict[str, Any]) -> None:
         request_id = str(payload.get('requestId', ''))

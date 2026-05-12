@@ -1688,14 +1688,22 @@ class ExtensionBridgeClient {
       return endpoint;
     } catch (error) {
       const messageText = error instanceof Error ? error.message : 'Unknown resolver failure.';
-      debugWarn('offscreen', 'Resolver failed; using fallback endpoint.', messageText);
+      debugWarn('offscreen', 'Resolver failed.', { mode: this.nextEndpointMode, error: messageText });
 
       if (this.nextEndpointMode === 'pastebin') {
         this.nextEndpointMode = 'github';
-      } else {
-        this.nextEndpointMode = 'direct';
-        this.localRetryAttempts = 0;
+        await this.updateStatus({
+          state: 'disconnected',
+          updatedAt: new Date().toISOString(),
+          message: `Pastebin resolver failed: ${messageText}. Trying GitHub raw resolver next.`,
+          lastFileName: null,
+          targetUrl: null
+        });
+        return this.resolveEndpoint(settings, false);
       }
+
+      this.nextEndpointMode = 'direct';
+      this.localRetryAttempts = 0;
 
       const fallbackEndpoint = {
         targetUrl: settings.websocketUrl,
@@ -1706,7 +1714,7 @@ class ExtensionBridgeClient {
       await this.updateStatus({
         state: 'disconnected',
         updatedAt: new Date().toISOString(),
-        message: `Resolver failed: ${messageText}. Continuing with ${fallbackEndpoint.targetUrl}.`,
+        message: `Resolver failed: ${messageText}. Continuing with local bridge ${fallbackEndpoint.targetUrl}.`,
         lastFileName: null,
         targetUrl: fallbackEndpoint.targetUrl
       });

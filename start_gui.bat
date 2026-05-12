@@ -4,7 +4,16 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 
 set "SETUP_ONLY=0"
+set "START_NATIVE=0"
+
+:parse_args
+if "%~1"=="" goto :args_done
 if /I "%~1"=="--setup-only" set "SETUP_ONLY=1"
+if /I "%~1"=="--with-native" set "START_NATIVE=1"
+if /I "%~1"=="--start-native" set "START_NATIVE=1"
+shift
+goto :parse_args
+:args_done
 
 set "PYTHON_BOOTSTRAP="
 where py >nul 2>nul
@@ -61,10 +70,14 @@ if "%SETUP_ONLY%"=="1" (
   exit /b 0
 )
 
-REM Make sure a native client is running before the GUI comes up. The launcher is
-REM idempotent (skips if already running) and prefers EXE -> C# DLL host -> Python
-REM module. Run hidden so it doesn't steal focus from the GUI.
-call "%~dp0capture_client_agent\start.bat" --silent
+if "%START_NATIVE%"=="1" (
+  REM Optional: launch a supervised native client when explicitly requested. The
+  REM default GUI startup only opens the bridge and waits until a real extension,
+  REM EXE, DLL host, or Python client connects and registers.
+  call "%~dp0capture_client_agent\start.bat" --silent
+) else (
+  echo Native client auto-start disabled. The GUI will wait for an extension/native client to connect.
+)
 
 echo Starting Capture Control Center...
 %VENV_PYTHON% -m capture_control_center.app

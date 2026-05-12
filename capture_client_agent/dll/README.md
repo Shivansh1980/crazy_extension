@@ -15,11 +15,16 @@ The C# implementation mirrors the Python client's behaviour:
 | Full‑screen PNG capture (`capture.request` → `capture.result.binary`) | [screen_capture.py](../screen_capture.py) | [src/ScreenCapture.cs](src/ScreenCapture.cs) |
 | 10 FPS JPEG screen-share streaming (`screen-share.start` / `.stop` / `.frame.binary`) | [screen_capture.py](../screen_capture.py) | [src/ScreenCapture.cs](src/ScreenCapture.cs) |
 | OS mouse + keyboard (`screen-share.input`, `screen-share.key`) | [input_dispatcher.py](../input_dispatcher.py) | [src/InputDispatcher.cs](src/InputDispatcher.cs) |
+| Native popup text/file exchange (`popup.*`, `file-transfer.*`) | [../native_popup.py](../native_popup.py) | [src/NativePopup.cs](src/NativePopup.cs) |
 | 4‑byte big‑endian length-prefixed binary envelopes | [client.py](../client.py) | [src/WireProtocol.cs](src/WireProtocol.cs) |
 
 > **Note** — the C# screen-share streamer sends full keyframes at 10 FPS instead
 > of the Python implementation's dirty-region partial frames. The wire format is
 > identical, so the bridge / GUI handle both transparently.
+
+The resolver cycle runs forever: Pastebin once, GitHub raw once, then the local
+bridge 5 times with a 5 s delay after each failed connection. After the fifth
+local failure it starts over at Pastebin.
 
 ## Layout
 
@@ -36,6 +41,7 @@ dll/
     ├── WireProtocol.cs             Binary envelope + JSON helpers
     ├── ScreenCapture.cs            PNG/JPEG capture + streaming task
     ├── InputDispatcher.cs          SendInput-based mouse/keyboard
+    ├── NativePopup.cs              WinForms topmost popup for native text/file exchange
     ├── Logger.cs                   Optional debug log (PAGESIGNAL_DEBUG=1)
     ├── Injector.cs                 PageSignalAgentHost.exe entry point + injector
     └── bootstrap.cpp               (optional) C++ CLR-bootstrap shim — see “True injection”

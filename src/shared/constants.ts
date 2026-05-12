@@ -14,7 +14,7 @@ export const OFFSCREEN_DOCUMENT_PATH = 'offscreen.html';
 export const BRIDGE_CLIENT_NAME = 'page-signal-capture';
 export const BRIDGE_RECONNECT_INTERVAL_MS = 5_000;
 export const BRIDGE_RESOLVER_TIMEOUT_MS = 5_000;
-export const BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD = 10;
+export const BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD = 5;
 
 export const DEFAULT_SETTINGS: ExtensionSettings = {
   enabled: true,

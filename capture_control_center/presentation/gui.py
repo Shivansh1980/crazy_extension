@@ -101,6 +101,9 @@ class CaptureControlWindow:
         self._latest_screen_share_frame: Image.Image | None = None
         self._screen_share_canvas: Image.Image | None = None
         self._screen_share_canvas_size: tuple[int, int] = (0, 0)
+        self._bridge_listen_url = bridge_url
+        self._extension_connection_details: dict | None = None
+        self._native_connection_details: dict | None = None
         self._native_screen_capture_available = False
         self._screen_share_active = False
         self._remote_control_enabled = False
@@ -130,12 +133,12 @@ class CaptureControlWindow:
         self._root.minsize(1120, 740)
         self._root.configure(bg=Palette.BG)
 
-        self._connection_status = tk.StringVar(value=f'Listening on {bridge_url}. Waiting for extension connection...')
+        self._connection_status = tk.StringVar(value=self._format_connection_status())
         self._capture_status = tk.StringVar(value='No screenshot captured yet.')
         self._clipboard_status = tk.StringVar(value='Clipboard idle.')
-        self._popup_status = tk.StringVar(value='Browser popup: unknown')
+        self._popup_status = tk.StringVar(value='Popup: unknown')
         self._screen_share_status = tk.StringVar(value='Screen share: idle.')
-        self._file_transfer_status = tk.StringVar(value='No browser file has been sent yet.')
+        self._file_transfer_status = tk.StringVar(value='No popup file has been sent yet.')
         self._client_uploads_status = tk.StringVar(value='No popup uploads received yet.')
         self._last_file = tk.StringVar(value='Not available')
         self._last_page = tk.StringVar(value='Not available')
@@ -343,8 +346,8 @@ class CaptureControlWindow:
         subtitle = tk.Label(
             header,
             text=(
-                'Capture full-page screenshots, sync exact text to the browser clipboard, manage the in-page popup, '
-                'send local files into the active browser, and review popup-originated messages from one desktop control surface.'
+                'Capture full-page screenshots, sync exact text to the browser clipboard, manage the active popup, '
+                'send local files into the connected popup, and review popup-originated messages from one desktop control surface.'
             ),
             bg=Palette.BG,
             fg=Palette.TEXT_SOFT,
@@ -499,7 +502,7 @@ class CaptureControlWindow:
         self._upload_file_button = self._create_action_button(
             top_row,
             5,
-            '\U0001f4e4  Send File to Browser',
+            '\U0001f4e4  Send File to Popup',
             self._on_upload_file_clicked,
             'Action.TButton',
             top_row_columns,
@@ -592,7 +595,7 @@ class CaptureControlWindow:
             info_box,
             text=(
                 'Paste any text or code below. Tabs, spacing, and line breaks are preserved exactly. '
-                'Send it to the browser clipboard or the in-page popup.'
+                'Send it to the browser clipboard or the connected popup.'
             ),
             bg=Palette.SURFACE,
             fg=Palette.TEXT_SOFT,
@@ -608,7 +611,7 @@ class CaptureControlWindow:
         status_area.grid_columnconfigure(0, weight=1)
 
         self._create_status_row(status_area, 0, 'Clipboard:', self._clipboard_status, 'clipboard')
-        self._create_status_row(status_area, 1, 'Browser Popup:', self._popup_status, 'popup')
+        self._create_status_row(status_area, 1, 'Popup:', self._popup_status, 'popup')
 
         separator = tk.Frame(body, height=1, bg=Palette.BORDER_SOFT)
         separator.grid(row=2, column=0, sticky='ew', pady=(4, 12))
@@ -739,9 +742,9 @@ class CaptureControlWindow:
         if kind == 'file_transfer':
             if 'uploading' in lower or 'sending' in lower or 'preparing' in lower:
                 return 'Sending', Palette.WARNING_BG, Palette.WARNING
-            if ('download' in lower or 'save was triggered' in lower or 'sent to the browser' in lower) and ('started' in lower or 'ready' in lower or 'created' in lower or 'triggered' in lower):
+            if ('download' in lower or 'save was triggered' in lower or 'sent to the browser' in lower or 'sent to the popup' in lower) and ('started' in lower or 'ready' in lower or 'created' in lower or 'triggered' in lower):
                 return 'Ready', Palette.SUCCESS_BG, Palette.SUCCESS
-            if 'no browser file' in lower or 'waiting' in lower:
+            if 'no browser file' in lower or 'no popup file' in lower or 'waiting' in lower:
                 return 'Idle', Palette.INFO_BG, Palette.INFO
             return 'Idle', Palette.SUCCESS_BG, Palette.SUCCESS
 
@@ -1094,7 +1097,7 @@ class CaptureControlWindow:
         text = self._clipboard_input.get('1.0', 'end-1c')
         debug_log('python-gui', 'Popup send button clicked.', {'characters': len(text)})
         self._send_popup_button.state(['disabled'])
-        self._popup_status.set('Sending text to the browser popup...')
+        self._popup_status.set('Sending text to the popup...')
         self._pending_popup = self._controller.send_popup_text(text)
         self._pending_popup.add_done_callback(self._on_send_popup_finished)
 
@@ -1118,7 +1121,7 @@ class CaptureControlWindow:
         if self._pending_file_upload is not None and not self._pending_file_upload.done():
             return
 
-        selected_path = filedialog.askopenfilename(parent=self._root, title='Select a file to send to the browser')
+        selected_path = filedialog.askopenfilename(parent=self._root, title='Select a file to send to the popup')
         if not selected_path:
             return
 
@@ -1130,7 +1133,7 @@ class CaptureControlWindow:
         debug_log('python-gui', 'File upload button clicked.', {'file_path': str(file_path)})
         if self._upload_file_button is not None:
             self._upload_file_button.state(['disabled'])
-        self._file_transfer_status.set(f'Sending {file_path.name} to the browser...')
+        self._file_transfer_status.set(f'Sending {file_path.name} to the popup...')
         self._pending_file_upload = self._controller.send_file_to_browser(file_path)
         self._pending_file_upload.add_done_callback(self._on_upload_file_finished)
 
@@ -1144,10 +1147,10 @@ class CaptureControlWindow:
             except Exception as error:
                 debug_log('python-gui', 'File upload failed in GUI callback.', str(error))
                 self._file_transfer_status.set(str(error))
-                messagebox.showerror('Browser file send failed', str(error))
+                messagebox.showerror('Popup file send failed', str(error))
                 return
 
-            message = str(result.get('message', 'Browser file delivery started.'))
+            message = str(result.get('message', 'Popup file delivery started.'))
             self._file_transfer_status.set(message)
             debug_log('python-gui', 'File upload finished successfully.', result)
 
@@ -1335,10 +1338,11 @@ class CaptureControlWindow:
         page_url = payload.get('page_url') or 'active page'
 
         if not exists:
-            return 'Browser popup: not present on the active page.'
+            return 'Popup: not present in the current provider.'
 
         action_suffix = f' ({action})' if action and action != 'status' else ''
-        return f'Browser popup: {state}{action_suffix} on {page_url} with {text_length} characters.'
+        provider = 'native popup' if page_url == 'native-popup' else page_url
+        return f'Popup: {state}{action_suffix} on {provider} with {text_length} characters.'
 
     def _format_screen_share_status(self, payload: dict) -> str:
         state = str(payload.get('state', 'idle'))
@@ -2439,7 +2443,7 @@ class CaptureControlWindow:
             ).pack(anchor='w')
             tk.Label(
                 empty_state,
-                text='When a user sends a file from the browser popup, it will appear here and be saved in the client_uploads folder.',
+                text='When a user sends a file from the popup, it will appear here and be saved in the client_uploads folder.',
                 bg=Palette.SURFACE,
                 fg=Palette.MUTED,
                 font=('Segoe UI', 9),
@@ -2558,35 +2562,59 @@ class CaptureControlWindow:
 
         self._root.after(self._event_poll_interval_ms, self._poll_events)
 
-    def _handle_controller_event(self, event_name: str, payload: dict) -> None:
-        if event_name == 'server_started':
-            debug_log('python-gui', 'Received GUI event.', event_name)
-            self._connection_status.set(f'Listening on ws://{payload["host"]}:{payload["port"]}. Waiting for extension connection...')
-        elif event_name == 'client_connected':
-            debug_log('python-gui', 'Received GUI event.', event_name)
-            self._connection_status.set(
-                f'Extension connected: {payload["name"]} {payload["version"]} ({payload["client_id"]}).'
+    def _format_connection_status(self, last_event_message: str | None = None) -> str:
+        connected_parts: list[str] = []
+
+        if self._extension_connection_details is not None:
+            extension = self._extension_connection_details
+            connected_parts.append(
+                f'extension: {extension.get("name", "unknown")} {extension.get("version", "unknown")} '
+                f'({extension.get("client_id", "unknown")})'
             )
-        elif event_name == 'client_disconnected':
-            debug_log('python-gui', 'Received GUI event.', event_name)
-            self._connection_status.set(payload['message'])
-        elif event_name == 'native_input_connected':
-            debug_log('python-gui', 'Received GUI event.', event_name)
-            capabilities = payload.get('capabilities') or []
-            self._native_screen_capture_available = 'screen-capture' in capabilities
+
+        if self._native_connection_details is not None:
+            native = self._native_connection_details
+            capabilities = native.get('capabilities') or []
             extras = []
             if 'os-input' in capabilities:
                 extras.append('OS input')
             if 'screen-capture' in capabilities:
                 extras.append('native screen capture')
             extras_text = f' ({", ".join(extras)})' if extras else ''
-            self._connection_status.set(
-                f'Native client connected: {payload["name"]} {payload["version"]}{extras_text}. Browser permission no longer required.'
+            connected_parts.append(
+                f'native: {native.get("name", "unknown")} {native.get("version", "unknown")}{extras_text}'
             )
+
+        if connected_parts:
+            return 'Connected: ' + '; '.join(connected_parts) + '.'
+
+        suffix = f' Last event: {last_event_message}' if last_event_message else ''
+        return f'Listening on {self._bridge_listen_url}. Waiting for extension or native client registration...{suffix}'
+
+    def _handle_controller_event(self, event_name: str, payload: dict) -> None:
+        if event_name == 'server_started':
+            debug_log('python-gui', 'Received GUI event.', event_name)
+            self._bridge_listen_url = f'ws://{payload["host"]}:{payload["port"]}'
+            self._connection_status.set(self._format_connection_status())
+        elif event_name == 'client_connected':
+            debug_log('python-gui', 'Received GUI event.', event_name)
+            self._extension_connection_details = dict(payload)
+            self._connection_status.set(self._format_connection_status())
+        elif event_name == 'client_disconnected':
+            debug_log('python-gui', 'Received GUI event.', event_name)
+            self._extension_connection_details = None
+            self._connection_status.set(self._format_connection_status(payload.get('message')))
+        elif event_name == 'native_input_connected':
+            debug_log('python-gui', 'Received GUI event.', event_name)
+            capabilities = payload.get('capabilities') or []
+            self._native_screen_capture_available = 'screen-capture' in capabilities
+            self._native_connection_details = dict(payload)
+            self._connection_status.set(self._format_connection_status())
         elif event_name == 'native_input_disconnected':
             debug_log('python-gui', 'Received GUI event.', event_name)
             self._native_screen_capture_available = False
-            self._connection_status.set(payload['message'])
+            self._native_connection_details = None
+            self._connection_status.set(self._format_connection_status(payload.get('message')))
         elif event_name == 'capture_failed':
             debug_log('python-gui', 'Received GUI event.', payload)
             self._capture_status.set(payload['message'])
@@ -2621,12 +2649,12 @@ class CaptureControlWindow:
             self._close_screen_share_window()
         elif event_name == 'file_transfer_status':
             debug_log('python-gui', 'Received GUI event.', payload)
-            self._file_transfer_status.set(str(payload.get('message', 'Browser file delivery started.')))
+            self._file_transfer_status.set(str(payload.get('message', 'Popup file delivery started.')))
         elif event_name == 'popup_file_saved':
             debug_log('python-gui', 'popup_file_saved event received.', payload)
             file_name = str(payload.get('file_name', 'client-upload.bin'))
             file_path = str(payload.get('file_path', ''))
-            self._client_uploads_status.set(f'Received {file_name} from the browser popup.')
+            self._client_uploads_status.set(f'Received {file_name} from the popup.')
             self._show_toast(f'{file_name} saved to client uploads.')
             # Always refresh; if the window was opened earlier its container exists, otherwise
             # the next open will pick up the new file via the open-handler refresh anyway.

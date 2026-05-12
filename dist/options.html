@@ -232,11 +232,11 @@
             <div class="field">
               <label for="connection-mode">Connection mode</label>
               <select id="connection-mode" name="connectionMode" style="width: 100%; padding: 14px 16px; border-radius: 16px; border: 1px solid var(--border); background: rgba(255, 255, 255, 0.92); color: var(--text);">
-                <option value="auto">Auto — try local, then resolver, then relay</option>
+                <option value="auto">Auto — Pastebin once, GitHub once, local 5 times, then relay</option>
                 <option value="relay">Relay — always use the relay server</option>
-                <option value="tunnel">Tunnel — local + resolver only (no relay)</option>
+                <option value="tunnel">Tunnel — resolver + local only (no relay)</option>
               </select>
-              <p class="hint">Pick how the extension should reach the Python GUI. Auto is recommended.</p>
+              <p class="hint">Pick how the extension should reach the Python GUI. Auto is recommended: Pastebin once, GitHub once, then the local bridge 5 times with 5 s backoff.</p>
             </div>
 
             <div class="field">
@@ -254,7 +254,7 @@
             <div class="field">
               <label for="websocket-url">Desktop bridge WebSocket URL</label>
               <input id="websocket-url" name="websocketUrl" type="text" placeholder="ws://127.0.0.1:8765" />
-              <p class="hint">Used as the direct fallback bridge target. Keep this as your local server unless you want a different default.</p>
+              <p class="hint">Used after Pastebin and GitHub raw resolver attempts fail. Keep this as your local server unless you want a different default.</p>
             </div>
 
             <div class="field">

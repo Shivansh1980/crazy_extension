@@ -3,7 +3,7 @@
 Page Signal Capture now consists of two cooperating applications:
 
 - A Manifest V3 Chrome extension that maintains a resilient local WebSocket client in an offscreen document and captures full-page screenshots on demand.
-- A Python desktop control center that exposes the WebSocket server, lets the user trigger captures from a GUI, previews the latest image, saves each screenshot into an `images` folder under the current working directory, can push raw text or code into the browser clipboard, and can show the same text inside a draggable in-page popup.
+- A Python desktop control center that exposes the WebSocket server, lets the user trigger captures from a GUI, previews the latest image, saves each screenshot into an `images` folder under the current working directory, can push raw text or code into the browser clipboard, and can show the same text/files in the active popup. When the extension is connected that popup is injected into the active browser page; when only a native EXE/DLL client is connected it falls back to a topmost native popup.
 
 ## Setup — first time on a fresh Windows machine
 
@@ -30,8 +30,10 @@ Steps:
    This creates `.venv\`, runs `pip install -r requirements.txt` (which now
    includes the optional `dxcam` package on Windows for HW-accelerated screen
    capture — see [Robust desktop screen capture](#robust-desktop-screen-capture)),
-   and launches the Tkinter GUI. Leave the window open; it is the WebSocket
-   server.
+    and launches the Tkinter GUI. Leave the window open; it is the WebSocket
+    server. The GUI does **not** auto-start any native client; its status stays
+    waiting until the extension, EXE, DLL host, or Python client actually
+    connects and sends `client.register`.
 3. **Build the Chrome extension** (only needed once unless `src/` changes):
    ```powershell
    .\build_extension.bat
@@ -52,6 +54,11 @@ Steps:
    .\capture_client_agent\start.bat --silent
    ```
    Logs land in `%TEMP%\PageSignalNativeClient.out.log`.
+    If you intentionally want one command to open the GUI and silently start the
+    native client, use:
+    ```powershell
+    .\start_gui.bat --with-native
+    ```
 
 That's everything. Click **Capture screenshot** in the GUI to verify the
 browser <-> server <-> agent loop.
@@ -95,7 +102,8 @@ Then load `dist\` in `chrome://extensions` (Developer mode → Load unpacked).
 
 | You want to... | Command |
 |---|---|
-| Start the GUI + WebSocket server | `.\start_gui.bat` |
+| Start the GUI + WebSocket server only | `.\start_gui.bat` |
+| Start the GUI and opt into silent native-client launch | `.\start_gui.bat --with-native` |
 | Start the native client (visible, supervised) | `.\capture_client_agent\start.bat` |
 | Start the native client (silent, detached, always-on) | `.\capture_client_agent\start.bat --silent` |
 | Rebuild the Chrome extension after editing `src/` | `.\build_extension.bat` |
@@ -105,10 +113,13 @@ Then load `dist\` in `chrome://extensions` (Developer mode → Load unpacked).
 
 ### Common first-run problems
 
-- **GUI says "no client connected"**: the extension's offscreen document still
-  needs to find a bridge endpoint. Either let the resolver chain run (it tries
-  Pastebin → GitHub raw → `ws://127.0.0.1:8765` automatically with 5 s
-  backoff) or open the extension Options page and set the URL manually.
+- **GUI keeps saying it is waiting for a client**: this is expected until a
+  real extension/native process connects and sends `client.register`. Start the
+  extension or run `capture_client_agent\start.bat`; the GUI no longer launches
+  the EXE/DLL automatically.
+- **Extension does not connect**: let the resolver chain run (it tries Pastebin
+  once → GitHub raw once → local bridge 5 times with 5 s backoff, then repeats)
+  or open the extension Options page and set the URL manually.
 - **Screenshots arrive but screen-share frames are black**: the foreground
   app is hardware-accelerated. Make sure `dxcam` installed cleanly
   (`pip show dxcam`); see
@@ -142,8 +153,8 @@ The browser APIs and GUI concerns stay behind focused abstractions so capture qu
 1. Start the Python GUI server.
 2. The extension offscreen document checks the configured Pastebin resolver first and tries the latest resolved tunnel endpoint before anything else.
 	If that resolver lookup or tunnel connection fails, it tries the GitHub raw fallback at `https://raw.githubusercontent.com/Shivansh1980/crazy_extension/refs/heads/main/server_url.txt`.
-	If that also fails, it falls back to `ws://127.0.0.1:8765` and retries localhost every 5 seconds for up to 10 attempts.
-	After those 10 localhost failures, it repeats the same cycle: Pastebin, then GitHub raw, then localhost.
+  If that also fails, it falls back to `ws://127.0.0.1:8765` and retries localhost every 5 seconds for up to 5 attempts.
+  After those 5 localhost failures, it repeats the same cycle: Pastebin once, GitHub raw once, then localhost 5 times.
 3. The user clicks **Capture screenshot** in the Python GUI.
 4. The Python server sends a WebSocket request to the extension.
 5. The extension captures the active page with `chrome.debugger` and `Page.captureScreenshot` using `captureBeyondViewport`.
@@ -159,19 +170,23 @@ Clipboard flow:
 
 Popup flow:
 
-1. Use the same advanced editor in the Python GUI and click **Send text to browser popup**.
-2. The extension injects or updates a floating popup on the active page.
-3. The popup stays above the page, can be dragged, resized, minimized into a compact icon, restored, copied from, or closed completely.
-4. Sending again updates the existing popup text instead of creating duplicates.
-5. The Python GUI shows the current popup state reported by the extension: open, minimized, or not present.
-6. You can also press `Alt+P` in Chrome to toggle the popup on the active tab: if it is missing it opens, and if it is already present it closes.
+1. Use the same advanced editor in the Python GUI and click **Send Text to Popup**.
+2. The bridge chooses the provider automatically: the Chrome extension wins when it is connected; otherwise a native client with `native-popup` capability handles the request.
+3. With the extension provider, the extension injects or updates a floating popup on the active page. With the native provider, the Python EXE/client or C# DLL/host opens a topmost native popup in that native path.
+4. The popup can be dragged, resized, copied from, used to upload/send files or text back to the GUI, and controlled with an opacity slider.
+5. Sending again updates the existing popup text instead of creating duplicates.
+6. The Python GUI shows the current popup state reported by the active provider: open, minimized, or not present.
+7. You can also press `Alt+P` in Chrome to toggle the browser page popup on the active tab when the extension provider is connected.
+
+Native popup focus note: Windows allows a popup to be topmost and shown without intentionally stealing focus, but typing into the popup requires keyboard focus by OS design. The native popup uses best-effort topmost/no-activate behavior for display, then accepts focus when the user clicks or tabs into its editor.
 
 File transfer flow:
 
-1. Click **Send File to Browser** in the Python GUI and choose any file.
-2. The Python bridge sends the selected file to the extension over the existing WebSocket bridge.
-3. The extension first tries the browser downloads API and falls back to a tab-triggered save flow when the browser does not expose that API.
-4. If the browser supports managed downloads, its normal uniquify behavior is used instead of overwriting an older file.
+1. Click **Send File to Popup** in the Python GUI and choose any file.
+2. The Python bridge sends the selected file to the active popup provider over the existing WebSocket bridge.
+3. With the extension provider, the extension first tries the browser downloads API and falls back to a tab-triggered save flow when the browser does not expose that API.
+4. With the native provider, the file is saved locally by the native popup and the popup is raised with a received-file status.
+5. If the browser supports managed downloads, its normal uniquify behavior is used instead of overwriting an older file.
 
 ## Why this capture strategy
 
@@ -242,7 +257,7 @@ build_extension.bat
 ## Runtime behavior
 
 - The extension keeps a persistent offscreen WebSocket client and retries every 5 seconds if the Python server restarts or the tunnel changes.
-- The extension uses a resolver-first reconnect strategy: it checks Pastebin first, then the GitHub raw fallback, then localhost for up to 10 attempts, and repeats that cycle until a bridge endpoint comes back.
+- The extension uses a resolver-first reconnect strategy: it checks Pastebin once, then the GitHub raw fallback once, then localhost for up to 5 attempts with 5 s between failures, and repeats that cycle until a bridge endpoint comes back.
 - Browser support is capability-based: Chrome, Edge, and Brave share the same Chromium path when the required APIs exist, and unsupported features degrade independently instead of taking down the whole extension.
 - Full-page screenshot capture remains debugger-based; if a browser does not expose the required debugger APIs, popup, clipboard, and bridge features continue to work while capture reports that it is unavailable.
 - The Python server uses WebSocket heartbeats and request timeouts so failures surface cleanly instead of hanging forever.

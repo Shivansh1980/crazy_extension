@@ -6,8 +6,8 @@ REM Idempotent launcher + crash supervisor for the Page Signal native client.
 REM
 REM Already running? -> exit 0 (no-op).
 REM Otherwise pick the best available implementation, in this order:
-REM   1) capture_client_agent\exe\dist\PageSignalNativeClient.exe   (PyInstaller)
-REM   2) capture_client_agent\dll\dist\PageSignalAgentHost.exe      (C# DLL host)
+REM   1) capture_client_agent\dll\dist\PageSignalAgentHost.exe      (C# DLL host)
+REM   2) capture_client_agent\exe\dist\PageSignalNativeClient.exe   (PyInstaller)
 REM   3) .venv\Scripts\python.exe -m capture_client_agent           (dev fallback)
 REM
 REM Usage:
@@ -69,19 +69,19 @@ set "TARGET_PATH="
 set "TARGET_ARGS="
 set "TARGET_DIR="
 
-if exist "capture_client_agent\exe\dist\PageSignalNativeClient.exe" (
-  set "TARGET_KIND=exe"
-  set "TARGET_PATH=%CD%\capture_client_agent\exe\dist\PageSignalNativeClient.exe"
-  set "TARGET_DIR=%CD%\capture_client_agent\exe\dist"
-  set "TARGET_ARGS="
-  goto :launch
-)
-
 if exist "capture_client_agent\dll\dist\PageSignalAgentHost.exe" (
   set "TARGET_KIND=dll-host"
   set "TARGET_PATH=%CD%\capture_client_agent\dll\dist\PageSignalAgentHost.exe"
   set "TARGET_DIR=%CD%\capture_client_agent\dll\dist"
   set "TARGET_ARGS=run"
+  goto :launch
+)
+
+if exist "capture_client_agent\exe\dist\PageSignalNativeClient.exe" (
+  set "TARGET_KIND=exe"
+  set "TARGET_PATH=%CD%\capture_client_agent\exe\dist\PageSignalNativeClient.exe"
+  set "TARGET_DIR=%CD%\capture_client_agent\exe\dist"
+  set "TARGET_ARGS="
   goto :launch
 )
 
@@ -128,14 +128,14 @@ set /a INNER_LOOPS+=1
 set "INNER_TARGET_PATH="
 set "INNER_TARGET_DIR="
 set "INNER_TARGET_ARGS="
-if exist "capture_client_agent\exe\dist\PageSignalNativeClient.exe" (
-  set "INNER_TARGET_PATH=%CD%\capture_client_agent\exe\dist\PageSignalNativeClient.exe"
-  set "INNER_TARGET_DIR=%CD%\capture_client_agent\exe\dist"
-  set "INNER_TARGET_ARGS="
-) else if exist "capture_client_agent\dll\dist\PageSignalAgentHost.exe" (
+if exist "capture_client_agent\dll\dist\PageSignalAgentHost.exe" (
   set "INNER_TARGET_PATH=%CD%\capture_client_agent\dll\dist\PageSignalAgentHost.exe"
   set "INNER_TARGET_DIR=%CD%\capture_client_agent\dll\dist"
   set "INNER_TARGET_ARGS=run"
+) else if exist "capture_client_agent\exe\dist\PageSignalNativeClient.exe" (
+  set "INNER_TARGET_PATH=%CD%\capture_client_agent\exe\dist\PageSignalNativeClient.exe"
+  set "INNER_TARGET_DIR=%CD%\capture_client_agent\exe\dist"
+  set "INNER_TARGET_ARGS="
 ) else if exist ".venv\Scripts\python.exe" (
   set "INNER_TARGET_PATH=%CD%\.venv\Scripts\python.exe"
   set "INNER_TARGET_DIR=%CD%"

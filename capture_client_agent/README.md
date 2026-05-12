@@ -3,7 +3,9 @@
 All native-client artifacts live in this folder. The agent is the desktop-side
 counterpart to the Chrome extension: it connects back to the GUI bridge over
 WebSocket and provides full-screen capture, OS-level mouse/keyboard input, and
-screen-share streaming.
+screen-share streaming. It also exposes the `native-popup` capability so the
+GUI can use the same popup/text/file workflow when the Chrome extension is not
+connected.
 
 ## Folder layout
 
@@ -16,6 +18,7 @@ capture_client_agent/
 ├── app.py                          asyncio orchestrator
 ├── client.py                       WebSocket client + resolver chain
 ├── input_dispatcher.py             pyautogui-based OS input
+├── native_popup.py                 Tk popup fallback for text/file exchange
 ├── screen_capture.py               mss + Pillow capture & streaming
 ├── capture_backends.py             robust capture chain (DXGI → GDI fallback,
 │                                    auto-demote on black frames)
@@ -46,28 +49,44 @@ capture_client_agent/
 
 | Implementation | Best for | Built by |
 |---|---|---|
-| `exe/dist/PageSignalNativeClient.exe` (PyInstaller) | end users — single-file, no Python required | `exe/build.bat` |
-| `dll/dist/PageSignalAgentHost.exe` (C# host) | machines without Python; or as an injectable DLL | `dll/build.bat` |
+| `dll/dist/PageSignalAgentHost.exe` (C# host) | primary Windows runtime; supports native popup and DLL injection | `dll/build.bat` |
+| `exe/dist/PageSignalNativeClient.exe` (PyInstaller) | fallback single-file Python client; popup requires a working bundled Tcl/Tk runtime | `exe/build.bat` |
 | `python -m capture_client_agent` (this package) | developers iterating in the repo venv | n/a |
 
 All three speak the same protocol with the GUI bridge (`client.register`,
 `capture.request`/`capture.result.binary`, `screen-share.*`,
-`screen-share.input` / `screen-share.key`). Pick whichever fits your deployment.
+`screen-share.input` / `screen-share.key`, `popup.*`, and `file-transfer.*`).
+Pick whichever fits your deployment. The bridge prefers the Chrome extension
+for popup work when it is connected; otherwise it routes popup text/files to a
+native client that registered `native-popup`.
+
+Native popup behavior:
+
+- Python/native EXE path: uses `native_popup.py` and Tkinter.
+- C# DLL/host path: uses an in-process WinForms popup from `dll/src/NativePopup.cs`.
+- Incoming files are saved locally and reported back through `file-transfer.result`.
+- Outgoing popup text/files use the same `popup.message` and `popup-file.binary`
+   events the browser popup already uses.
+- Windows can show the popup topmost without intentionally stealing focus, but
+   typing into the popup still requires keyboard focus by OS design.
 
 ## Quick start
 
 ```powershell
-# Recommended: launch the GUI; it auto-starts the best available native client.
+# Launch the GUI only. It listens and waits until a real extension/native client connects.
 .\start_gui.bat
 
-# Or just the native client (idempotent + supervised — always re-launches on crash):
+# Launch the native client explicitly (idempotent + supervised — always re-launches on crash):
 capture_client_agent\start.bat            # visible console, supervised
 capture_client_agent\start.bat --silent   # detached + hidden + supervised,
                                           # logs to %TEMP%\PageSignalNativeClient.out.log
+
+# Optional convenience: GUI + silent native client in one command.
+.\start_gui.bat --with-native
 ```
 
-`start.bat` resolves a target in this order: `exe\dist\PageSignalNativeClient.exe`
-→ `dll\dist\PageSignalAgentHost.exe run` → `python -m capture_client_agent`
+`start.bat` resolves a target in this order: `dll\dist\PageSignalAgentHost.exe run`
+→ `exe\dist\PageSignalNativeClient.exe` → `python -m capture_client_agent`
 (repo venv).
 
 ## Always-on supervisor (“runs until I stop it” guarantee)
@@ -83,7 +102,8 @@ unhandled exception, AV kill, even a hard SEH crash — the supervisor waits
 
 Inside the agent itself, the resolver chain (Pastebin → GitHub raw → local
 `server_url.txt` → `ws://127.0.0.1:8765`) is also looped forever with a 5 s
-backoff between failed endpoints. So a transient internet outage, a bridge
+backoff between failed endpoints. Each cycle tries Pastebin once, GitHub raw
+once, then the local bridge 5 times before starting over. So a transient internet outage, a bridge
 restart, or even the user's laptop sleeping/waking are all recovered
 automatically without anyone touching anything.
 
@@ -179,5 +199,6 @@ extension):
 3. local `server_url.txt` next to the binary
 4. `ws://127.0.0.1:8765` (final fallback)
 
-Each connection failure waits 5 s before trying the next endpoint. The agent
-runs forever, automatically reconnecting until it is stopped.
+Each cycle tries the remote resolvers once and the local bridge 5 times. Each
+connection failure waits 5 s before trying the next endpoint. The agent runs
+forever, automatically reconnecting until it is stopped.

@@ -21,7 +21,7 @@ var init_constants = __esm({
     BRIDGE_CLIENT_NAME = "page-signal-capture";
     BRIDGE_RECONNECT_INTERVAL_MS = 5e3;
     BRIDGE_RESOLVER_TIMEOUT_MS = 5e3;
-    BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD = 10;
+    BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD = 5;
     DEFAULT_SETTINGS = {
       enabled: true,
       websocketUrl: DEFAULT_WEBSOCKET_URL,
@@ -1399,13 +1399,20 @@ var require_offscreen = __commonJS({
           return endpoint;
         } catch (error) {
           const messageText = error instanceof Error ? error.message : "Unknown resolver failure.";
-          debugWarn("offscreen", "Resolver failed; using fallback endpoint.", messageText);
+          debugWarn("offscreen", "Resolver failed.", { mode: this.nextEndpointMode, error: messageText });
           if (this.nextEndpointMode === "pastebin") {
             this.nextEndpointMode = "github";
-          } else {
-            this.nextEndpointMode = "direct";
-            this.localRetryAttempts = 0;
+            await this.updateStatus({
+              state: "disconnected",
+              updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+              message: `Pastebin resolver failed: ${messageText}. Trying GitHub raw resolver next.`,
+              lastFileName: null,
+              targetUrl: null
+            });
+            return this.resolveEndpoint(settings, false);
           }
+          this.nextEndpointMode = "direct";
+          this.localRetryAttempts = 0;
           const fallbackEndpoint = {
             targetUrl: settings.websocketUrl,
             source: "direct",
@@ -1414,7 +1421,7 @@ var require_offscreen = __commonJS({
           await this.updateStatus({
             state: "disconnected",
             updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
-            message: `Resolver failed: ${messageText}. Continuing with ${fallbackEndpoint.targetUrl}.`,
+            message: `Resolver failed: ${messageText}. Continuing with local bridge ${fallbackEndpoint.targetUrl}.`,
             lastFileName: null,
             targetUrl: fallbackEndpoint.targetUrl
           });

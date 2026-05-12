@@ -174,9 +174,10 @@ class RelayBridgeClient:
         )
 
     async def request_popup_show(self, text: str, timeout_seconds: float = 15.0) -> dict[str, Any]:
+        target = self._select_popup_target()
         return await self._simple_request(
             self._pending_popup,
-            ROLE_EXTENSION_CLIENT,
+            target,
             {'type': 'popup.show', 'text': text},
             timeout_seconds,
             'popup',
@@ -288,6 +289,7 @@ class RelayBridgeClient:
         request_id = self._new_request_id()
         future = self._loop_future()
         self._pending_file_upload[request_id] = future
+        target = self._select_popup_target()
         metadata = {
             'type': 'file-transfer.upload.binary',
             'requestId': request_id,
@@ -295,10 +297,11 @@ class RelayBridgeClient:
             'mimeType': mime_type,
             'byteCount': len(file_bytes),
             'uploadedAt': time.time(),
-            '_target': ROLE_EXTENSION_CLIENT,
+            '_target': target,
         }
         envelope = build_binary_envelope(metadata, file_bytes)
         try:
+            self._ensure_role_connected(target)
             await self._send_binary(envelope)
         except Exception:
             self._pending_file_upload.pop(request_id, None)
@@ -354,16 +357,29 @@ class RelayBridgeClient:
             return ROLE_NATIVE_INPUT_CLIENT
         return ROLE_EXTENSION_CLIENT
 
+    def _select_popup_target(self) -> str:
+        if self._extension_registration is not None:
+            return ROLE_EXTENSION_CLIENT
+        if (
+            self._native_input_registration is not None
+            and 'native-popup' in self._native_input_registration.capabilities
+        ):
+            return ROLE_NATIVE_INPUT_CLIENT
+        raise RuntimeError('No popup provider is connected. Connect the Chrome extension or start the native client agent.')
+
+    def _ensure_role_connected(self, target_role: str) -> None:
+        if target_role == ROLE_EXTENSION_CLIENT and self._extension_registration is None:
+            raise RuntimeError('The Chrome extension is not connected to the relay yet.')
+        if target_role == ROLE_NATIVE_INPUT_CLIENT and self._native_input_registration is None:
+            raise RuntimeError('The native input client is not connected to the relay yet.')
+
     async def _send_to_role(self, target_role: str, payload: dict[str, Any]) -> None:
         if not self._authenticated:
             raise RuntimeError(
                 'Relay is not connected/authenticated yet. Verify the relay server is reachable and '
                 'your credentials are correct.'
             )
-        if target_role == ROLE_EXTENSION_CLIENT and self._extension_registration is None:
-            raise RuntimeError('The Chrome extension is not connected to the relay yet.')
-        if target_role == ROLE_NATIVE_INPUT_CLIENT and self._native_input_registration is None:
-            raise RuntimeError('The native input client is not connected to the relay yet.')
+        self._ensure_role_connected(target_role)
         framed = {**payload, '_target': target_role}
         await self._send_text(framed)
 

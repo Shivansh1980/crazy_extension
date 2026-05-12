@@ -11,6 +11,7 @@ env/
 .vscode/
 images/
 client_uploads/
+server_url.local.txt
 *.log
 *.tmp
 *.temp
@@ -31,14 +32,15 @@ Thumbs.db
 .DS_Store
 desktop.ini
 
-# Chrome extension build output (rebuild with build_extension.bat)
-/dist/
-*.js.map
+# Chrome extension debug maps (extension runtime assets in /dist are kept so a
+# second PC can load the unpacked extension without rebuilding)
+/dist/**/*.map
 
 # Legacy/native-client build output paths
 capture_client_agent/build/
 capture_client_agent/dist/
 capture_client_agent/PageSignalNativeClient.spec
+dist_native_client/
 
 # PyInstaller native-client intermediates (rebuild with capture_client_agent/exe/build.bat)
 capture_client_agent/exe/build/
@@ -59,4 +61,9 @@ capture_client_agent/dll/dist/*
 *.ilk
 *.exp
 *.lib
+
+# Native/compiler scratch files
+*.tlog
+*.lastbuildstate
+*.manifest.intermediate
 

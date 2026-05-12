@@ -95,6 +95,18 @@ class BridgeServer:
             return self._extension_connection, 'extension'
         return None, 'none'
 
+    def _select_popup_connection_locked(self) -> tuple[ServerConnection | None, str]:
+        """Pick popup provider. Browser extension wins; native popup is fallback only."""
+        if self._extension_connection is not None and self._extension_registration is not None:
+            return self._extension_connection, 'extension'
+        if (
+            self._native_input_connection is not None
+            and self._native_input_registration is not None
+            and 'native-popup' in self._native_input_registration.capabilities
+        ):
+            return self._native_input_connection, 'native-popup'
+        return None, 'none'
+
     async def request_capture(self, timeout_seconds: float = 20.0) -> ScreenshotResult:
         debug_log('python-bridge', 'Preparing capture request.', {'timeout_seconds': timeout_seconds})
         request_id = str(uuid.uuid4())
@@ -169,9 +181,9 @@ class BridgeServer:
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
 
         async with self._lock:
-            connection = self._extension_connection
-            if connection is None or self._extension_registration is None:
-                raise RuntimeError('The Chrome extension is not connected. Open the extension options and reconnect the bridge.')
+            connection, provider = self._select_popup_connection_locked()
+            if connection is None:
+                raise RuntimeError('No popup provider is connected. Connect the Chrome extension or start the native client agent.')
 
             self._pending_popup_requests[request_id] = future
             try:
@@ -180,7 +192,7 @@ class BridgeServer:
                 self._pending_popup_requests.pop(request_id, None)
                 raise
 
-        debug_log('python-bridge', 'Popup show request sent to extension.', {'request_id': request_id, 'characters': len(text)})
+        debug_log('python-bridge', 'Popup show request sent.', {'request_id': request_id, 'characters': len(text), 'provider': provider})
 
         try:
             return await asyncio.wait_for(future, timeout=timeout_seconds)
@@ -426,9 +438,9 @@ class BridgeServer:
         }
 
         async with self._lock:
-            connection = self._extension_connection
-            if connection is None or self._extension_registration is None:
-                raise RuntimeError('The Chrome extension is not connected. Open the extension options and reconnect the bridge.')
+            connection, provider = self._select_popup_connection_locked()
+            if connection is None:
+                raise RuntimeError('No file receiver is connected. Connect the Chrome extension or start the native client agent.')
 
             self._pending_file_upload_requests[request_id] = future
             try:
@@ -437,7 +449,7 @@ class BridgeServer:
                 self._pending_file_upload_requests.pop(request_id, None)
                 raise
 
-        debug_log('python-bridge', 'File upload request sent to extension.', {'request_id': request_id, 'file_name': file_name, 'bytes': len(file_bytes)})
+        debug_log('python-bridge', 'File upload request sent.', {'request_id': request_id, 'file_name': file_name, 'bytes': len(file_bytes), 'provider': provider})
 
         try:
             return await asyncio.wait_for(future, timeout=timeout_seconds)
