@@ -65,6 +65,7 @@ from typing import Any, Awaitable, Callable, Iterable
 
 try:
     from websockets.asyncio.server import ServerConnection, serve
+    from websockets.datastructures import Headers
     from websockets.exceptions import ConnectionClosed
     from websockets.http11 import Response  # type: ignore
 except ImportError as exc:  # pragma: no cover - import-time check
@@ -81,6 +82,18 @@ except ImportError as exc:  # pragma: no cover - import-time check
 
 
 LOGGER = logging.getLogger('relay')
+WEBSOCKET_SERVER_LOGGER = logging.getLogger('relay.websocket')
+WEBSOCKET_SERVER_LOGGER.addHandler(logging.NullHandler())
+WEBSOCKET_SERVER_LOGGER.propagate = False
+WEBSOCKET_SERVER_LOGGER.setLevel(logging.CRITICAL)
+
+
+def _plain_text_response(status_code: int, reason: str, body: bytes, upgrade: bool = False) -> Response:
+    headers = Headers()
+    headers['content-type'] = 'text/plain; charset=utf-8'
+    if upgrade:
+        headers['upgrade'] = 'websocket'
+    return Response(status_code, reason, headers=headers, body=body)
 
 ROLE_CONTROL_GUI = 'control-gui'
 ROLE_EXTENSION_CLIENT = 'extension-client'
@@ -589,15 +602,27 @@ class RelayServer:
         self._stop_event: asyncio.Event | None = None
 
     async def serve_forever(self) -> None:
-        async def _process_request(connection: ServerConnection, request: Any) -> Response | None:  # type: ignore[override]
+        def _process_request(connection: ServerConnection, request: Any) -> Response | None:  # type: ignore[override]
             # Provide a tiny health endpoint for hosts that probe HTTP routes.
+            del connection
             try:
                 path = request.path  # type: ignore[attr-defined]
             except AttributeError:
+                path = '/'
+            try:
+                upgrade = request.headers.get('Upgrade', '')  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001 - best-effort handshake guard
+                upgrade = ''
+            if str(upgrade).lower() == 'websocket':
                 return None
             if path in ('/healthz', '/_health', '/ping'):
-                return Response(200, 'OK', headers=[('content-type', 'text/plain; charset=utf-8')], body=b'ok\n')
-            return None
+                return _plain_text_response(200, 'OK', b'ok\n')
+            return _plain_text_response(
+                426,
+                'Upgrade Required',
+                b'Page Signal relay is running. Connect with a WebSocket client.\n',
+                upgrade=True,
+            )
 
         loop = asyncio.get_running_loop()
         self._stop_event = asyncio.Event()
@@ -622,6 +647,7 @@ class RelayServer:
             ping_timeout=20,
             max_size=64 * 1024 * 1024,
             process_request=_process_request,
+            logger=WEBSOCKET_SERVER_LOGGER,
         ) as server:
             LOGGER.info(
                 'Relay listening on %s:%s (sessionId=%s, allow_plain_ws=%s).',

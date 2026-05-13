@@ -1,5 +1,5 @@
 @echo off
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 
 cd /d "%~dp0"
 
@@ -29,6 +29,13 @@ if not defined PYTHON_BOOTSTRAP (
   exit /b 1
 )
 
+%PYTHON_BOOTSTRAP% -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>nul
+if errorlevel 1 (
+  echo The detected Python interpreter is older than 3.11. Install Python 3.11 or newer.
+  %PYTHON_BOOTSTRAP% --version
+  exit /b 1
+)
+
 if not exist ".venv\Scripts\python.exe" (
   echo Creating virtual environment...
   %PYTHON_BOOTSTRAP% -m venv .venv
@@ -39,30 +46,48 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 set "VENV_PYTHON=.venv\Scripts\python.exe"
+if not exist "%VENV_PYTHON%" (
+  echo Virtual environment is corrupt: %VENV_PYTHON% does not exist. Delete .venv and re-run this script.
+  exit /b 1
+)
+
+"%VENV_PYTHON%" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>nul
+if errorlevel 1 (
+  echo The virtual environment uses Python older than 3.11. Delete .venv and re-run this script with Python 3.11+ on PATH.
+  "%VENV_PYTHON%" --version
+  exit /b 1
+)
+
 for /f "tokens=1,* delims==" %%A in (.venv\pyvenv.cfg) do (
   if /I "%%A"=="home " set "PYTHON_HOME=%%B"
 )
+if defined PYTHON_HOME if "!PYTHON_HOME:~0,1!"==" " set "PYTHON_HOME=!PYTHON_HOME:~1!"
 
 if defined PYTHON_HOME (
   if exist "%PYTHON_HOME%\tcl\tcl8.6" set "TCL_LIBRARY=%PYTHON_HOME%\tcl\tcl8.6"
   if exist "%PYTHON_HOME%\tcl\tk8.6" set "TK_LIBRARY=%PYTHON_HOME%\tcl\tk8.6"
 )
 
-echo Checking Python dependencies...
-%VENV_PYTHON% -c "import PIL, websockets" >nul 2>nul
+echo Installing/updating Python dependencies from requirements.txt...
+"%VENV_PYTHON%" -m pip install --disable-pip-version-check --upgrade pip setuptools wheel
 if errorlevel 1 (
-  echo Installing Python dependencies from requirements.txt...
-  %VENV_PYTHON% -m pip install --upgrade pip
-  if errorlevel 1 (
-    echo Failed to upgrade pip.
-    exit /b 1
-  )
+  echo Failed to upgrade pip / setuptools / wheel.
+  exit /b 1
+)
 
-  %VENV_PYTHON% -m pip install -r requirements.txt
-  if errorlevel 1 (
-    echo Failed to install Python dependencies.
-    exit /b 1
-  )
+"%VENV_PYTHON%" -m pip install --disable-pip-version-check -r requirements.txt
+if errorlevel 1 (
+  echo Failed to install Python dependencies.
+  exit /b 1
+)
+
+echo Verifying Python runtime imports...
+"%VENV_PYTHON%" -c "import bcrypt, mss, PIL, pyautogui, websockets; import tkinter; tkinter.Tcl().eval('info patchlevel')" >nul 2>nul
+if errorlevel 1 (
+  echo Python dependencies installed, but Tkinter/Tcl or another GUI dependency failed to import.
+  echo Install/repair Python 3.11+ with Tcl/Tk support, or delete .venv and re-run after fixing Python.
+  "%VENV_PYTHON%" -c "import sys; print(sys.version); import tkinter; print(tkinter.__file__); tkinter.Tcl().eval('info patchlevel')"
+  exit /b 1
 )
 
 if "%SETUP_ONLY%"=="1" (
@@ -80,5 +105,5 @@ if "%START_NATIVE%"=="1" (
 )
 
 echo Starting Capture Control Center...
-%VENV_PYTHON% -m capture_control_center.app
+"%VENV_PYTHON%" -m capture_control_center.app
 exit /b %errorlevel%

@@ -1,3 +1,6 @@
+# Runtime dependencies for the GUI, local bridge, relay client, and Python
+# native client fallback. Build-only tools such as PyInstaller are installed by
+# their build scripts so normal GUI startup stays lean.
 websockets>=15.0.0,<16.0.0
 Pillow>=11.0.0,<12.0.0
 pyautogui>=0.9.54,<1.0.0

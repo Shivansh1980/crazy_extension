@@ -2,15 +2,54 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import traceback
 import uuid
 from typing import Any, Callable
 
 from capture_control_center.debug import debug_log
 from websockets.asyncio.server import ServerConnection, serve
+from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosed
+from websockets.http11 import Response  # type: ignore
 
 from capture_control_center.domain.models import ClientRegistration, ScreenshotResult, ScreenShareFrame
+
+
+WEBSOCKET_SERVER_LOGGER = logging.getLogger('page_signal.local_websocket')
+WEBSOCKET_SERVER_LOGGER.addHandler(logging.NullHandler())
+WEBSOCKET_SERVER_LOGGER.propagate = False
+WEBSOCKET_SERVER_LOGGER.setLevel(logging.CRITICAL)
+
+
+def _is_websocket_upgrade(request: Any) -> bool:
+    try:
+        upgrade = request.headers.get('Upgrade', '')  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - best-effort handshake guard
+        return False
+    return str(upgrade).lower() == 'websocket'
+
+
+def _plain_text_response(status_code: int, reason: str, body: bytes, upgrade: bool = False) -> Response:
+    headers = Headers()
+    headers['content-type'] = 'text/plain; charset=utf-8'
+    if upgrade:
+        headers['upgrade'] = 'websocket'
+    return Response(status_code, reason, headers=headers, body=body)
+
+
+def _process_bridge_http_request(connection: ServerConnection, request: Any) -> Response | None:  # type: ignore[override]
+    del connection
+    if _is_websocket_upgrade(request):
+        return None
+    try:
+        path = request.path  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        path = '/'
+    if path in ('/healthz', '/_health', '/ping'):
+        return _plain_text_response(200, 'OK', b'ok\n')
+    body = b'Page Signal bridge is running. Connect with a WebSocket client.\n'
+    return _plain_text_response(426, 'Upgrade Required', body, upgrade=True)
 
 
 class BridgeServer:
@@ -47,6 +86,8 @@ class BridgeServer:
             ping_interval=15,
             ping_timeout=15,
             max_size=None,
+            process_request=_process_bridge_http_request,
+            logger=WEBSOCKET_SERVER_LOGGER,
         )
         debug_log('python-bridge', 'running...')
         self._emit('server_started', {'host': self._host, 'port': self._port})
