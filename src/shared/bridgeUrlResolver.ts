@@ -10,6 +10,10 @@ export function normalizeWebSocketUrl(value: string, fallback = DEFAULT_WEBSOCKE
   return toWebSocketUrl(value, fallback);
 }
 
+export function normalizeOptionalWebSocketUrl(value: string): string {
+  return toWebSocketUrl(value, '');
+}
+
 export function normalizeResolverUrl(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) {

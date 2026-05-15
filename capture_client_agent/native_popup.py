@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import mimetypes
 import queue
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Awaitable
+from typing import Any, Awaitable, Callable
 
 try:  # pragma: no cover - Tk is platform/runtime dependent
     import tkinter as tk
@@ -45,6 +47,8 @@ class NativePopupService:
         self._thread = threading.Thread(target=self._run_ui, name='PageSignalNativePopup', daemon=True)
         self._root: Any = None
         self._window: Any = None
+        self._shell: Any = None
+        self._launcher: Any = None
         self._text: Any = None
         self._meta_var: Any = None
         self._file_var: Any = None
@@ -52,6 +56,8 @@ class NativePopupService:
         self._opacity_var: Any = None
         self._selected_file: Path | None = None
         self._state = 'closed'
+        self._normal_geometry = '360x300+80+80'
+        self._hotkey_pressed = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._json_sender: JsonSender | None = None
         self._binary_sender: BinarySender | None = None
@@ -83,6 +89,7 @@ class NativePopupService:
                     self._text.delete('1.0', tk.END)
                     self._text.insert('1.0', text)
                 self._state = 'open'
+                self._restore_window_shell()
                 self._window.deiconify()
                 self._window.lift()
                 self._window.attributes('-topmost', True)
@@ -112,8 +119,10 @@ class NativePopupService:
             self._status_var.set(f'Received {target.name} ({len(file_bytes)} bytes).')
             self._file_var.set(f'Received: {target.name}')
             self._state = 'open'
+            self._restore_window_shell()
             self._window.deiconify()
             self._window.lift()
+            self._window.attributes('-topmost', True)
             self._publish_status(self._status(action='file-received'))
 
         self._post(action)
@@ -136,6 +145,7 @@ class NativePopupService:
         self._root = tk.Tk()
         self._root.withdraw()
         self._root.after(50, self._drain_actions)
+        self._install_hotkey_poll()
         self._ready.set()
         self._root.mainloop()
 
@@ -165,11 +175,13 @@ class NativePopupService:
             return
         window = tk.Toplevel(self._root)
         window.title('Page Signal Shared Text')
-        window.geometry('360x300+80+80')
+        window.geometry(self._normal_geometry)
         window.minsize(260, 220)
         window.attributes('-topmost', True)
         window.attributes('-alpha', 0.85)
         window.protocol('WM_DELETE_WINDOW', lambda: self._set_state('closed'))
+        window.bind('<Alt-Shift-p>', lambda _event: self._toggle_visibility())
+        window.bind('<Alt-Shift-P>', lambda _event: self._toggle_visibility())
 
         self._meta_var = tk.StringVar(value='0 chars - 0 lines')
         self._file_var = tk.StringVar(value='No file selected')
@@ -178,8 +190,12 @@ class NativePopupService:
 
         shell = ttk.Frame(window, padding=10)
         shell.pack(fill=tk.BOTH, expand=True)
+        self._shell = shell
         shell.columnconfigure(0, weight=1)
         shell.rowconfigure(1, weight=1)
+
+        launcher = ttk.Button(window, text='P', width=3, command=lambda: self._set_state('open'))
+        self._launcher = launcher
 
         header = ttk.Frame(shell)
         header.grid(row=0, column=0, sticky='ew', pady=(0, 8))
@@ -254,11 +270,60 @@ class NativePopupService:
         if state == 'closed':
             self._window.withdraw()
         elif state == 'minimized':
+            if self._window.winfo_width() > 100 and self._window.winfo_height() > 100:
+                self._normal_geometry = self._window.geometry()
+            if self._shell is not None:
+                self._shell.pack_forget()
+            if self._launcher is not None:
+                self._launcher.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
             self._window.geometry('64x64')
+            self._window.minsize(48, 48)
             self._window.deiconify()
+            self._window.lift()
+            self._window.attributes('-topmost', True)
         else:
+            self._restore_window_shell()
             self._window.deiconify()
+            self._window.lift()
+            self._window.attributes('-topmost', True)
         self._publish_status(self._status(action=state))
+
+    def _restore_window_shell(self) -> None:
+        if self._launcher is not None:
+            self._launcher.pack_forget()
+        if self._shell is not None:
+            self._shell.pack(fill=tk.BOTH, expand=True)
+        if self._window is not None:
+            self._window.minsize(260, 220)
+            self._window.geometry(self._normal_geometry)
+
+    def _toggle_visibility(self) -> None:
+        if self._state == 'open':
+            self._set_state('minimized')
+            return
+        self._set_state('open')
+
+    def _install_hotkey_poll(self) -> None:
+        if sys.platform != 'win32' or self._root is None:
+            return
+
+        user32 = ctypes.windll.user32
+        vk_shift = 0x10
+        vk_alt = 0x12
+        vk_p = 0x50
+
+        def is_down(vk_code: int) -> bool:
+            return bool(user32.GetAsyncKeyState(vk_code) & 0x8000)
+
+        def poll() -> None:
+            pressed = is_down(vk_shift) and is_down(vk_alt) and is_down(vk_p)
+            if pressed and not self._hotkey_pressed:
+                self._toggle_visibility()
+            self._hotkey_pressed = pressed
+            if self._root is not None:
+                self._root.after(80, poll)
+
+        self._root.after(120, poll)
 
     def _copy_text(self) -> None:
         text = self._text.get('1.0', 'end-1c')

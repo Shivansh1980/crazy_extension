@@ -56,6 +56,22 @@ _RECONNECT_INITIAL_BACKOFF = 2.0
 _RECONNECT_MAX_BACKOFF = 30.0
 
 
+def normalize_websocket_url(value: str) -> str:
+    candidate = (value or '').strip()
+    if not candidate:
+        return ''
+    lowered = candidate.lower()
+    if lowered.startswith('tcp://'):
+        return 'ws://' + candidate[len('tcp://'):]
+    if lowered.startswith('http://'):
+        return 'ws://' + candidate[len('http://'):]
+    if lowered.startswith('https://'):
+        return 'wss://' + candidate[len('https://'):]
+    if lowered.startswith(('ws://', 'wss://')):
+        return candidate
+    return 'ws://' + candidate
+
+
 @dataclass(frozen=True, slots=True)
 class RelayCredentials:
     """Operator credentials supplied by the login dialog."""
@@ -84,7 +100,7 @@ class RelayBridgeClient:
         client_version: str = '2.0.0',
         on_auth_failure: AuthFailureCallback | None = None,
     ) -> None:
-        self._relay_url = relay_url
+        self._relay_url = normalize_websocket_url(relay_url)
         self._credentials_provider = credentials_provider
         self._client_name = client_name
         self._client_version = client_version

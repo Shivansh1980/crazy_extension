@@ -1,3 +1,5 @@
+import { normalizeOptionalWebSocketUrl } from '../shared/bridgeUrlResolver';
+
 type ScreenShareViewerReadyResponse = {
   ok: boolean;
   status?: {
@@ -244,8 +246,13 @@ async function ensureStreamSocket(): Promise<void> {
 }
 
 async function openStreamSocket(targetUrl: string): Promise<void> {
+  const websocketTargetUrl = normalizeOptionalWebSocketUrl(targetUrl);
+  if (!websocketTargetUrl) {
+    throw new Error(`Invalid websocket target for screen share streaming: ${targetUrl}`);
+  }
+
   await new Promise<void>((resolve, reject) => {
-    const socket = new WebSocket(targetUrl);
+    const socket = new WebSocket(websocketTargetUrl);
     let settled = false;
 
     const finalizeFailure = (error: Error) => {

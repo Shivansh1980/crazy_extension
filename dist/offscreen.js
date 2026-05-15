@@ -107,6 +107,9 @@ var init_ChromeRunStatusRepository = __esm({
 function normalizeWebSocketUrl(value, fallback = DEFAULT_WEBSOCKET_URL) {
   return toWebSocketUrl(value, fallback);
 }
+function normalizeOptionalWebSocketUrl(value) {
+  return toWebSocketUrl(value, "");
+}
 function normalizeResolverUrl(value) {
   const trimmed = value.trim();
   if (!trimmed) {
@@ -243,10 +246,7 @@ function normalizeConnectionMode(value) {
 }
 function normalizeRelayUrl(value) {
   if (typeof value !== "string") return "";
-  const trimmed = value.trim();
-  if (!trimmed) return "";
-  if (!/^wss?:\/\//i.test(trimmed)) return "";
-  return trimmed;
+  return normalizeOptionalWebSocketUrl(value);
 }
 function normalizeSessionId(value) {
   if (typeof value !== "string") return DEFAULT_SETTINGS.sessionId;
@@ -429,17 +429,21 @@ var require_offscreen = __commonJS({
         this.clearReconnectTimer();
         const generation = ++this.connectionGeneration;
         const endpoint = await this.resolveEndpoint(settings, settingsChanged);
-        this.resolvedTargetUrl = endpoint.targetUrl;
-        this.resolvedEndpoint = endpoint;
-        debugLog("offscreen", "Connecting websocket.", endpoint);
+        const normalizedEndpoint = {
+          ...endpoint,
+          targetUrl: normalizeWebSocketUrl(endpoint.targetUrl, settings.websocketUrl)
+        };
+        this.resolvedTargetUrl = normalizedEndpoint.targetUrl;
+        this.resolvedEndpoint = normalizedEndpoint;
+        debugLog("offscreen", "Connecting websocket.", normalizedEndpoint);
         await this.updateStatus({
           state: "connecting",
           updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
-          message: endpoint.source === "resolver" ? `Connecting to ${endpoint.targetUrl} from resolver ${endpoint.resolverUrl}...` : `Connecting to ${endpoint.targetUrl}...`,
+          message: endpoint.source === "resolver" ? `Connecting to ${normalizedEndpoint.targetUrl} from resolver ${endpoint.resolverUrl}...` : `Connecting to ${normalizedEndpoint.targetUrl}...`,
           lastFileName: null,
-          targetUrl: endpoint.targetUrl
+          targetUrl: normalizedEndpoint.targetUrl
         });
-        const socket = new WebSocket(endpoint.targetUrl);
+        const socket = new WebSocket(normalizedEndpoint.targetUrl);
         socket.binaryType = "arraybuffer";
         this.socket = socket;
         socket.addEventListener("open", () => {
@@ -453,7 +457,7 @@ var require_offscreen = __commonJS({
           this.relayCycleStep = 0;
           this.hasConnectedOnce = true;
           debugLog("offscreen", "running...");
-          debugLog("offscreen", "WebSocket connection opened.", endpoint.targetUrl);
+          debugLog("offscreen", "WebSocket connection opened.", normalizedEndpoint.targetUrl);
           this.send({
             type: "client.register",
             clientId: this.clientId,

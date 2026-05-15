@@ -15,6 +15,7 @@ from capture_control_center.infrastructure.received_file_store import ReceivedFi
 from capture_control_center.infrastructure.relay_bridge_client import (
     RelayBridgeClient,
     RelayCredentials,
+    normalize_websocket_url,
 )
 from capture_control_center.presentation.gui import CaptureControlWindow
 from capture_control_center.presentation.login_dialog import LoginDialog, LoginResult
@@ -140,11 +141,11 @@ def _start_direct_mode(env: dict[str, str], loop: asyncio.AbstractEventLoop):
 
 
 def _start_relay_mode(env: dict[str, str], loop: asyncio.AbstractEventLoop):
-    relay_url = env.get('RELAY_URL', '').strip()
+    relay_url = normalize_websocket_url(env.get('RELAY_URL', '').strip())
     session_id = env.get('SESSION_ID', '').strip() or 'default'
     default_username = env.get('RELAY_USERNAME', '').strip()
     if not relay_url:
-        raise SystemExit('Relay mode requires RELAY_URL in .env (e.g. wss://example.com/ws).')
+        raise SystemExit('Relay mode requires RELAY_URL in .env (e.g. https://example.com/ws or wss://example.com/ws).')
 
     creds = _prompt_credentials(relay_url=relay_url, default_username=default_username)
     if creds.cancelled:

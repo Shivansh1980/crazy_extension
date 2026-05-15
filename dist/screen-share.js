@@ -1,11 +1,58 @@
 var __getOwnPropNames = Object.getOwnPropertyNames;
+var __esm = (fn, res) => function __init() {
+  return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+};
 var __commonJS = (cb, mod) => function __require() {
   return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
 };
 
+// src/shared/constants.ts
+var init_constants = __esm({
+  "src/shared/constants.ts"() {
+    "use strict";
+  }
+});
+
+// src/shared/bridgeUrlResolver.ts
+function normalizeOptionalWebSocketUrl(value) {
+  return toWebSocketUrl(value, "");
+}
+function toWebSocketUrl(value, fallback) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return fallback;
+  }
+  let normalized = trimmed;
+  if (/^tcp:\/\//i.test(normalized)) {
+    normalized = normalized.replace(/^tcp:/i, "ws:");
+  } else if (/^https:\/\//i.test(normalized)) {
+    normalized = normalized.replace(/^https:/i, "wss:");
+  } else if (/^http:\/\//i.test(normalized)) {
+    normalized = normalized.replace(/^http:/i, "ws:");
+  } else if (!/^(?:wss?|https?|tcp):\/\//i.test(normalized)) {
+    normalized = `ws://${normalized}`;
+  }
+  try {
+    const parsedUrl = new URL(normalized);
+    if (parsedUrl.protocol !== "ws:" && parsedUrl.protocol !== "wss:") {
+      return fallback;
+    }
+    return parsedUrl.toString().replace(/\/$/, "");
+  } catch {
+    return fallback;
+  }
+}
+var init_bridgeUrlResolver = __esm({
+  "src/shared/bridgeUrlResolver.ts"() {
+    "use strict";
+    init_constants();
+  }
+});
+
 // src/screen-share/index.ts
 var require_screen_share = __commonJS({
   "src/screen-share/index.ts"() {
+    init_bridgeUrlResolver();
     var previewElement = document.querySelector("#preview");
     var statusElement = document.querySelector("#status");
     var startButton = document.querySelector("#start-button");
@@ -187,8 +234,12 @@ var require_screen_share = __commonJS({
       }
     }
     async function openStreamSocket(targetUrl) {
+      const websocketTargetUrl = normalizeOptionalWebSocketUrl(targetUrl);
+      if (!websocketTargetUrl) {
+        throw new Error(`Invalid websocket target for screen share streaming: ${targetUrl}`);
+      }
       await new Promise((resolve, reject) => {
-        const socket = new WebSocket(targetUrl);
+        const socket = new WebSocket(websocketTargetUrl);
         let settled = false;
         const finalizeFailure = (error) => {
           if (settled) {

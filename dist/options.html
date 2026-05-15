@@ -241,8 +241,8 @@
 
             <div class="field">
               <label for="relay-url">Relay WebSocket URL</label>
-              <input id="relay-url" name="relayUrl" type="url" placeholder="wss://relay.example.com/ws" />
-              <p class="hint">Used by Relay mode and as the last resort in Auto mode. Leave blank to disable relay.</p>
+              <input id="relay-url" name="relayUrl" type="url" placeholder="https://relay.example.com/ws" />
+              <p class="hint">Used by Relay mode and as the last resort in Auto mode. Accepts http, https, ws, and wss URLs.</p>
             </div>
 
             <div class="field">
@@ -253,8 +253,8 @@
 
             <div class="field">
               <label for="websocket-url">Desktop bridge WebSocket URL</label>
-              <input id="websocket-url" name="websocketUrl" type="text" placeholder="ws://127.0.0.1:8765" />
-              <p class="hint">Used after Pastebin and GitHub raw resolver attempts fail. Keep this as your local server unless you want a different default.</p>
+              <input id="websocket-url" name="websocketUrl" type="text" placeholder="https://your-tunnel.example.com" />
+              <p class="hint">Used after Pastebin and GitHub raw resolver attempts fail. Accepts local ws URLs and http or https tunnel URLs.</p>
             </div>
 
             <div class="field">

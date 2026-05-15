@@ -4,7 +4,7 @@ import type { ExtensionSettings } from '../domain/models/ExtensionSettings';
 import { ChromeRunStatusRepository } from '../infrastructure/storage/ChromeRunStatusRepository';
 import { ChromeSettingsRepository } from '../infrastructure/storage/ChromeSettingsRepository';
 import { debugError, debugLog, debugWarn } from '../shared/debug';
-import { resolveBridgeEndpoint, type ResolvedBridgeEndpoint } from '../shared/bridgeUrlResolver';
+import { normalizeWebSocketUrl, resolveBridgeEndpoint, type ResolvedBridgeEndpoint } from '../shared/bridgeUrlResolver';
 import {
   BRIDGE_CLIENT_NAME,
   BRIDGE_RECONNECT_INTERVAL_MS,
@@ -371,22 +371,26 @@ class ExtensionBridgeClient {
     this.clearReconnectTimer();
     const generation = ++this.connectionGeneration;
     const endpoint = await this.resolveEndpoint(settings, settingsChanged);
-    this.resolvedTargetUrl = endpoint.targetUrl;
-    this.resolvedEndpoint = endpoint;
-    debugLog('offscreen', 'Connecting websocket.', endpoint);
+    const normalizedEndpoint = {
+      ...endpoint,
+      targetUrl: normalizeWebSocketUrl(endpoint.targetUrl, settings.websocketUrl)
+    };
+    this.resolvedTargetUrl = normalizedEndpoint.targetUrl;
+    this.resolvedEndpoint = normalizedEndpoint;
+    debugLog('offscreen', 'Connecting websocket.', normalizedEndpoint);
 
     await this.updateStatus({
       state: 'connecting',
       updatedAt: new Date().toISOString(),
       message:
         endpoint.source === 'resolver'
-          ? `Connecting to ${endpoint.targetUrl} from resolver ${endpoint.resolverUrl}...`
-          : `Connecting to ${endpoint.targetUrl}...`,
+          ? `Connecting to ${normalizedEndpoint.targetUrl} from resolver ${endpoint.resolverUrl}...`
+          : `Connecting to ${normalizedEndpoint.targetUrl}...`,
       lastFileName: null,
-      targetUrl: endpoint.targetUrl
+      targetUrl: normalizedEndpoint.targetUrl
     });
 
-    const socket = new WebSocket(endpoint.targetUrl);
+    const socket = new WebSocket(normalizedEndpoint.targetUrl);
     socket.binaryType = 'arraybuffer';
     this.socket = socket;
 
@@ -402,7 +406,7 @@ class ExtensionBridgeClient {
       this.relayCycleStep = 0;
       this.hasConnectedOnce = true;
       debugLog('offscreen', 'running...');
-      debugLog('offscreen', 'WebSocket connection opened.', endpoint.targetUrl);
+      debugLog('offscreen', 'WebSocket connection opened.', normalizedEndpoint.targetUrl);
 
       this.send({
         type: 'client.register',

@@ -1908,6 +1908,9 @@ var init_ChromeRunStatusRepository = __esm({
 function normalizeWebSocketUrl(value, fallback = DEFAULT_WEBSOCKET_URL) {
   return toWebSocketUrl(value, fallback);
 }
+function normalizeOptionalWebSocketUrl(value) {
+  return toWebSocketUrl(value, "");
+}
 function normalizeResolverUrl(value) {
   const trimmed = value.trim();
   if (!trimmed) {
@@ -1979,10 +1982,7 @@ function normalizeConnectionMode(value) {
 }
 function normalizeRelayUrl(value) {
   if (typeof value !== "string") return "";
-  const trimmed = value.trim();
-  if (!trimmed) return "";
-  if (!/^wss?:\/\//i.test(trimmed)) return "";
-  return trimmed;
+  return normalizeOptionalWebSocketUrl(value);
 }
 function normalizeSessionId(value) {
   if (typeof value !== "string") return DEFAULT_SETTINGS.sessionId;

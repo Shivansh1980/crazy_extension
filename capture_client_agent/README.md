@@ -64,11 +64,14 @@ Native popup behavior:
 
 - Python/native EXE path: uses `native_popup.py` and Tkinter.
 - C# DLL/host path: uses an in-process WinForms popup from `dll/src/NativePopup.cs`.
+- The native popup can collapse to a small `P` launcher icon and can be toggled
+   with `Shift+Alt+P` on Windows.
 - Incoming files are saved locally and reported back through `file-transfer.result`.
 - Outgoing popup text/files use the same `popup.message` and `popup-file.binary`
    events the browser popup already uses.
-- Windows can show the popup topmost without intentionally stealing focus, but
-   typing into the popup still requires keyboard focus by OS design.
+- The C# DLL/host popup is created in the loaded agent process and is shown
+   topmost without intentionally stealing focus. Clicking or typing into the
+   popup still gives that popup keyboard focus by Windows design.
 
 ## Quick start
 

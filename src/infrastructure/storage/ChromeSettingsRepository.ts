@@ -1,6 +1,6 @@
 import type { ConnectionMode, ExtensionSettings } from '../../domain/models/ExtensionSettings';
 import type { SettingsRepository } from '../../domain/ports/SettingsRepository';
-import { normalizeResolverUrl, normalizeWebSocketUrl } from '../../shared/bridgeUrlResolver';
+import { normalizeOptionalWebSocketUrl, normalizeResolverUrl, normalizeWebSocketUrl } from '../../shared/bridgeUrlResolver';
 import { DEFAULT_SETTINGS, DEFAULT_WEBSOCKET_RESOLVER_URL, SETTINGS_STORAGE_KEY } from '../../shared/constants';
 import { getStorageValue, setStorageValue } from '../../shared/storageAccess';
 
@@ -14,11 +14,7 @@ function normalizeConnectionMode(value: unknown): ConnectionMode {
 
 function normalizeRelayUrl(value: unknown): string {
   if (typeof value !== 'string') return '';
-  const trimmed = value.trim();
-  if (!trimmed) return '';
-  // Accept ws:// or wss:// only.
-  if (!/^wss?:\/\//i.test(trimmed)) return '';
-  return trimmed;
+  return normalizeOptionalWebSocketUrl(value);
 }
 
 function normalizeSessionId(value: unknown): string {
