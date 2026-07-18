@@ -9,7 +9,7 @@ from typing import Any
 
 from capture_control_center.debug import debug_log
 from capture_control_center.domain.models import ReceivedClientFile, SavedCapture
-from capture_control_center.infrastructure.bridge_server import BridgeServer
+from capture_control_center.domain.ports import BridgeTransport, CredentialUpdatableBridge
 from capture_control_center.infrastructure.image_store import ImageStore
 from capture_control_center.infrastructure.received_file_store import ReceivedFileStore
 
@@ -17,7 +17,7 @@ from capture_control_center.infrastructure.received_file_store import ReceivedFi
 class CaptureController:
     def __init__(
         self,
-        bridge_server: BridgeServer,
+        bridge_server: BridgeTransport,
         image_store: ImageStore,
         received_file_store: ReceivedFileStore,
         loop: asyncio.AbstractEventLoop,
@@ -118,8 +118,27 @@ class CaptureController:
 
     def stop(self) -> None:
         debug_log('python-controller', 'Stopping bridge server.')
-        stop_future = asyncio.run_coroutine_threadsafe(self._bridge_server.stop(), self._loop)
-        stop_future.result(timeout=5)
+        if self._loop.is_closed() or not self._loop.is_running():
+            debug_log('python-controller', 'Bridge loop is already stopped.')
+            return
+        stop_operation = self._bridge_server.stop()
+        try:
+            stop_future = asyncio.run_coroutine_threadsafe(stop_operation, self._loop)
+        except RuntimeError as error:
+            stop_operation.close()
+            debug_log('python-controller', 'Bridge shutdown could not be scheduled.', {'error': str(error)})
+            return
+        try:
+            stop_future.result(timeout=10)
+        except Exception as error:  # noqa: BLE001 - shutdown must not strand the Tk process
+            stop_future.cancel()
+            debug_log('python-controller', 'Bridge shutdown did not complete cleanly.', {'error': str(error)})
+
+    def update_relay_credentials(self, username: str, password: str, session_id: str) -> Future[None]:
+        return asyncio.run_coroutine_threadsafe(
+            self._update_relay_credentials(username, password, session_id),
+            self._loop,
+        )
 
     def list_received_client_files(self) -> list[dict[str, Any]]:
         records = self._received_file_store.list_files()
@@ -161,7 +180,7 @@ class CaptureController:
     async def _capture_and_store(self) -> SavedCapture:
         debug_log('python-controller', 'Waiting for screenshot from extension.')
         screenshot = await self._bridge_server.request_capture()
-        saved_capture = self._image_store.save(screenshot)
+        saved_capture = await asyncio.to_thread(self._image_store.save, screenshot)
         debug_log('python-controller', 'Screenshot saved locally.', str(saved_capture.file_path))
         self._events.put_nowait(
             (
@@ -176,6 +195,11 @@ class CaptureController:
             )
         )
         return saved_capture
+
+    async def _update_relay_credentials(self, username: str, password: str, session_id: str) -> None:
+        if not isinstance(self._bridge_server, CredentialUpdatableBridge):
+            raise RuntimeError('The active bridge does not use relay credentials.')
+        await self._bridge_server.update_credentials(username, password, session_id)
 
     async def _send_clipboard_text(self, text: str) -> None:
         debug_log('python-controller', 'Sending clipboard text through the bridge.', {'characters': len(text)})

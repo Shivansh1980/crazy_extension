@@ -1,9 +1,18 @@
 var __getOwnPropNames = Object.getOwnPropertyNames;
-var __esm = (fn, res) => function __init() {
-  return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+var __esm = (fn, res, err) => function __init() {
+  if (err) throw err[0];
+  try {
+    return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+  } catch (e) {
+    throw err = [e], e;
+  }
 };
 var __commonJS = (cb, mod) => function __require() {
-  return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
+  try {
+    return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
+  } catch (e) {
+    throw mod = 0, e;
+  }
 };
 
 // src/shared/errors.ts
@@ -250,63 +259,29 @@ var init_ChromeActiveTabGateway = __esm({
 // src/infrastructure/browser/ChromeClipboardAccessGateway.ts
 function enableClipboardAccessInPage() {
   const stateKey = "__pageSignalClipboardAccessState";
+  const styleElementId = "page-signal-clipboard-access-style";
+  const popupHostId = "page-signal-capture-popup-host";
+  const legacyProtectedHandlerProps = [
+    "oncopy",
+    "oncut",
+    "onpaste",
+    "onbeforecopy",
+    "onbeforecut",
+    "onbeforepaste",
+    "onselectstart",
+    "oncontextmenu",
+    "ondragstart"
+  ];
   const win = window;
-  const state = win[stateKey] ?? (win[stateKey] = {
-    installed: false,
-    observerInstalled: false,
-    captureInterceptorsInstalled: false,
-    rootPropsProtected: false,
-    domReadyListenerInstalled: false,
-    styleElementId: "page-signal-clipboard-access-style",
-    popupHostId: "page-signal-capture-popup-host",
-    protectedEventTypes: [
-      "copy",
-      "cut",
-      "paste",
-      "beforecopy",
-      "beforecut",
-      "beforepaste",
-      "selectstart",
-      "contextmenu"
-    ],
-    protectedHandlerProps: [
-      "oncopy",
-      "oncut",
-      "onpaste",
-      "onbeforecopy",
-      "onbeforecut",
-      "onbeforepaste",
-      "onselectstart",
-      "oncontextmenu",
-      "ondragstart"
-    ]
-  });
-  const alreadyInstalled = state.installed;
+  const existingState = win[stateKey];
+  const legacyStateDetected = Boolean(
+    existingState && existingState.installed === true && existingState.compatibilityMode !== "passive"
+  );
+  const alreadyInstalled = Boolean(
+    existingState && existingState.installed === true && existingState.compatibilityMode === "passive"
+  );
   const methodsApplied = [];
   const methodsFailed = [];
-  const protectedEventTypes = new Set(state.protectedEventTypes);
-  const protectedShortcutKeys = /* @__PURE__ */ new Set(["a", "c", "v", "x", "insert"]);
-  const isClipboardShortcutEvent = (event) => {
-    if (!(event instanceof KeyboardEvent)) {
-      return false;
-    }
-    const key = event.key.toLowerCase();
-    if ((event.ctrlKey || event.metaKey) && !event.altKey && protectedShortcutKeys.has(key)) {
-      return true;
-    }
-    return event.shiftKey && key === "insert";
-  };
-  const isProtectedEvent = (event) => protectedEventTypes.has(event.type) || isClipboardShortcutEvent(event);
-  const isInsidePopup = (target) => {
-    if (!(target instanceof Node)) {
-      return false;
-    }
-    const rootNode = target.getRootNode();
-    if (rootNode instanceof ShadowRoot && rootNode.host instanceof HTMLElement && rootNode.host.id === state.popupHostId) {
-      return true;
-    }
-    return target instanceof Element && Boolean(target.closest(`#${state.popupHostId}`));
-  };
   const applyMethod = (name, action) => {
     try {
       action();
@@ -315,191 +290,55 @@ function enableClipboardAccessInPage() {
       methodsFailed.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
-  const protectRootHandlerProps = () => {
-    if (state.rootPropsProtected) {
-      return;
+  const removeLegacyStyleOverride = () => {
+    document.getElementById(styleElementId)?.remove();
+  };
+  const releaseLegacyRootHandlerProps = () => {
+    const targets = [window, document];
+    if (document.documentElement) {
+      targets.push(document.documentElement);
     }
-    const targets = [window, document, document.documentElement, document.body].filter(
-      (target) => target !== null && target !== void 0
-    );
+    if (document.body) {
+      targets.push(document.body);
+    }
     for (const target of targets) {
-      for (const prop of state.protectedHandlerProps) {
+      for (const prop of legacyProtectedHandlerProps) {
+        const descriptor = Object.getOwnPropertyDescriptor(target, prop);
+        if (!descriptor?.configurable || typeof descriptor.get !== "function" || typeof descriptor.set !== "function") {
+          continue;
+        }
+        let descriptorValue;
         try {
-          target[prop] = null;
+          descriptorValue = descriptor.get.call(target);
         } catch {
+          descriptorValue = void 0;
         }
-        try {
-          const descriptor = Object.getOwnPropertyDescriptor(target, prop);
-          if (descriptor?.configurable === false) {
-            continue;
-          }
-          Object.defineProperty(target, prop, {
-            configurable: true,
-            enumerable: descriptor?.enumerable ?? false,
-            get: () => null,
-            set: () => void 0
-          });
-        } catch {
+        if (descriptorValue === null) {
+          delete target[prop];
         }
       }
     }
-    state.rootPropsProtected = true;
   };
-  const ensureStyleOverride = () => {
-    const container = document.head ?? document.documentElement;
-    if (!container) {
-      throw new Error("No document container is available for stylesheet injection.");
-    }
-    let styleElement = document.getElementById(state.styleElementId);
-    if (!styleElement) {
-      styleElement = document.createElement("style");
-      styleElement.id = state.styleElementId;
-      container.appendChild(styleElement);
-    }
-    styleElement.textContent = `
-      html, body, body * {
-        user-select: text !important;
-        -webkit-user-select: text !important;
-        -webkit-touch-callout: default !important;
-      }
-      input, textarea, [contenteditable], [role="textbox"] {
-        caret-color: auto !important;
-        -webkit-user-modify: read-write !important;
-      }
-      input[disabled], textarea[disabled] {
-        pointer-events: auto !important;
-        opacity: 1 !important;
-      }
-    `;
-  };
-  const cleanupElement = (element) => {
-    if (!(element instanceof HTMLElement)) {
+  const neutralizeLegacyState = () => {
+    if (!existingState) {
       return;
     }
-    for (const prop of state.protectedHandlerProps) {
-      if (element.hasAttribute(prop)) {
-        element.removeAttribute(prop);
-      }
-      try {
-        element[prop] = null;
-      } catch {
-      }
-    }
-    element.style.setProperty("user-select", "text", "important");
-    element.style.setProperty("-webkit-user-select", "text", "important");
-    element.style.setProperty("-webkit-touch-callout", "default", "important");
-    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
-      element.disabled = false;
-      element.readOnly = false;
-      element.removeAttribute("disabled");
-      element.removeAttribute("readonly");
-      return;
-    }
-    if (element.getAttribute("role") === "textbox" || element.hasAttribute("contenteditable")) {
-      if (element.getAttribute("contenteditable") === "false" || !element.isContentEditable) {
-        element.setAttribute("contenteditable", "plaintext-only");
-      }
-    }
+    existingState.protectedEventTypes = [];
+    existingState.protectedHandlerProps = [];
   };
-  const refreshDocumentNodes = (root = document) => {
-    const selector = [
-      "input",
-      "textarea",
-      "[contenteditable]",
-      '[contenteditable="false"]',
-      '[role="textbox"]',
-      ...state.protectedHandlerProps.map((prop) => `[${prop}]`)
-    ].join(",");
-    const elements = /* @__PURE__ */ new Set();
-    if (root instanceof Document) {
-      if (root.documentElement) {
-        elements.add(root.documentElement);
-      }
-      if (root.body) {
-        elements.add(root.body);
-      }
-    } else if (root instanceof Element) {
-      elements.add(root);
-    }
-    if ("querySelectorAll" in root) {
-      for (const element of root.querySelectorAll(selector)) {
-        elements.add(element);
-      }
-    }
-    for (const element of elements) {
-      cleanupElement(element);
-    }
+  if (legacyStateDetected) {
+    applyMethod("legacy-style-cleanup", removeLegacyStyleOverride);
+    applyMethod("legacy-root-handler-cleanup", releaseLegacyRootHandlerProps);
+    applyMethod("legacy-state-neutralized", neutralizeLegacyState);
+  }
+  win[stateKey] = {
+    installed: true,
+    compatibilityMode: "passive",
+    styleElementId,
+    popupHostId,
+    updatedAt: (/* @__PURE__ */ new Date()).toISOString()
   };
-  const ensureCaptureInterceptors = () => {
-    if (state.captureInterceptorsInstalled) {
-      return;
-    }
-    const intercept = (event) => {
-      if (!isProtectedEvent(event) || isInsidePopup(event.target)) {
-        return;
-      }
-      event.stopImmediatePropagation();
-      event.stopPropagation();
-    };
-    window.addEventListener("copy", intercept, true);
-    window.addEventListener("cut", intercept, true);
-    window.addEventListener("paste", intercept, true);
-    window.addEventListener("beforecopy", intercept, true);
-    window.addEventListener("beforecut", intercept, true);
-    window.addEventListener("beforepaste", intercept, true);
-    window.addEventListener("selectstart", intercept, true);
-    window.addEventListener("contextmenu", intercept, true);
-    window.addEventListener("keydown", intercept, true);
-    state.captureInterceptorsInstalled = true;
-  };
-  const ensureMutationObserver = () => {
-    if (state.observerInstalled || !document.documentElement) {
-      return;
-    }
-    const observer = new MutationObserver((mutations) => {
-      for (const mutation of mutations) {
-        if (mutation.type === "attributes" && mutation.target instanceof Element) {
-          cleanupElement(mutation.target);
-        }
-        for (const node of mutation.addedNodes) {
-          if (node instanceof Element) {
-            refreshDocumentNodes(node);
-          }
-        }
-      }
-    });
-    observer.observe(document.documentElement, {
-      subtree: true,
-      childList: true,
-      attributes: true,
-      attributeFilter: [...state.protectedHandlerProps, "disabled", "readonly", "style", "contenteditable"]
-    });
-    state.observerInstalled = true;
-  };
-  const ensureDomReadyRefresh = () => {
-    if (state.domReadyListenerInstalled) {
-      return;
-    }
-    document.addEventListener(
-      "DOMContentLoaded",
-      () => {
-        try {
-          refreshDocumentNodes(document);
-          protectRootHandlerProps();
-        } catch {
-        }
-      },
-      { capture: true, once: true }
-    );
-    state.domReadyListenerInstalled = true;
-  };
-  applyMethod("style-override", ensureStyleOverride);
-  applyMethod("root-handler-protection", protectRootHandlerProps);
-  applyMethod("dom-cleanup", () => refreshDocumentNodes(document));
-  applyMethod("capture-interceptors", ensureCaptureInterceptors);
-  applyMethod("mutation-observer", ensureMutationObserver);
-  applyMethod("dom-ready-refresh", ensureDomReadyRefresh);
-  state.installed = true;
+  applyMethod("passive-page-compatibility", () => void 0);
   return {
     pageUrl: location.href,
     alreadyInstalled,
@@ -1482,6 +1321,9 @@ var init_ChromeScreenShareGateway = __esm({
           focused: true,
           state: "maximized"
         });
+        if (!createdWindow) {
+          throw new ExtensionError("Chrome did not return a screen share popup window.");
+        }
         this.viewerWindowId = typeof createdWindow.id === "number" ? createdWindow.id : null;
         this.latestStatus = {
           state: "launching",
@@ -1740,15 +1582,14 @@ var init_ChromeOffscreenBridgeRuntime = __esm({
         if (!capabilities.runtimeMessaging) {
           throw new ExtensionError("This browser does not support extension runtime messaging required for bridge startup.");
         }
-        await chrome.runtime.sendMessage({ type: "bridge-start" }).catch(() => void 0);
+        await this.sendBridgeMessage("bridge-start");
       }
       async reconnect() {
         const capabilities = getBrowserCapabilities();
         if (!capabilities.runtimeMessaging) {
           throw new ExtensionError("This browser does not support extension runtime messaging required for bridge reconnect.");
         }
-        await chrome.runtime.sendMessage({ type: "bridge-start" }).catch(() => void 0);
-        await chrome.runtime.sendMessage({ type: "bridge-reconnect" }).catch(() => void 0);
+        await this.sendBridgeMessage("bridge-reconnect");
       }
       async createDocument() {
         const capabilities = getBrowserCapabilities();
@@ -1756,6 +1597,9 @@ var init_ChromeOffscreenBridgeRuntime = __esm({
           throw new ExtensionError("This browser does not support offscreen documents required for the desktop bridge.");
         }
         try {
+          if (typeof chrome.offscreen.hasDocument === "function" && await chrome.offscreen.hasDocument()) {
+            return;
+          }
           await chrome.offscreen.createDocument({
             url: OFFSCREEN_DOCUMENT_PATH,
             reasons: [chrome.offscreen.Reason.BLOBS, chrome.offscreen.Reason.CLIPBOARD],
@@ -1763,10 +1607,36 @@ var init_ChromeOffscreenBridgeRuntime = __esm({
           });
         } catch (error) {
           const message = error instanceof Error ? error.message : "";
-          if (!message.includes("Only a single offscreen document may be created")) {
+          const normalizedMessage = message.toLowerCase();
+          if (!normalizedMessage.includes("single offscreen") && !normalizedMessage.includes("already exists")) {
             throw new ExtensionError(message || "Unable to create the offscreen bridge document.");
           }
         }
+      }
+      async sendBridgeMessage(type) {
+        let lastError = null;
+        for (let attempt = 1; attempt <= 5; attempt += 1) {
+          try {
+            const response = await chrome.runtime.sendMessage({ type });
+            if (!response?.ok) {
+              throw new ExtensionError(response?.message ?? `The offscreen document rejected ${type}.`);
+            }
+            return;
+          } catch (error) {
+            lastError = error;
+            const message2 = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+            const listenerIsStarting = message2.includes("receiving end does not exist") || message2.includes("message port closed");
+            if (!listenerIsStarting || attempt === 5) {
+              break;
+            }
+            await new Promise((resolve) => setTimeout(resolve, attempt * 100));
+          }
+        }
+        if (lastError instanceof ExtensionError) {
+          throw lastError;
+        }
+        const message = lastError instanceof Error ? lastError.message : String(lastError ?? "");
+        throw new ExtensionError(message || `Unable to deliver ${type} to the offscreen bridge.`);
       }
     };
   }
@@ -1912,7 +1782,7 @@ function normalizeOptionalWebSocketUrl(value) {
   return toWebSocketUrl(value, "");
 }
 function normalizeResolverUrl(value) {
-  const trimmed = value.trim();
+  const trimmed = typeof value === "string" ? value.trim() : "";
   if (!trimmed) {
     return "";
   }
@@ -1945,7 +1815,7 @@ function extractPastebinId(pathname) {
   return pathSegments[0] ?? null;
 }
 function toWebSocketUrl(value, fallback) {
-  const trimmed = value.trim();
+  const trimmed = typeof value === "string" ? value.trim() : "";
   if (!trimmed) {
     return fallback;
   }
@@ -2008,12 +1878,15 @@ var init_ChromeSettingsRepository = __esm({
         return nextValue;
       }
       normalize(settings) {
+        const fileNamePrefix = typeof settings.fileNamePrefix === "string" ? settings.fileNamePrefix.trim() : "";
+        const requestTimeout = Number(settings.requestTimeoutMs);
+        const resolverUrl = typeof settings.websocketResolverUrl === "string" && settings.websocketResolverUrl.trim() ? settings.websocketResolverUrl : DEFAULT_WEBSOCKET_RESOLVER_URL;
         return {
-          enabled: Boolean(settings.enabled),
+          enabled: typeof settings.enabled === "boolean" ? settings.enabled : DEFAULT_SETTINGS.enabled,
           websocketUrl: normalizeWebSocketUrl(settings.websocketUrl),
-          websocketResolverUrl: normalizeResolverUrl(DEFAULT_WEBSOCKET_RESOLVER_URL),
-          fileNamePrefix: settings.fileNamePrefix.trim() || DEFAULT_SETTINGS.fileNamePrefix,
-          requestTimeoutMs: Math.max(1e3, Math.round(settings.requestTimeoutMs || DEFAULT_SETTINGS.requestTimeoutMs)),
+          websocketResolverUrl: normalizeResolverUrl(resolverUrl),
+          fileNamePrefix: fileNamePrefix || DEFAULT_SETTINGS.fileNamePrefix,
+          requestTimeoutMs: Number.isFinite(requestTimeout) ? Math.min(12e4, Math.max(1e3, Math.round(requestTimeout))) : DEFAULT_SETTINGS.requestTimeoutMs,
           connectionMode: normalizeConnectionMode(settings.connectionMode),
           relayUrl: normalizeRelayUrl(settings.relayUrl),
           sessionId: normalizeSessionId(settings.sessionId)
@@ -3291,8 +3164,16 @@ var require_main = __commonJS({
       if (message?.type === "screen-share-stream-endpoint-get") {
         void (async () => {
           try {
-            const runStatus = await runStatusRepository.get();
-            sendResponse({ ok: true, targetUrl: runStatus.targetUrl });
+            const [runStatus, settings] = await Promise.all([
+              runStatusRepository.get(),
+              settingsRepository.get()
+            ]);
+            const fallbackTarget = settings.connectionMode === "relay" && settings.relayUrl ? settings.relayUrl : settings.websocketUrl;
+            sendResponse({
+              ok: true,
+              targetUrl: runStatus.targetUrl ?? fallbackTarget,
+              sessionId: settings.sessionId
+            });
           } catch (error) {
             const messageText = error instanceof Error ? error.message : "Screen share stream endpoint lookup failed.";
             debugError("background", "Screen share stream endpoint lookup failed.", messageText);
@@ -3328,9 +3209,10 @@ var require_main = __commonJS({
             if (!chrome.tabCapture?.getMediaStreamId) {
               throw new Error("This Chrome build does not expose chrome.tabCapture. Update Chrome to use the silent capture flow.");
             }
+            const targetTabId = targetTab.id;
             const streamId = await new Promise((resolve, reject) => {
               chrome.tabCapture.getMediaStreamId(
-                { consumerTabId, targetTabId: targetTab.id },
+                { consumerTabId, targetTabId },
                 (id) => {
                   const runtimeError = chrome.runtime.lastError;
                   if (runtimeError) {
@@ -3345,11 +3227,11 @@ var require_main = __commonJS({
                 }
               );
             });
-            latestScreenShareOverlayTabId = targetTab.id;
+            latestScreenShareOverlayTabId = targetTabId;
             sendResponse({
               ok: true,
               streamId,
-              targetTabId: targetTab.id,
+              targetTabId,
               sourceLabel: targetTab.title || targetTab.url || "Browser tab"
             });
           } catch (error) {

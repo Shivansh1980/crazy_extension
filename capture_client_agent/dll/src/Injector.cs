@@ -1,24 +1,16 @@
 // Host / injector entry point for the PageSignal native agent.
 //
 // Modes:
-//   PageSignalAgentHost.exe                 — runs the agent in this process (foreground).
-//   PageSignalAgentHost.exe run             — same as above.
+//   PageSignalAgentHost.exe                 - runs the agent in this process (foreground).
+//   PageSignalAgentHost.exe run             - same as above.
 //   PageSignalAgentHost.exe inject <pid> [<dll-path>]
-//                                           — injects the supplied DLL into the target
+//                                           - injects the supplied DLL into the target
 //                                             process via CreateRemoteThread+LoadLibraryW.
 //                                             Defaults to the bootstrap shim next to this EXE.
 //
-// IMPORTANT — true cross-process injection of the *managed* agent DLL into a native
-// process requires a tiny native bootstrap DLL that hosts the CLR and calls
-// PageSignal.NativeAgent.Agent.StartBackground(). The C++ source for that shim is
-// shipped as bootstrap.cpp in this folder; it must be compiled with MSVC (cl.exe)
-// because no C++ compiler was available in the build environment. Once compiled
-// to PageSignalBootstrap.dll, point this injector at it:
-//
-//     PageSignalAgentHost.exe inject <pid> PageSignalBootstrap.dll
-//
-// For target processes that already host the .NET Framework CLR (e.g. other .NET
-// EXEs), you can skip the shim and inject the managed DLL directly.
+// The architecture-specific native bootstrap hosts .NET Framework CLR v4 and calls
+// PageSignal.NativeAgent.Agent.StartBackgroundFromBootstrap(). Keep the host,
+// managed agent, and both bootstrap DLLs together in the portable dist folder.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -71,20 +63,6 @@ namespace PageSignal.NativeAgent.Host
                         Console.Error.WriteLine("Unexpected argument: " + a);
                         return 2;
                     }
-                    if (dll == null)
-                    {
-                        string here = Path.GetDirectoryName(typeof(Program).Assembly.Location);
-                        string shim = Path.Combine(here, "PageSignalBootstrap.dll");
-                        if (!File.Exists(shim))
-                        {
-                            Console.Error.WriteLine(
-                                "PageSignalBootstrap.dll not found next to host EXE.\n" +
-                                "Either pass an explicit DLL path or compile bootstrap.cpp with MSVC first.");
-                            return 3;
-                        }
-                        dll = shim;
-                    }
-
                     int[] pids = ResolveTargets(target, injectAll, waitSeconds);
                     if (pids.Length == 0)
                     {
@@ -99,6 +77,10 @@ namespace PageSignal.NativeAgent.Host
                         if (rc != 0) failures++;
                     }
                     return failures == 0 ? 0 : 11;
+                }
+                if (string.Equals(args[0], "ui", StringComparison.OrdinalIgnoreCase))
+                {
+                    return LaunchInjectorUi();
                 }
                 if (string.Equals(args[0], "list", StringComparison.OrdinalIgnoreCase))
                 {
@@ -127,15 +109,29 @@ namespace PageSignal.NativeAgent.Host
         {
             Console.WriteLine("PageSignal native agent host");
             Console.WriteLine("  run                                          Run the agent in this process (default).");
+            Console.WriteLine("  ui                                           Open the graphical process injector.");
             Console.WriteLine("  list [<name-substring>]                      List running processes (filtered).");
             Console.WriteLine("  inject <pid|name|name.exe> [<dll-path>]");
             Console.WriteLine("           [--all] [--wait[=seconds]]          Inject DLL into target process(es).");
             Console.WriteLine();
             Console.WriteLine("Examples:");
             Console.WriteLine("  PageSignalAgentHost.exe inject notepad.exe");
-            Console.WriteLine("  PageSignalAgentHost.exe inject 12345 .\\dist\\PageSignalBootstrap.dll");
+            Console.WriteLine("  PageSignalAgentHost.exe inject 12345 .\\dist\\PageSignalBootstrap.x64.dll");
             Console.WriteLine("  PageSignalAgentHost.exe inject chrome --all");
             Console.WriteLine("  PageSignalAgentHost.exe inject MyGame.exe --wait=30");
+        }
+
+        private static int LaunchInjectorUi()
+        {
+            string here = Path.GetDirectoryName(typeof(Program).Assembly.Location);
+            string uiPath = Path.Combine(here, "PageSignalInjector.exe");
+            if (!File.Exists(uiPath))
+            {
+                Console.Error.WriteLine("PageSignalInjector.exe was not found next to the host executable.");
+                return 3;
+            }
+            Process.Start(new ProcessStartInfo(uiPath) { UseShellExecute = true, WorkingDirectory = here });
+            return 0;
         }
 
         // ----------------- in-process mode -----------------
@@ -150,7 +146,16 @@ namespace PageSignal.NativeAgent.Host
         }
 
         // ----------------- remote injection -----------------
-        private const uint PROCESS_ALL_ACCESS = 0x001F0FFF;
+        private const uint PROCESS_CREATE_THREAD = 0x0002;
+        private const uint PROCESS_VM_OPERATION = 0x0008;
+        private const uint PROCESS_VM_READ = 0x0010;
+        private const uint PROCESS_VM_WRITE = 0x0020;
+        private const uint PROCESS_QUERY_INFORMATION = 0x0400;
+        private const uint PROCESS_INJECTION_ACCESS = PROCESS_CREATE_THREAD
+            | PROCESS_VM_OPERATION
+            | PROCESS_VM_READ
+            | PROCESS_VM_WRITE
+            | PROCESS_QUERY_INFORMATION;
         private const uint MEM_COMMIT = 0x1000;
         private const uint MEM_RESERVE = 0x2000;
         private const uint MEM_RELEASE = 0x8000;
@@ -188,14 +193,7 @@ namespace PageSignal.NativeAgent.Host
 
         private static int Inject(int pid, string dllPath)
         {
-            Console.WriteLine("[PageSignal] injecting " + dllPath + " -> pid " + pid);
-            if (!File.Exists(dllPath))
-            {
-                Console.Error.WriteLine("DLL not found: " + dllPath);
-                return 4;
-            }
-
-            IntPtr hProc = OpenProcess(PROCESS_ALL_ACCESS, false, pid);
+            IntPtr hProc = OpenProcess(PROCESS_INJECTION_ACCESS, false, pid);
             if (hProc == IntPtr.Zero)
             {
                 Console.Error.WriteLine("OpenProcess failed (pid " + pid + "): " + Marshal.GetLastWin32Error()
@@ -209,6 +207,14 @@ namespace PageSignal.NativeAgent.Host
                 bool hostIsX64 = IntPtr.Size == 8;
                 // On a 64-bit OS, a non-Wow64 process is x64; on a 32-bit OS every process is x86.
                 bool targetIsX64 = Environment.Is64BitOperatingSystem && !targetIsWow64;
+                if (string.IsNullOrEmpty(dllPath))
+                    dllPath = DefaultBootstrapPath(targetIsX64);
+                Console.WriteLine("[PageSignal] injecting " + dllPath + " -> pid " + pid);
+                if (!File.Exists(dllPath))
+                {
+                    Console.Error.WriteLine("DLL not found: " + dllPath);
+                    return 4;
+                }
                 if (targetIsX64 != hostIsX64)
                 {
                     // Try to relay to the sibling-bitness host EXE shipped next to this one.
@@ -275,6 +281,14 @@ namespace PageSignal.NativeAgent.Host
                 }
             }
             finally { CloseHandle(hProc); }
+        }
+
+        private static string DefaultBootstrapPath(bool targetIsX64)
+        {
+            string here = Path.GetDirectoryName(typeof(Program).Assembly.Location);
+            return Path.Combine(
+                here,
+                targetIsX64 ? "PageSignalBootstrap.x64.dll" : "PageSignalBootstrap.x86.dll");
         }
 
         // ----------------- target resolution -----------------

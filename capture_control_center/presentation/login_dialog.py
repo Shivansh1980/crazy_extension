@@ -25,19 +25,27 @@ class LoginDialog:
 
     def __init__(
         self,
-        title: str = 'Capture Control Center — Sign in',
+        title: str = 'Capture Control Center - Sign in',
         relay_url: str = '',
         default_username: str = '',
         error_message: str = '',
+        parent: tk.Misc | None = None,
     ) -> None:
         self._title = title
         self._relay_url = relay_url
         self._default_username = default_username
         self._error_message = error_message
+        self._parent = parent
         self._result: LoginResult | None = None
 
     def prompt(self) -> LoginResult:
-        root = tk.Tk()
+        root: tk.Tk | tk.Toplevel
+        if self._parent is None:
+            root = tk.Tk()
+        else:
+            root = tk.Toplevel(self._parent)
+            root.transient(self._parent)
+            root.grab_set()
         root.title(self._title)
         root.resizable(False, False)
         root.protocol('WM_DELETE_WINDOW', lambda: self._on_cancel(root))
@@ -98,13 +106,16 @@ class LoginDialog:
         y = (root.winfo_screenheight() - height) // 2
         root.geometry(f'+{x}+{y}')
 
-        root.mainloop()
+        if self._parent is None:
+            root.mainloop()
+        else:
+            self._parent.wait_window(root)
 
         return self._result or LoginResult(username='', password='', cancelled=True)
 
     def _on_submit(
         self,
-        root: tk.Tk,
+        root: tk.Tk | tk.Toplevel,
         username: str,
         password: str,
         error_var: tk.StringVar,
@@ -116,7 +127,7 @@ class LoginDialog:
         self._result = LoginResult(username=username, password=password, cancelled=False)
         root.destroy()
 
-    def _on_cancel(self, root: tk.Tk) -> None:
+    def _on_cancel(self, root: tk.Tk | tk.Toplevel) -> None:
         self._result = LoginResult(username='', password='', cancelled=True)
         root.destroy()
 

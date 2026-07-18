@@ -1,13 +1,22 @@
 var __getOwnPropNames = Object.getOwnPropertyNames;
-var __esm = (fn, res) => function __init() {
-  return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+var __esm = (fn, res, err) => function __init() {
+  if (err) throw err[0];
+  try {
+    return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+  } catch (e) {
+    throw err = [e], e;
+  }
 };
 var __commonJS = (cb, mod) => function __require() {
-  return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
+  try {
+    return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
+  } catch (e) {
+    throw mod = 0, e;
+  }
 };
 
 // src/shared/constants.ts
-var SETTINGS_STORAGE_KEY, STATUS_STORAGE_KEY, DEFAULT_WEBSOCKET_URL, DEFAULT_WEBSOCKET_RESOLVER_URL, DEFAULT_WEBSOCKET_SECONDARY_RESOLVER_URL, DEFAULT_RELAY_URL, DEFAULT_SESSION_ID, BRIDGE_CLIENT_NAME, BRIDGE_RECONNECT_INTERVAL_MS, BRIDGE_RESOLVER_TIMEOUT_MS, BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD, DEFAULT_SETTINGS, DEFAULT_STATUS;
+var SETTINGS_STORAGE_KEY, STATUS_STORAGE_KEY, DEFAULT_WEBSOCKET_URL, DEFAULT_WEBSOCKET_RESOLVER_URL, DEFAULT_WEBSOCKET_SECONDARY_RESOLVER_URL, DEFAULT_RELAY_URL, DEFAULT_SESSION_ID, BRIDGE_CLIENT_NAME, BRIDGE_RECONNECT_INTERVAL_MS, BRIDGE_RECONNECT_MAX_INTERVAL_MS, BRIDGE_CONNECT_TIMEOUT_MS, BRIDGE_RESOLVER_TIMEOUT_MS, BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD, DEFAULT_SETTINGS, DEFAULT_STATUS;
 var init_constants = __esm({
   "src/shared/constants.ts"() {
     "use strict";
@@ -20,6 +29,8 @@ var init_constants = __esm({
     DEFAULT_SESSION_ID = "default";
     BRIDGE_CLIENT_NAME = "page-signal-capture";
     BRIDGE_RECONNECT_INTERVAL_MS = 5e3;
+    BRIDGE_RECONNECT_MAX_INTERVAL_MS = 3e4;
+    BRIDGE_CONNECT_TIMEOUT_MS = 12e3;
     BRIDGE_RESOLVER_TIMEOUT_MS = 5e3;
     BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD = 5;
     DEFAULT_SETTINGS = {
@@ -111,7 +122,7 @@ function normalizeOptionalWebSocketUrl(value) {
   return toWebSocketUrl(value, "");
 }
 function normalizeResolverUrl(value) {
-  const trimmed = value.trim();
+  const trimmed = typeof value === "string" ? value.trim() : "";
   if (!trimmed) {
     return "";
   }
@@ -209,7 +220,7 @@ function tryExtractFromJson(payload) {
   }
 }
 function toWebSocketUrl(value, fallback) {
-  const trimmed = value.trim();
+  const trimmed = typeof value === "string" ? value.trim() : "";
   if (!trimmed) {
     return fallback;
   }
@@ -272,12 +283,15 @@ var init_ChromeSettingsRepository = __esm({
         return nextValue;
       }
       normalize(settings) {
+        const fileNamePrefix = typeof settings.fileNamePrefix === "string" ? settings.fileNamePrefix.trim() : "";
+        const requestTimeout = Number(settings.requestTimeoutMs);
+        const resolverUrl = typeof settings.websocketResolverUrl === "string" && settings.websocketResolverUrl.trim() ? settings.websocketResolverUrl : DEFAULT_WEBSOCKET_RESOLVER_URL;
         return {
-          enabled: Boolean(settings.enabled),
+          enabled: typeof settings.enabled === "boolean" ? settings.enabled : DEFAULT_SETTINGS.enabled,
           websocketUrl: normalizeWebSocketUrl(settings.websocketUrl),
-          websocketResolverUrl: normalizeResolverUrl(DEFAULT_WEBSOCKET_RESOLVER_URL),
-          fileNamePrefix: settings.fileNamePrefix.trim() || DEFAULT_SETTINGS.fileNamePrefix,
-          requestTimeoutMs: Math.max(1e3, Math.round(settings.requestTimeoutMs || DEFAULT_SETTINGS.requestTimeoutMs)),
+          websocketResolverUrl: normalizeResolverUrl(resolverUrl),
+          fileNamePrefix: fileNamePrefix || DEFAULT_SETTINGS.fileNamePrefix,
+          requestTimeoutMs: Number.isFinite(requestTimeout) ? Math.min(12e4, Math.max(1e3, Math.round(requestTimeout))) : DEFAULT_SETTINGS.requestTimeoutMs,
           connectionMode: normalizeConnectionMode(settings.connectionMode),
           relayUrl: normalizeRelayUrl(settings.relayUrl),
           sessionId: normalizeSessionId(settings.sessionId)
@@ -406,7 +420,7 @@ var require_offscreen = __commonJS({
       async runStart(forceReconnect) {
         const settings = await this.settingsRepository.get();
         debugLog("offscreen", "Loaded bridge settings.", settings);
-        const settingsChanged = this.currentSettings === null || this.currentSettings.websocketUrl !== settings.websocketUrl || this.currentSettings.websocketResolverUrl !== settings.websocketResolverUrl || this.currentSettings.enabled !== settings.enabled;
+        const settingsChanged = this.currentSettings === null || this.connectionSettingsKey(this.currentSettings) !== this.connectionSettingsKey(settings);
         const shouldReplaceExistingSocket = forceReconnect || settingsChanged;
         this.currentSettings = settings;
         if (settingsChanged) {
@@ -423,7 +437,25 @@ var require_offscreen = __commonJS({
         if (!forceReconnect && this.socket && this.socket.readyState !== WebSocket.CLOSED) {
           return;
         }
-        await this.connect(settings, settingsChanged);
+        try {
+          await this.connect(settings, settingsChanged);
+        } catch (error) {
+          this.consecutiveConnectionFailures += 1;
+          if (this.resolvedEndpoint) {
+            this.recordFailedAttempt(this.resolvedEndpoint.source);
+          }
+          const messageText = error instanceof Error ? error.message : "Bridge connection setup failed.";
+          const retryDelayMs = this.reconnectDelayMs();
+          await this.updateStatus({
+            state: "disconnected",
+            updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+            message: `Bridge connection setup failed: ${messageText}. Retrying in ${Math.ceil(retryDelayMs / 1e3)} seconds.`,
+            lastFileName: null,
+            targetUrl: this.resolvedTargetUrl ?? settings.websocketUrl
+          });
+          this.scheduleReconnect(retryDelayMs);
+          throw error;
+        }
       }
       async connect(settings, settingsChanged) {
         this.clearReconnectTimer();
@@ -446,7 +478,18 @@ var require_offscreen = __commonJS({
         const socket = new WebSocket(normalizedEndpoint.targetUrl);
         socket.binaryType = "arraybuffer";
         this.socket = socket;
+        const connectTimeoutHandle = window.setTimeout(() => {
+          if (generation === this.connectionGeneration && socket.readyState === WebSocket.CONNECTING) {
+            debugWarn("offscreen", "WebSocket handshake timed out.", {
+              targetUrl: normalizedEndpoint.targetUrl,
+              timeoutMs: BRIDGE_CONNECT_TIMEOUT_MS
+            });
+            socket.close(4001, "Bridge connection timed out");
+          }
+        }, BRIDGE_CONNECT_TIMEOUT_MS);
+        const clearConnectTimeout = () => window.clearTimeout(connectTimeoutHandle);
         socket.addEventListener("open", () => {
+          clearConnectTimeout();
           if (generation !== this.connectionGeneration) {
             socket.close();
             return;
@@ -458,15 +501,27 @@ var require_offscreen = __commonJS({
           this.hasConnectedOnce = true;
           debugLog("offscreen", "running...");
           debugLog("offscreen", "WebSocket connection opened.", normalizedEndpoint.targetUrl);
-          this.send({
+          const registrationSent = this.send({
             type: "client.register",
             clientId: this.clientId,
             name: BRIDGE_CLIENT_NAME,
             version: "1.0.0",
             role: "extension-client",
             sessionId: settings.sessionId || "default",
-            capabilities: ["capture.full-page", "screen-share.preview"]
+            capabilities: [
+              "capture.full-page",
+              "clipboard.write",
+              "popup.browser",
+              "file-transfer.browser",
+              "screen-share.preview",
+              "screen-share.input",
+              "screen-share.paste"
+            ]
           });
+          if (!registrationSent) {
+            socket.close();
+            return;
+          }
           this.flushPendingBridgeMessages();
           void this.publishPopupStatus();
           void this.publishPopupMessageHistory();
@@ -491,6 +546,7 @@ var require_offscreen = __commonJS({
           socket.close();
         });
         socket.addEventListener("close", (event) => {
+          clearConnectTimeout();
           if (generation !== this.connectionGeneration) {
             return;
           }
@@ -513,14 +569,15 @@ var require_offscreen = __commonJS({
             debugLog("offscreen", "WebSocket connection closed; reconnect will be attempted.", closeDetails);
           }
           const retryHint = this.buildReconnectHint();
+          const retryDelayMs = this.reconnectDelayMs();
           void this.updateStatus({
             state: "disconnected",
             updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
-            message: `Bridge connection closed. Retrying ${endpoint.targetUrl} in 5 seconds. Failure count: ${this.consecutiveConnectionFailures}.${retryHint}`,
+            message: `Bridge connection closed. Retrying in ${Math.ceil(retryDelayMs / 1e3)} seconds. Failure count: ${this.consecutiveConnectionFailures}.${retryHint}`,
             lastFileName: null,
             targetUrl: endpoint.targetUrl
           });
-          this.scheduleReconnect();
+          this.scheduleReconnect(retryDelayMs);
         });
       }
       async handleMessage(rawData, targetUrl, settings, generation) {
@@ -1102,23 +1159,32 @@ var require_offscreen = __commonJS({
         }
       }
       send(message) {
-        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+        const socket = this.socket;
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
           debugWarn("offscreen", "Skipping websocket send because socket is not open.", message.type);
-          return;
+          return false;
         }
-        debugLog("offscreen", "Sending websocket message.", message.type);
-        this.socket.send(JSON.stringify(message));
+        try {
+          debugLog("offscreen", "Sending websocket message.", message.type);
+          socket.send(JSON.stringify(message));
+          return true;
+        } catch (error) {
+          debugWarn("offscreen", "Websocket send failed; preserving the message for reconnect.", {
+            type: message.type,
+            error: error instanceof Error ? error.message : String(error)
+          });
+          try {
+            socket.close();
+          } catch {
+          }
+          return false;
+        }
       }
       sendOrQueueBridgeMessage(message) {
-        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-          debugLog("offscreen", "Queueing bridge message until websocket is open.", message.type);
-          this.pendingBridgeMessages.push(message);
-          if (this.pendingBridgeMessages.length > 20) {
-            this.pendingBridgeMessages.splice(0, this.pendingBridgeMessages.length - 20);
-          }
+        if (this.send(message)) {
           return;
         }
-        this.send(message);
+        this.enqueuePendingBridgeMessage(message);
       }
       sendOrQueueBinaryCaptureResult(requestId, capturedPage) {
         const queuedMessage = {
@@ -1126,39 +1192,59 @@ var require_offscreen = __commonJS({
           requestId,
           capturedPage
         };
-        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-          debugLog("offscreen", "Queueing binary capture result until websocket is open.", {
-            requestId,
-            fileName: capturedPage.fileName
-          });
-          this.pendingBridgeMessages.push(queuedMessage);
-          if (this.pendingBridgeMessages.length > 20) {
-            this.pendingBridgeMessages.splice(0, this.pendingBridgeMessages.length - 20);
-          }
+        if (this.sendBinaryCaptureResult(requestId, capturedPage)) {
           return;
         }
-        this.sendBinaryCaptureResult(requestId, capturedPage);
+        debugLog("offscreen", "Queueing binary capture result until websocket is open.", {
+          requestId,
+          fileName: capturedPage.fileName
+        });
+        this.enqueuePendingBridgeMessage(queuedMessage);
       }
       flushPendingBridgeMessages() {
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN || this.pendingBridgeMessages.length === 0) {
           return;
         }
-        const queuedMessages = [...this.pendingBridgeMessages];
-        this.pendingBridgeMessages = [];
-        for (const message of queuedMessages) {
-          if (message.type === "capture.result.binary") {
-            this.sendBinaryCaptureResult(message.requestId, message.capturedPage);
-            continue;
+        while (this.pendingBridgeMessages.length > 0) {
+          const message = this.pendingBridgeMessages[0];
+          if (!message) {
+            return;
           }
-          this.send(message);
+          const sent = message.type === "capture.result.binary" ? this.sendBinaryCaptureResult(message.requestId, message.capturedPage) : this.send(message);
+          if (!sent) {
+            return;
+          }
+          this.pendingBridgeMessages.shift();
+        }
+      }
+      enqueuePendingBridgeMessage(message) {
+        if (message.type === "popup.status" || message.type === "screen-share.status") {
+          const existingIndex = this.pendingBridgeMessages.findIndex((candidate) => candidate.type === message.type);
+          if (existingIndex >= 0) {
+            this.pendingBridgeMessages.splice(existingIndex, 1);
+          }
+        }
+        this.pendingBridgeMessages.push(message);
+        if (this.pendingBridgeMessages.length > 20) {
+          const dropped = this.pendingBridgeMessages.shift();
+          debugWarn("offscreen", "Bridge recovery queue reached its limit; dropping the oldest message.", dropped?.type);
         }
       }
       sendBinaryCaptureResult(requestId, capturedPage) {
-        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+        const socket = this.socket;
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
           debugWarn("offscreen", "Skipping binary capture send because socket is not open.", requestId);
-          return;
+          return false;
         }
-        const imageBytes = this.base64ToBytes(capturedPage.base64Data);
+        let imageBytes;
+        try {
+          imageBytes = this.base64ToBytes(capturedPage.base64Data);
+        } catch (error) {
+          const messageText = error instanceof Error ? error.message : "Captured image data could not be encoded.";
+          debugError("offscreen", "Unable to encode binary capture result.", { requestId, error: messageText });
+          this.send({ type: "capture.error", requestId, message: messageText });
+          return true;
+        }
         const metadataBytes = new TextEncoder().encode(
           JSON.stringify({
             type: "capture.result.binary",
@@ -1185,10 +1271,24 @@ var require_offscreen = __commonJS({
           bytes: imageBytes.length,
           metadataBytes: metadataBytes.length
         });
-        this.socket.send(envelope.buffer);
+        try {
+          socket.send(envelope.buffer);
+          return true;
+        } catch (error) {
+          debugWarn("offscreen", "Binary capture send failed; preserving it for reconnect.", {
+            requestId,
+            error: error instanceof Error ? error.message : String(error)
+          });
+          try {
+            socket.close();
+          } catch {
+          }
+          return false;
+        }
       }
       sendPopupFileUpload(metadata, fileBytes) {
-        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+        const socket = this.socket;
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
           throw new Error("The desktop bridge is not connected. Reconnect the GUI bridge before sending files from the popup.");
         }
         const metadataBytes = new TextEncoder().encode(JSON.stringify(metadata));
@@ -1204,7 +1304,15 @@ var require_offscreen = __commonJS({
           pageUrl: metadata.pageUrl,
           tabId: metadata.tabId
         });
-        this.socket.send(envelope.buffer);
+        try {
+          socket.send(envelope.buffer);
+        } catch (error) {
+          try {
+            socket.close();
+          } catch {
+          }
+          throw new Error(`The desktop bridge disconnected while sending ${metadata.fileName}: ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
       base64ToBytes(base64Data) {
         const normalizedBase64 = base64Data.replace(/\s+/g, "");
@@ -1315,15 +1423,31 @@ var require_offscreen = __commonJS({
           activeElement?.focus({ preventScroll: true });
         }
       }
-      scheduleReconnect() {
+      scheduleReconnect(delayMs = this.reconnectDelayMs()) {
         if (this.reconnectTimer !== null) {
           return;
         }
-        debugLog("offscreen", "Scheduling reconnect.", BRIDGE_RECONNECT_INTERVAL_MS);
+        debugLog("offscreen", "Scheduling reconnect.", delayMs);
         this.reconnectTimer = window.setTimeout(() => {
           this.reconnectTimer = null;
-          void this.start(true);
-        }, BRIDGE_RECONNECT_INTERVAL_MS);
+          void this.start(true).catch((error) => {
+            debugWarn("offscreen", "Scheduled bridge reconnect failed; another retry remains scheduled.", error);
+          });
+        }, delayMs);
+      }
+      reconnectDelayMs() {
+        const exponent = Math.max(0, Math.min(6, this.consecutiveConnectionFailures - 1));
+        return Math.min(BRIDGE_RECONNECT_INTERVAL_MS * 2 ** exponent, BRIDGE_RECONNECT_MAX_INTERVAL_MS);
+      }
+      connectionSettingsKey(settings) {
+        return JSON.stringify({
+          enabled: settings.enabled,
+          websocketUrl: settings.websocketUrl,
+          websocketResolverUrl: settings.websocketResolverUrl,
+          connectionMode: settings.connectionMode,
+          relayUrl: settings.relayUrl,
+          sessionId: settings.sessionId
+        });
       }
       clearReconnectTimer() {
         if (this.reconnectTimer !== null) {
@@ -1440,9 +1564,6 @@ var require_offscreen = __commonJS({
           return;
         }
         if (this.nextEndpointMode === "relay") {
-          if (settings?.connectionMode === "relay") {
-            return;
-          }
           this.nextEndpointMode = "pastebin";
           this.localRetryAttempts = 0;
           return;
@@ -1610,6 +1731,16 @@ var require_offscreen = __commonJS({
             }
           });
         }
+        window.addEventListener("online", () => {
+          if (!this.currentSettings?.enabled || this.socket?.readyState === WebSocket.OPEN) {
+            return;
+          }
+          debugLog("offscreen", "Browser returned online; retrying the bridge immediately.");
+          this.clearReconnectTimer();
+          void this.start(true).catch((error) => {
+            debugWarn("offscreen", "Immediate reconnect after browser online event failed.", error);
+          });
+        });
       }
     };
     var bridgeClient = new ExtensionBridgeClient();

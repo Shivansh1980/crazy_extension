@@ -1,12 +1,13 @@
 // PageSignal CLR-bootstrap shim for cross-process DLL injection.
 //
-// Build (MSVC x64 Developer Prompt):
-//     cl /LD /EHsc /O2 bootstrap.cpp /Fe:PageSignalBootstrap.dll mscoree.lib
+// Build (MSVC x64 or x86 Developer Prompt):
+//     cl /LD /EHsc /O2 bootstrap.cpp /Fe:PageSignalBootstrap.<arch>.dll mscoree.lib
 //
 // What this DLL does when LoadLibrary'd into a target process:
 //   1. On DLL_PROCESS_ATTACH it spawns a worker thread.
 //   2. The worker thread starts the .NET Framework 4.x CLR via mscoree (CLRCreateInstance).
-//   3. It calls PageSignal.NativeAgent.Agent.StartBackground() in PageSignalAgent.dll.
+//   3. It calls the signature-compatible StartBackgroundFromBootstrap adapter in
+//      PageSignalAgent.dll.
 //
 // PageSignalAgent.dll is expected to live alongside this DLL on disk.
 
@@ -14,16 +15,14 @@
 #include <windows.h>
 #include <metahost.h>
 #include <string>
+#include <vector>
 #pragma comment(lib, "mscoree.lib")
 
-#import "mscorlib.tlb" raw_interfaces_only \
-    high_property_prefixes("_get","_put","_putref") rename("ReportEvent","InteropServices_ReportEvent")
-
 static std::wstring ModuleDirectory(HMODULE h) {
-    wchar_t buf[MAX_PATH];
-    DWORD n = GetModuleFileNameW(h, buf, MAX_PATH);
-    if (n == 0) return L"";
-    std::wstring p(buf, n);
+    std::vector<wchar_t> buf(32768, L'\0');
+    DWORD n = GetModuleFileNameW(h, buf.data(), static_cast<DWORD>(buf.size()));
+    if (n == 0 || n >= buf.size()) return L"";
+    std::wstring p(buf.data(), n);
     size_t slash = p.find_last_of(L"\\/");
     return (slash == std::wstring::npos) ? L"" : p.substr(0, slash);
 }
@@ -59,7 +58,7 @@ static DWORD WINAPI Bootstrap(LPVOID) {
     hr = runtimeHost->ExecuteInDefaultAppDomain(
         asmPath.c_str(),
         L"PageSignal.NativeAgent.Agent",
-        L"StartBackground",
+        L"StartBackgroundFromBootstrap",
         L"", // unused argument
         &ret);
 

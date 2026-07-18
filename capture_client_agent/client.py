@@ -7,12 +7,17 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse, urlunparse
 from urllib.request import urlopen
 
 from websockets.asyncio.client import connect
 
 from capture_client_agent.input_dispatcher import OsInputDispatcher
+from capture_client_agent.connection_config import (
+    DEFAULT_WEBSOCKET_URL,
+    NativeConnectionConfig,
+    find_upwards,
+    normalize_websocket_url,
+)
 from capture_client_agent.native_popup import NativePopupService
 from capture_client_agent.screen_capture import (
     ScreenCaptureService,
@@ -23,15 +28,10 @@ from capture_client_agent.screen_capture import (
 from capture_control_center.debug import debug_log
 
 
-DEFAULT_WEBSOCKET_URL = 'ws://127.0.0.1:8765'
-DEFAULT_WEBSOCKET_RESOLVER_URL = 'https://pastebin.com/raw/pmrhGPW5'
-DEFAULT_WEBSOCKET_SECONDARY_RESOLVER_URL = (
-    'https://raw.githubusercontent.com/Shivansh1980/crazy_extension/refs/heads/main/server_url.txt'
-)
 RECONNECT_INTERVAL_SECONDS = 5
 LOCALHOST_ATTEMPT_THRESHOLD = 5
 CLIENT_NAME = 'page-signal-native-client'
-CLIENT_VERSION = '2.0.0'
+CLIENT_VERSION = '2.1.0'
 LOCAL_RESOLVER_FILE_NAME = 'server_url.txt'
 
 
@@ -39,6 +39,18 @@ LOCAL_RESOLVER_FILE_NAME = 'server_url.txt'
 class ResolvedEndpoint:
     url: str
     source: str
+
+
+class SerializedWebSocketSender:
+    """Allow capture, popup, and request handlers to share one socket safely."""
+
+    def __init__(self, websocket: Any) -> None:
+        self._websocket = websocket
+        self._send_lock = asyncio.Lock()
+
+    async def send(self, payload: str | bytes) -> None:
+        async with self._send_lock:
+            await self._websocket.send(payload)
 
 
 class BackgroundCaptureClient:
@@ -52,8 +64,9 @@ class BackgroundCaptureClient:
 
     def __init__(self, project_directory: Path) -> None:
         self._project_directory = project_directory
+        self._connection_config = NativeConnectionConfig.load(project_directory)
         self._client_id = str(uuid.uuid4())
-        self._localhost_failure_count = 0
+        self._stop_event = asyncio.Event()
         try:
             self._input_dispatcher: OsInputDispatcher | None = OsInputDispatcher()
             self._input_capable = True
@@ -92,10 +105,15 @@ class BackgroundCaptureClient:
             'Starting native capture client.',
             {'client_id': self._client_id},
         )
-        while True:
-            for endpoint in self._connection_plan():
+        while not self._stop_event.is_set():
+            connection_plan = await asyncio.to_thread(self._connection_plan)
+            for endpoint in connection_plan:
+                if self._stop_event.is_set():
+                    return
                 try:
                     await self._connect(endpoint)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as error:  # noqa: BLE001 - reconnect on any failure
                     debug_log(
                         'client-agent',
@@ -107,57 +125,63 @@ class BackgroundCaptureClient:
                             'retry_in_seconds': RECONNECT_INTERVAL_SECONDS,
                         },
                     )
-                    await asyncio.sleep(RECONNECT_INTERVAL_SECONDS)
+                    try:
+                        await asyncio.wait_for(self._stop_event.wait(), timeout=RECONNECT_INTERVAL_SECONDS)
+                    except asyncio.TimeoutError:
+                        pass
                     continue
             debug_log(
                 'client-agent',
                 'All endpoints exhausted; restarting cycle.',
             )
 
+    def stop(self) -> None:
+        self._stop_event.set()
+
     def _connection_plan(self) -> list[ResolvedEndpoint]:
         plan: list[ResolvedEndpoint] = []
+
+        if self._connection_config.mode == 'relay' and self._connection_config.relay_url:
+            plan.append(ResolvedEndpoint(url=self._connection_config.relay_url, source='configured-relay'))
 
         # Mirror the Chrome extension's strategy: Pastebin first, then the GitHub raw
         # fallback, then localhost up to LOCALHOST_ATTEMPT_THRESHOLD times (with the
         # RECONNECT_INTERVAL_SECONDS pause between failures handled by run_forever).
-        pastebin_endpoint = self._resolve_remote_endpoint(DEFAULT_WEBSOCKET_RESOLVER_URL)
-        if pastebin_endpoint is not None:
-            plan.append(
-                ResolvedEndpoint(url=pastebin_endpoint.url, source='pastebin-resolver')
-            )
+        if self._connection_config.mode == 'auto':
+            pastebin_endpoint = self._resolve_remote_endpoint(self._connection_config.resolver_url)
+            if pastebin_endpoint is not None:
+                plan.append(ResolvedEndpoint(url=pastebin_endpoint.url, source='primary-resolver'))
 
-        github_endpoint = self._resolve_remote_endpoint(DEFAULT_WEBSOCKET_SECONDARY_RESOLVER_URL)
-        if github_endpoint is not None:
-            plan.append(
-                ResolvedEndpoint(url=github_endpoint.url, source='github-resolver')
-            )
+            github_endpoint = self._resolve_remote_endpoint(self._connection_config.secondary_resolver_url)
+            if github_endpoint is not None:
+                plan.append(ResolvedEndpoint(url=github_endpoint.url, source='secondary-resolver'))
 
-        local_endpoint = self._resolve_local_endpoint()
-        if local_endpoint is not None:
-            for attempt in range(LOCALHOST_ATTEMPT_THRESHOLD):
-                plan.append(
-                    ResolvedEndpoint(
-                        url=local_endpoint.url,
-                        source=f'{local_endpoint.source}#{attempt + 1}',
-                    )
-                )
+        if self._connection_config.mode == 'auto':
+            local_endpoint = self._resolve_local_endpoint()
+            if local_endpoint is not None and all(item.url != local_endpoint.url for item in plan):
+                plan.append(local_endpoint)
 
-        if not plan:
-            plan.append(ResolvedEndpoint(url=DEFAULT_WEBSOCKET_URL, source='default-fallback'))
+        direct_url = self._connection_config.direct_url or DEFAULT_WEBSOCKET_URL
+        for attempt in range(LOCALHOST_ATTEMPT_THRESHOLD):
+            plan.append(ResolvedEndpoint(url=direct_url, source=f'configured-direct#{attempt + 1}'))
+        if self._connection_config.mode == 'auto' and self._connection_config.relay_url:
+            plan.append(ResolvedEndpoint(url=self._connection_config.relay_url, source='configured-relay-fallback'))
         return plan
 
     def _resolve_local_endpoint(self) -> ResolvedEndpoint | None:
-        resolver_path = self._project_directory / LOCAL_RESOLVER_FILE_NAME
-        if not resolver_path.is_file():
-            return ResolvedEndpoint(url=DEFAULT_WEBSOCKET_URL, source='default-local')
+        resolver_path = find_upwards(self._project_directory, 'server_url.local.txt')
+        if resolver_path is None:
+            resolver_path = find_upwards(self._project_directory, LOCAL_RESOLVER_FILE_NAME)
+        if resolver_path is None:
+            return None
         try:
             raw_value = resolver_path.read_text(encoding='utf-8').strip()
         except OSError as error:
             debug_log('client-agent', 'Failed to read local resolver file.', {'error': str(error)})
-            return ResolvedEndpoint(url=DEFAULT_WEBSOCKET_URL, source='default-local')
+            return None
         normalized = self._normalize_target_url(raw_value)
         if normalized is None:
-            return ResolvedEndpoint(url=DEFAULT_WEBSOCKET_URL, source='default-local')
+            return None
         return ResolvedEndpoint(url=normalized, source='local-file')
 
     def _resolve_remote_endpoint(self, resolver_url: str) -> ResolvedEndpoint | None:
@@ -167,30 +191,23 @@ class BackgroundCaptureClient:
         except Exception as error:  # noqa: BLE001 - resolver is best effort
             debug_log('client-agent', 'Remote resolver fetch failed.', {'error': str(error)})
             return None
+        try:
+            parsed_payload = json.loads(raw_value)
+        except json.JSONDecodeError:
+            parsed_payload = None
+        if isinstance(parsed_payload, dict):
+            for key in ('websocketUrl', 'webSocketUrl', 'bridgeUrl', 'url', 'targetUrl'):
+                candidate = parsed_payload.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    raw_value = candidate.strip()
+                    break
         normalized = self._normalize_target_url(raw_value)
         if normalized is None:
             return None
         return ResolvedEndpoint(url=normalized, source='remote-resolver')
 
     def _normalize_target_url(self, raw_value: str) -> str | None:
-        if not raw_value:
-            return None
-        candidate = raw_value.strip()
-        if candidate.startswith('tcp://'):
-            candidate = 'ws://' + candidate[len('tcp://'):]
-        if candidate.startswith('http://'):
-            candidate = 'ws://' + candidate[len('http://'):]
-        elif candidate.startswith('https://'):
-            candidate = 'wss://' + candidate[len('https://'):]
-        if not candidate.startswith(('ws://', 'wss://')):
-            candidate = 'ws://' + candidate
-        try:
-            parsed = urlparse(candidate)
-        except ValueError:
-            return None
-        if not parsed.netloc:
-            return None
-        return urlunparse(parsed)
+        return normalize_websocket_url(raw_value) or None
 
     async def _connect(self, endpoint: ResolvedEndpoint) -> None:
         debug_log(
@@ -199,24 +216,33 @@ class BackgroundCaptureClient:
             {'endpoint': endpoint.url, 'source': endpoint.source},
         )
         try:
-            async with connect(endpoint.url, max_size=None, ping_interval=20, ping_timeout=20) as websocket:
-                if endpoint.source in ('local-file', 'default-local'):
-                    self._localhost_failure_count = 0
+            async with connect(
+                endpoint.url,
+                max_size=64 * 1024 * 1024,
+                ping_interval=20,
+                ping_timeout=20,
+                open_timeout=12,
+                close_timeout=5,
+            ) as websocket:
+                sender = SerializedWebSocketSender(websocket)
                 capabilities: list[str] = []
                 if self._input_capable:
                     capabilities.append('os-input')
                 if self._screen_capture_capable:
                     capabilities.append('screen-capture')
                 if self._native_popup_capable:
-                    capabilities.append('native-popup')
-                await websocket.send(
+                    capabilities.extend(['native-popup', 'file-transfer.native'])
+                await sender.send(
                     json.dumps(
                         {
                             'type': 'client.register',
                             'clientId': self._client_id,
                             'name': CLIENT_NAME,
                             'version': CLIENT_VERSION,
-                            'role': 'native-input-client' if self._input_capable else 'native-file-client',
+                            # The role identifies the native-agent connection slot. Individual
+                            # capabilities describe whether OS input is actually available.
+                            'role': 'native-input-client',
+                            'sessionId': self._connection_config.session_id,
                             'capabilities': capabilities,
                         }
                     )
@@ -226,17 +252,17 @@ class BackgroundCaptureClient:
                     'Registered with bridge.',
                     {'endpoint': endpoint.url, 'capabilities': capabilities},
                 )
+                self._bind_native_popup_bridge(sender)
                 async for raw_message in websocket:
-                    await self._handle_message(websocket, raw_message)
-        except Exception:
+                    await self._handle_message(sender, raw_message)
+        finally:
+            if self._native_popup is not None:
+                self._native_popup.unbind_bridge()
             if self._screen_capture_service is not None and self._screen_capture_service.active:
                 try:
                     await self._screen_capture_service.stop()
                 except Exception:  # noqa: BLE001 - best effort cleanup
                     pass
-            if endpoint.source in ('local-file', 'default-local'):
-                self._localhost_failure_count += 1
-            raise
 
     async def _handle_message(self, websocket: Any, raw_message: Any) -> None:
         if isinstance(raw_message, bytes):

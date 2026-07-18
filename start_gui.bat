@@ -68,17 +68,33 @@ if defined PYTHON_HOME (
   if exist "%PYTHON_HOME%\tcl\tk8.6" set "TK_LIBRARY=%PYTHON_HOME%\tcl\tk8.6"
 )
 
-echo Installing/updating Python dependencies from requirements.txt...
-"%VENV_PYTHON%" -m pip install --disable-pip-version-check --upgrade pip setuptools wheel
-if errorlevel 1 (
-  echo Failed to upgrade pip / setuptools / wheel.
-  exit /b 1
+set "REQUIREMENTS_HASH="
+set "INSTALLED_REQUIREMENTS_HASH="
+set "DEPENDENCIES_READY=0"
+for /f "delims=" %%H in ('powershell.exe -NoProfile -Command "(Get-FileHash -Algorithm SHA256 -LiteralPath 'requirements.txt').Hash"') do set "REQUIREMENTS_HASH=%%H"
+if exist ".venv\.requirements.sha256" set /p "INSTALLED_REQUIREMENTS_HASH="<".venv\.requirements.sha256"
+
+if defined REQUIREMENTS_HASH if /I "!REQUIREMENTS_HASH!"=="!INSTALLED_REQUIREMENTS_HASH!" (
+  "%VENV_PYTHON%" -c "import bcrypt, mss, PIL, pyautogui, websockets" >nul 2>nul
+  if not errorlevel 1 set "DEPENDENCIES_READY=1"
 )
 
-"%VENV_PYTHON%" -m pip install --disable-pip-version-check -r requirements.txt
-if errorlevel 1 (
-  echo Failed to install Python dependencies.
-  exit /b 1
+if "!DEPENDENCIES_READY!"=="0" (
+  echo Installing/updating Python dependencies from requirements.txt...
+  "%VENV_PYTHON%" -m pip install --disable-pip-version-check --upgrade pip setuptools wheel
+  if errorlevel 1 (
+    echo Failed to upgrade pip / setuptools / wheel.
+    exit /b 1
+  )
+
+  "%VENV_PYTHON%" -m pip install --disable-pip-version-check -r requirements.txt
+  if errorlevel 1 (
+    echo Failed to install Python dependencies.
+    exit /b 1
+  )
+  if defined REQUIREMENTS_HASH >".venv\.requirements.sha256" echo !REQUIREMENTS_HASH!
+) else (
+  echo Python dependencies are already up to date.
 )
 
 echo Verifying Python runtime imports...

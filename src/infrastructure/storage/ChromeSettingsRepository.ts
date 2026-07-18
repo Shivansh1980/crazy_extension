@@ -36,12 +36,21 @@ export class ChromeSettingsRepository implements SettingsRepository {
   }
 
   private normalize(settings: ExtensionSettings): ExtensionSettings {
+    const fileNamePrefix = typeof settings.fileNamePrefix === 'string'
+      ? settings.fileNamePrefix.trim()
+      : '';
+    const requestTimeout = Number(settings.requestTimeoutMs);
+    const resolverUrl = typeof settings.websocketResolverUrl === 'string' && settings.websocketResolverUrl.trim()
+      ? settings.websocketResolverUrl
+      : DEFAULT_WEBSOCKET_RESOLVER_URL;
     return {
-      enabled: Boolean(settings.enabled),
+      enabled: typeof settings.enabled === 'boolean' ? settings.enabled : DEFAULT_SETTINGS.enabled,
       websocketUrl: normalizeWebSocketUrl(settings.websocketUrl),
-      websocketResolverUrl: normalizeResolverUrl(DEFAULT_WEBSOCKET_RESOLVER_URL),
-      fileNamePrefix: settings.fileNamePrefix.trim() || DEFAULT_SETTINGS.fileNamePrefix,
-      requestTimeoutMs: Math.max(1_000, Math.round(settings.requestTimeoutMs || DEFAULT_SETTINGS.requestTimeoutMs)),
+      websocketResolverUrl: normalizeResolverUrl(resolverUrl),
+      fileNamePrefix: fileNamePrefix || DEFAULT_SETTINGS.fileNamePrefix,
+      requestTimeoutMs: Number.isFinite(requestTimeout)
+        ? Math.min(120_000, Math.max(1_000, Math.round(requestTimeout)))
+        : DEFAULT_SETTINGS.requestTimeoutMs,
       connectionMode: normalizeConnectionMode(settings.connectionMode),
       relayUrl: normalizeRelayUrl(settings.relayUrl),
       sessionId: normalizeSessionId(settings.sessionId)

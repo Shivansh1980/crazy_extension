@@ -50,6 +50,7 @@ from capture_control_center.infrastructure.wire_protocol import (
 ROLE_CONTROL_GUI = 'control-gui'
 ROLE_EXTENSION_CLIENT = 'extension-client'
 ROLE_NATIVE_INPUT_CLIENT = 'native-input-client'
+ROLE_SCREEN_SHARE_STREAM = 'screen-share-stream'
 
 # Reconnect backoff bounds (seconds).
 _RECONNECT_INITIAL_BACKOFF = 2.0
@@ -111,6 +112,9 @@ class RelayBridgeClient:
         self._authenticated = False
         self._stopping = False
         self._connect_task: asyncio.Task[None] | None = None
+        self._credentials_override: RelayCredentials | None = None
+        self._credentials_update_event = asyncio.Event()
+        self._send_lock = asyncio.Lock()
 
         self._extension_registration: ClientRegistration | None = None
         self._native_input_registration: ClientRegistration | None = None
@@ -132,11 +136,13 @@ class RelayBridgeClient:
     # ------------------------------------------------------------------ public API
 
     async def start(self) -> None:
+        if self._connect_task is not None and not self._connect_task.done():
+            return
         debug_log('python-relay', 'Starting relay client.', {'relay_url': self._relay_url})
         self._stopping = False
         self._connect_task = asyncio.create_task(self._connect_loop(), name='relay-connect-loop')
         # Emit a "server_started" event mimicking BridgeServer so the GUI can show a status.
-        self._emit('server_started', {'host': self._relay_url, 'port': 0, 'mode': 'relay'})
+        self._emit('server_started', {'host': self._relay_url, 'port': 0, 'mode': 'relay', 'url': self._relay_url})
 
     async def stop(self) -> None:
         debug_log('python-relay', 'Stopping relay client.')
@@ -157,6 +163,17 @@ class RelayBridgeClient:
 
     def has_native_input_client(self) -> bool:
         return self._native_input_registration is not None
+
+    async def update_credentials(self, username: str, password: str, session_id: str) -> None:
+        """Replace rejected relay credentials and wake the paused reconnect loop."""
+        self._credentials_override = RelayCredentials(
+            username=username.strip(),
+            password=password,
+            session_id=session_id.strip() or 'default',
+        )
+        self._credentials_update_event.set()
+        if not self._stopping and (self._connect_task is None or self._connect_task.done()):
+            self._connect_task = asyncio.create_task(self._connect_loop(), name='relay-connect-loop')
 
     # ------------------------------------------------------------ request methods
 
@@ -361,7 +378,10 @@ class RelayBridgeClient:
         return asyncio.get_running_loop().create_future()
 
     def _select_input_target(self) -> str:
-        if self._native_input_registration is not None:
+        if (
+            self._native_input_registration is not None
+            and 'os-input' in self._native_input_registration.capabilities
+        ):
             return ROLE_NATIVE_INPUT_CLIENT
         return ROLE_EXTENSION_CLIENT
 
@@ -403,7 +423,10 @@ class RelayBridgeClient:
         socket = self._socket
         if socket is None:
             raise RuntimeError('Relay socket is not open.')
-        await socket.send(json.dumps(payload))
+        async with self._send_lock:
+            if socket is not self._socket:
+                raise RuntimeError('Relay socket changed while the message was waiting to send.')
+            await socket.send(json.dumps(payload))
 
     async def _send_binary(self, envelope: bytes) -> None:
         if not self._authenticated:
@@ -411,35 +434,62 @@ class RelayBridgeClient:
         socket = self._socket
         if socket is None:
             raise RuntimeError('Relay socket is not open.')
-        await socket.send(envelope)
+        async with self._send_lock:
+            if socket is not self._socket:
+                raise RuntimeError('Relay socket changed while the binary message was waiting to send.')
+            await socket.send(envelope)
 
     # ----------------------------------------------------------- connect loop
 
     async def _connect_loop(self) -> None:
         backoff = _RECONNECT_INITIAL_BACKOFF
         while not self._stopping:
+            disconnect_message: str | None = None
             try:
                 await self._connect_once()
                 backoff = _RECONNECT_INITIAL_BACKOFF  # reset on a clean session
+                if not self._stopping:
+                    disconnect_message = 'Relay transport closed; reconnecting automatically.'
             except RelayAuthError as error:
-                debug_log('python-relay', 'Authentication failed; halting reconnect.', str(error))
+                debug_log('python-relay', 'Authentication failed; waiting for updated credentials.', str(error))
+                # Clear before invoking callbacks so a fast credential update cannot be lost.
+                self._credentials_update_event.clear()
                 if self._on_auth_failure is not None:
                     try:
                         self._on_auth_failure(str(error))
                     except Exception:  # noqa: BLE001
                         pass
-                # Stop trying — credentials are wrong; the GUI must re-prompt.
-                self._emit('client_disconnected', {'message': f'Relay authentication failed: {error}'})
-                return
+                # Credentials are wrong; pause until the GUI supplies a replacement.
+                current_credentials = self._credentials_override or self._credentials_provider()
+                self._emit(
+                    'relay_auth_failed',
+                    {
+                        'message': f'Relay authentication failed: {error}',
+                        'relay_url': self._relay_url,
+                        'username': current_credentials.username,
+                        'session_id': current_credentials.session_id,
+                    },
+                )
+                await self._reset_session_state()
+                await self._fail_all_pending('Relay authentication failed before the request could complete.')
+                if self._stopping:
+                    return
+                await self._credentials_update_event.wait()
+                self._credentials_update_event.clear()
+                backoff = _RECONNECT_INITIAL_BACKOFF
+                continue
             except asyncio.CancelledError:
                 raise
             except Exception as error:  # noqa: BLE001
                 debug_log('python-relay', 'Relay connection failed.', str(error))
-                self._emit(
-                    'client_disconnected',
-                    {'message': f'Relay disconnected: {error}. Retrying in {backoff:.0f}s.'},
-                )
+                disconnect_message = f'Relay disconnected: {error}. Retrying in {backoff:.0f}s.'
+
+            if disconnect_message is not None:
+                self._emit('relay_disconnected', {'message': disconnect_message})
             await self._reset_session_state()
+            # The relay cannot retain peer responses while the GUI is absent, and input/file
+            # operations aren't safe to replay. Fail outstanding work promptly after a loss.
+            await self._fail_all_pending('Relay transport disconnected before the request completed. Please retry.')
             if self._stopping:
                 return
             try:
@@ -450,13 +500,20 @@ class RelayBridgeClient:
 
     async def _connect_once(self) -> None:
         debug_log('python-relay', 'Opening relay socket.', self._relay_url)
-        async with connect(self._relay_url, max_size=64 * 1024 * 1024, ping_interval=20, ping_timeout=20) as socket:
+        async with connect(
+            self._relay_url,
+            max_size=64 * 1024 * 1024,
+            ping_interval=20,
+            ping_timeout=20,
+            open_timeout=12,
+            close_timeout=5,
+        ) as socket:
             self._socket = socket
             try:
                 await self._handshake(socket)
                 self._authenticated = True
                 self._emit(
-                    'client_connected',
+                    'relay_connected',
                     {
                         'client_id': self._client_id,
                         'name': self._client_name,
@@ -485,7 +542,7 @@ class RelayBridgeClient:
         if not isinstance(hello, dict) or hello.get('type') != 'server.hello':
             raise RuntimeError('First frame from relay was not server.hello.')
 
-        creds = self._credentials_provider()
+        creds = self._credentials_override or self._credentials_provider()
         register = {
             'type': 'client.register',
             'role': ROLE_CONTROL_GUI,
@@ -859,6 +916,9 @@ class RelayBridgeClient:
         if not isinstance(registration_payload, dict):
             return
         peer_role = str(payload.get('role', '')).strip().lower()
+        if peer_role == ROLE_SCREEN_SHARE_STREAM:
+            debug_log('python-relay', 'Screen share stream peer connected.')
+            return
         capabilities = tuple(c for c in registration_payload.get('capabilities', []) if isinstance(c, str))
         registration = ClientRegistration(
             client_id=str(registration_payload.get('clientId', 'unknown')),
@@ -888,12 +948,19 @@ class RelayBridgeClient:
                     'client_id': registration.client_id,
                     'name': registration.name,
                     'version': registration.version,
+                    'capabilities': list(capabilities),
                 },
             )
 
     def _on_peer_disconnected(self, payload: dict[str, Any]) -> None:
         peer_role = str(payload.get('role', '')).strip().lower()
         message = str(payload.get('message', 'Peer disconnected.'))
+        if peer_role == ROLE_SCREEN_SHARE_STREAM:
+            self._emit(
+                'screen_share_stream_interrupted',
+                {'message': 'Screen share stream interrupted; waiting for automatic reconnect.'},
+            )
+            return
         if peer_role == ROLE_NATIVE_INPUT_CLIENT:
             if self._native_input_registration is not None:
                 self._native_input_registration = None

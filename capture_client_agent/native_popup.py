@@ -20,6 +20,7 @@ except Exception:  # noqa: BLE001
     ttk = None  # type: ignore[assignment]
 
 from capture_control_center.debug import debug_log
+from capture_control_center.infrastructure.file_names import build_unique_path, sanitize_file_name
 
 JsonSender = Callable[[dict[str, Any]], Awaitable[None]]
 BinarySender = Callable[[dict[str, Any], bytes], Awaitable[None]]
@@ -78,6 +79,13 @@ class NativePopupService:
             self._json_sender = json_sender
             self._binary_sender = binary_sender
 
+    def unbind_bridge(self) -> None:
+        """Drop callbacks for a closed socket so UI actions never target stale transports."""
+        with self._lock:
+            self._loop = None
+            self._json_sender = None
+            self._binary_sender = None
+
     async def show(self, text: str) -> dict[str, Any]:
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
 
@@ -105,13 +113,8 @@ class NativePopupService:
 
     async def receive_file(self, file_name: str, file_bytes: bytes, mime_type: str) -> dict[str, Any]:
         self._received_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = Path(file_name or 'shared-file.bin').name or 'shared-file.bin'
-        target = self._received_dir / safe_name
-        if target.exists():
-            stem = target.stem
-            suffix = target.suffix
-            stamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
-            target = self._received_dir / f'{stem}-{stamp}{suffix}'
+        safe_name = sanitize_file_name(file_name, 'shared-file.bin')
+        target = build_unique_path(self._received_dir, safe_name)
         await asyncio.to_thread(target.write_bytes, file_bytes)
 
         def action() -> None:
@@ -358,21 +361,23 @@ class NativePopupService:
                     'text': text,
                     'sentAt': datetime.now(timezone.utc).isoformat(),
                 }
-                self._send_binary(metadata, data)
+                if not self._send_binary(metadata, data, completion_status='Sent file and text.'):
+                    self._status_var.set('Bridge is reconnecting. Try sending again shortly.')
+                    return
                 self._selected_file = None
                 self._file_var.set('No file selected')
-                self._status_var.set('Sent file and text.')
+                self._status_var.set('Sending file and text...')
                 return
             except Exception as error:  # noqa: BLE001
                 self._status_var.set(f'Send failed: {error}')
                 return
-        self._send_json({
+        queued = self._send_json({
             'type': 'popup.message',
             'text': text,
             'pageUrl': 'native-popup',
             'sentAt': datetime.now(timezone.utc).isoformat(),
-        })
-        self._status_var.set('Sent text.')
+        }, completion_status='Sent text.')
+        self._status_var.set('Sending text...' if queued else 'Bridge is reconnecting. Try sending again shortly.')
 
     def _status(self, action: str = 'status') -> dict[str, Any]:
         return {
@@ -388,18 +393,61 @@ class NativePopupService:
     def _publish_status(self, status: dict[str, Any]) -> None:
         self._send_json({'type': 'popup.status', 'status': status})
 
-    def _send_json(self, payload: dict[str, Any]) -> None:
+    def _send_json(self, payload: dict[str, Any], completion_status: str | None = None) -> bool:
         with self._lock:
             loop = self._loop
             sender = self._json_sender
         if loop is None or sender is None:
-            return
-        loop.call_soon_threadsafe(lambda: asyncio.create_task(sender(payload)))
+            return False
+        try:
+            loop.call_soon_threadsafe(self._schedule_send, lambda: sender(payload), 'JSON', completion_status)
+        except RuntimeError:
+            return False
+        return True
 
-    def _send_binary(self, metadata: dict[str, Any], payload: bytes) -> None:
+    def _send_binary(
+        self,
+        metadata: dict[str, Any],
+        payload: bytes,
+        completion_status: str | None = None,
+    ) -> bool:
         with self._lock:
             loop = self._loop
             sender = self._binary_sender
         if loop is None or sender is None:
+            return False
+        try:
+            loop.call_soon_threadsafe(
+                self._schedule_send,
+                lambda: sender(metadata, payload),
+                'binary',
+                completion_status,
+            )
+        except RuntimeError:
+            return False
+        return True
+
+    def _schedule_send(
+        self,
+        factory: Callable[[], Awaitable[None]],
+        label: str,
+        completion_status: str | None,
+    ) -> None:
+        try:
+            task = asyncio.create_task(factory())
+        except Exception as error:  # noqa: BLE001
+            debug_log('client-agent', f'Native popup {label} send could not start.', {'error': str(error)})
             return
-        loop.call_soon_threadsafe(lambda: asyncio.create_task(sender(metadata, payload)))
+
+        def report_failure(completed: asyncio.Task[None]) -> None:
+            if completed.cancelled():
+                return
+            error = completed.exception()
+            if error is not None:
+                debug_log('client-agent', f'Native popup {label} send failed.', {'error': str(error)})
+                if completion_status:
+                    self._post(lambda: self._status_var.set(f'Send failed: {error}'))
+            elif completion_status:
+                self._post(lambda: self._status_var.set(completion_status))
+
+        task.add_done_callback(report_failure)

@@ -259,8 +259,8 @@
 
             <div class="field">
               <label for="websocket-resolver-url">Resolver URL</label>
-              <input id="websocket-resolver-url" name="websocketResolverUrl" type="text" readonly value="https://pastebin.com/raw/pmrhGPW5" />
-              <p class="hint">Fixed by the extension. On every reconnect it fetches this Pastebin raw URL, reads the ngrok target from there, and converts `http`, `https`, or `tcp` values into the correct WebSocket URL automatically.</p>
+              <input id="websocket-resolver-url" name="websocketResolverUrl" type="url" placeholder="https://pastebin.com/raw/your-id" />
+              <p class="hint">Optional resolver checked by tunnel and auto modes. Plain-text and JSON responses are supported, and http, https, or tcp targets are converted to WebSocket URLs.</p>
             </div>
 
             <div class="field">

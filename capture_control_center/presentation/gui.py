@@ -17,6 +17,8 @@ from PIL import Image, ImageTk
 
 from capture_control_center.application.controller import CaptureController
 from capture_control_center.domain.models import SavedCapture
+from capture_control_center.presentation.capabilities import UiCapabilities
+from capture_control_center.presentation.login_dialog import LoginDialog
 
 try:
     _LANCZOS = Image.Resampling.LANCZOS
@@ -104,7 +106,11 @@ class CaptureControlWindow:
         self._bridge_listen_url = bridge_url
         self._extension_connection_details: dict | None = None
         self._native_connection_details: dict | None = None
+        self._ui_capabilities = UiCapabilities.from_connections(None, None)
         self._native_screen_capture_available = False
+        self._relay_transport_connected = False
+        self._relay_mode = False
+        self._relay_login_in_progress = False
         self._screen_share_active = False
         self._remote_control_enabled = False
         self._remote_pointer_pressed = False
@@ -127,6 +133,14 @@ class CaptureControlWindow:
         self._scroll_canvas: tk.Canvas | None = None
         self._scroll_content_window: int | None = None
         self._scroll_container: tk.Frame | None = None
+        self._action_rows: list[tuple[tk.Frame, tuple[str, ...]]] = []
+        self._action_buttons: dict[str, ttk.Button] = {}
+        self._status_rows: dict[str, tk.Frame] = {}
+        self._text_panel_card: tk.Frame | None = None
+        self._preview_panel_card: tk.Frame | None = None
+        self._messages_panel_card: tk.Frame | None = None
+        self._text_panel_info_label: tk.Label | None = None
+        self._screen_share_hint_label: tk.Label | None = None
 
         self._root.title('Capture Control Center')
         self._root.geometry('1440x860')
@@ -146,6 +160,7 @@ class CaptureControlWindow:
         self._popup_message_two = tk.StringVar(value='Waiting for the next popup message.')
 
         self._build_layout()
+        self._refresh_capability_ui()
         self._poll_events()
         debug_log('python-gui', 'GUI initialized.')
 
@@ -223,6 +238,120 @@ class CaptureControlWindow:
 
         self._scroll_canvas.yview_scroll(int(-delta / 120), 'units')
         return 'break'
+
+    def _update_capabilities(self) -> None:
+        self._ui_capabilities = UiCapabilities.from_connections(
+            self._extension_connection_details,
+            self._native_connection_details,
+        )
+        self._native_screen_capture_available = self._ui_capabilities.native_screen_capture
+        self._refresh_capability_ui()
+
+    def _refresh_capability_ui(self) -> None:
+        capabilities = self._ui_capabilities
+        action_visibility = {
+            'capture': capabilities.capture,
+            'open_folder': True,
+            'copy_image': True,
+            'clipboard': capabilities.clipboard,
+            'popup': capabilities.popup,
+            'upload': capabilities.file_transfer,
+            'client_uploads': True,
+            'screen_share': capabilities.screen_share or self._screen_share_active,
+            'stop_screen_share': self._screen_share_active,
+        }
+        for parent, order in self._action_rows:
+            self._reflow_action_row(parent, order, action_visibility)
+
+        if self._text_panel_card is not None and self._preview_panel_card is not None:
+            if capabilities.text_tools:
+                self._text_panel_card.grid(row=0, column=0, columnspan=1, sticky='nsew', padx=(0, 6))
+                self._preview_panel_card.grid(row=0, column=1, columnspan=1, sticky='nsew', padx=(6, 0))
+            else:
+                self._text_panel_card.grid_remove()
+                self._preview_panel_card.grid(row=0, column=0, columnspan=2, sticky='nsew', padx=0)
+
+        status_visibility = {
+            'clipboard': capabilities.clipboard,
+            'popup': capabilities.popup,
+            'screen_share': capabilities.screen_share or self._screen_share_active,
+            'file_transfer': capabilities.file_transfer,
+            'client_uploads': True,
+        }
+        for name, row in self._status_rows.items():
+            if status_visibility.get(name, False):
+                row.grid()
+            else:
+                row.grid_remove()
+
+        if self._text_panel_info_label is not None:
+            if capabilities.clipboard and capabilities.popup:
+                text = 'Enter text below and send it to the browser clipboard or the connected popup.'
+            elif capabilities.clipboard:
+                text = 'Enter text below and send it to the connected browser clipboard.'
+            else:
+                text = 'Enter text below and send it to the connected native popup.'
+            self._text_panel_info_label.configure(text=text)
+
+        if self._messages_panel_card is not None:
+            if capabilities.popup:
+                self._messages_panel_card.grid()
+            else:
+                self._messages_panel_card.grid_remove()
+
+        if not capabilities.remote_input and self._remote_control_enabled:
+            self._set_remote_control_enabled(False)
+        self._refresh_viewer_controls()
+
+        if self._scroll_canvas is not None:
+            try:
+                self._root.after_idle(lambda: self._scroll_canvas.configure(scrollregion=self._scroll_canvas.bbox('all')))
+            except tk.TclError:
+                pass
+
+    def _reflow_action_row(
+        self,
+        parent: tk.Frame,
+        order: tuple[str, ...],
+        visibility: dict[str, bool],
+    ) -> None:
+        for column in range(len(order)):
+            parent.grid_columnconfigure(column, weight=0, uniform='')
+        for key in order:
+            button = self._action_buttons.get(key)
+            if button is not None:
+                button.grid_remove()
+
+        visible = [key for key in order if visibility.get(key, False) and key in self._action_buttons]
+        uniform_name = f'actions-{str(parent)}'
+        for column, key in enumerate(visible):
+            parent.grid_columnconfigure(column, weight=1, uniform=uniform_name)
+            self._action_buttons[key].grid(
+                row=0,
+                column=column,
+                sticky='ew',
+                padx=(0 if column == 0 else 6, 0 if column == len(visible) - 1 else 6),
+                ipady=4,
+            )
+
+    def _refresh_viewer_controls(self) -> None:
+        if self._viewer_take_control_button is not None:
+            self._viewer_take_control_button.pack_forget()
+        if self._viewer_stop_button is not None:
+            self._viewer_stop_button.pack_forget()
+
+        if self._viewer_take_control_button is not None and self._screen_share_active and self._ui_capabilities.remote_input:
+            self._viewer_take_control_button.pack(side=tk.LEFT, padx=(0, 10))
+        if self._viewer_stop_button is not None and self._screen_share_active:
+            self._viewer_stop_button.pack(side=tk.LEFT)
+
+        if self._screen_share_hint_label is not None:
+            hints = ['The live stream is shown locally in this window. Use Stop Sharing to end the session.']
+            if self._ui_capabilities.remote_input:
+                hints.append('Use Take Control to forward mouse and keyboard input to the shared screen.')
+            if self._ui_capabilities.remote_paste:
+                hints.append('While control is active, press Ctrl+V to type local clipboard text into the focused field.')
+            self._screen_share_hint_label.configure(text=' '.join(hints))
 
     def _style_ttk(self) -> None:
         style = ttk.Style(self._root)
@@ -532,6 +661,21 @@ class CaptureControlWindow:
             bottom_row_columns,
         )
         self._stop_screen_share_button.state(['disabled'])
+        self._action_buttons = {
+            'capture': self._capture_button,
+            'open_folder': self._open_folder_button,
+            'copy_image': self._copy_image_button,
+            'clipboard': self._send_clipboard_button,
+            'popup': self._send_popup_button,
+            'upload': self._upload_file_button,
+            'client_uploads': self._client_uploads_button,
+            'screen_share': self._screen_share_button,
+            'stop_screen_share': self._stop_screen_share_button,
+        }
+        self._action_rows = [
+            (top_row, ('capture', 'open_folder', 'copy_image', 'clipboard', 'popup', 'upload')),
+            (bottom_row, ('client_uploads', 'screen_share', 'stop_screen_share')),
+        ]
 
     def _create_action_button(
         self,
@@ -568,6 +712,7 @@ class CaptureControlWindow:
 
     def _build_text_panel(self, parent: tk.Frame) -> None:
         card, body = self._create_card(parent, title='Text and Popup Controls', icon='\U0001f5ce')
+        self._text_panel_card = card
         card.grid(row=0, column=0, sticky='nsew', padx=(0, 6))
         body.grid_columnconfigure(0, weight=1)
         body.grid_rowconfigure(4, weight=1)
@@ -603,6 +748,7 @@ class CaptureControlWindow:
             anchor='w',
             wraplength=680,
         )
+        self._text_panel_info_label = info_label
         info_label.grid(row=0, column=1, sticky='ew')
         info_box.bind('<Configure>', lambda event: info_label.configure(wraplength=max(320, event.width - 90)))
 
@@ -610,8 +756,12 @@ class CaptureControlWindow:
         status_area.grid(row=1, column=0, sticky='ew', pady=(0, 8))
         status_area.grid_columnconfigure(0, weight=1)
 
-        self._create_status_row(status_area, 0, 'Clipboard:', self._clipboard_status, 'clipboard')
-        self._create_status_row(status_area, 1, 'Popup:', self._popup_status, 'popup')
+        self._status_rows['clipboard'] = self._create_status_row(
+            status_area, 0, 'Clipboard:', self._clipboard_status, 'clipboard'
+        )
+        self._status_rows['popup'] = self._create_status_row(
+            status_area, 1, 'Popup:', self._popup_status, 'popup'
+        )
 
         separator = tk.Frame(body, height=1, bg=Palette.BORDER_SOFT)
         separator.grid(row=2, column=0, sticky='ew', pady=(4, 12))
@@ -619,9 +769,15 @@ class CaptureControlWindow:
         share_status = tk.Frame(body, bg=Palette.CARD)
         share_status.grid(row=3, column=0, sticky='ew', pady=(0, 12))
         share_status.grid_columnconfigure(0, weight=1)
-        self._create_status_row(share_status, 0, 'Screen Share:', self._screen_share_status, 'screen_share')
-        self._create_status_row(share_status, 1, 'Download:', self._file_transfer_status, 'file_transfer')
-        self._create_status_row(share_status, 2, 'Client Uploads:', self._client_uploads_status, 'client_uploads')
+        self._status_rows['screen_share'] = self._create_status_row(
+            share_status, 0, 'Screen Share:', self._screen_share_status, 'screen_share'
+        )
+        self._status_rows['file_transfer'] = self._create_status_row(
+            share_status, 1, 'Download:', self._file_transfer_status, 'file_transfer'
+        )
+        self._status_rows['client_uploads'] = self._create_status_row(
+            share_status, 2, 'Client Uploads:', self._client_uploads_status, 'client_uploads'
+        )
 
         editor_frame = tk.Frame(
             body,
@@ -671,7 +827,7 @@ class CaptureControlWindow:
         label_text: str,
         variable: tk.StringVar,
         kind: str,
-    ) -> None:
+    ) -> tk.Frame:
         line = tk.Frame(parent, bg=Palette.CARD)
         line.grid(row=row, column=0, sticky='ew', pady=(0, 8))
         line.grid_columnconfigure(2, weight=1)
@@ -712,6 +868,7 @@ class CaptureControlWindow:
         line.bind('<Configure>', lambda event: detail.configure(wraplength=max(220, event.width - 240)))
         variable.trace_add('write', lambda *_args, b=badge, v=variable, k=kind: self._update_status_badge(v, b, k))
         self._update_status_badge(variable, badge, kind)
+        return line
 
     def _update_status_badge(self, variable: tk.StringVar, badge: tk.Label, kind: str) -> None:
         text, bg, fg = self._badge_style_for_status(variable.get(), kind)
@@ -769,6 +926,7 @@ class CaptureControlWindow:
 
     def _build_preview_panel(self, parent: tk.Frame) -> None:
         card, body = self._create_card(parent, title='Preview', icon='\u25c9')
+        self._preview_panel_card = card
         card.grid(row=0, column=1, sticky='nsew', padx=(6, 0))
         body.grid_columnconfigure(0, weight=1)
         body.grid_rowconfigure(0, weight=1)
@@ -873,6 +1031,7 @@ class CaptureControlWindow:
 
     def _build_messages_panel(self, parent: tk.Frame) -> None:
         card, body = self._create_card(parent, title='Last Two Popup Messages', icon='\u25cc', padding=(16, 14))
+        self._messages_panel_card = card
         card.grid(row=4, column=0, sticky='ew', pady=(10, 0))
         body.grid_columnconfigure(0, weight=1, uniform='messages')
         body.grid_columnconfigure(1, weight=1, uniform='messages')
@@ -1030,6 +1189,8 @@ class CaptureControlWindow:
         return widget
 
     def _on_capture_clicked(self) -> None:
+        if not self._ui_capabilities.capture:
+            return
         if self._pending_capture is not None and not self._pending_capture.done():
             return
 
@@ -1060,6 +1221,8 @@ class CaptureControlWindow:
         self._root.after(0, finalize)
 
     def _on_send_clipboard_clicked(self) -> None:
+        if not self._ui_capabilities.clipboard:
+            return
         if self._pending_clipboard is not None and not self._pending_clipboard.done():
             return
 
@@ -1091,6 +1254,8 @@ class CaptureControlWindow:
         self._root.after(0, finalize)
 
     def _on_send_popup_clicked(self) -> None:
+        if not self._ui_capabilities.popup:
+            return
         if self._pending_popup is not None and not self._pending_popup.done():
             return
 
@@ -1118,6 +1283,8 @@ class CaptureControlWindow:
         self._root.after(0, finalize)
 
     def _on_upload_file_clicked(self) -> None:
+        if not self._ui_capabilities.file_transfer:
+            return
         if self._pending_file_upload is not None and not self._pending_file_upload.done():
             return
 
@@ -1166,6 +1333,8 @@ class CaptureControlWindow:
         self._client_uploads_window.focus_force()
 
     def _on_screen_share_clicked(self) -> None:
+        if not self._ui_capabilities.screen_share:
+            return
         if self._pending_screen_share is not None and not self._pending_screen_share.done():
             debug_log('python-gui', 'Screen share start ignored; a start request is already in flight.')
             return
@@ -1298,24 +1467,33 @@ class CaptureControlWindow:
         self._root.after(0, finalize)
 
     def _on_take_control_clicked(self) -> None:
+        if not self._ui_capabilities.remote_input:
+            return
         if not self._screen_share_active:
             self._screen_share_window_status.set('Click control becomes available once the live stream is active.')
             return
 
         self._set_remote_control_enabled(not self._remote_control_enabled)
         if self._remote_control_enabled:
+            paste_note = ' Ctrl+V also forwards local clipboard text.' if self._ui_capabilities.remote_paste else ''
             self._screen_share_window_status.set(
-                'Remote control enabled. Mouse, keyboard, scroll, and Ctrl+V here are forwarded to the shared page. Click Stop Control to release.'
+                'Remote control enabled. Mouse, keyboard, and scroll are forwarded to the shared screen.'
+                + paste_note
+                + ' Click Stop Control to release.'
             )
             return
 
         self._screen_share_window_status.set('Remote control released. Use Take Control to resume.')
 
-    def _handle_send_clipboard_shortcut(self, _event: tk.Event) -> str:
+    def _handle_send_clipboard_shortcut(self, _event: tk.Event) -> str | None:
+        if not self._ui_capabilities.clipboard:
+            return None
         self._on_send_clipboard_clicked()
         return 'break'
 
-    def _handle_send_popup_shortcut(self, _event: tk.Event) -> str:
+    def _handle_send_popup_shortcut(self, _event: tk.Event) -> str | None:
+        if not self._ui_capabilities.popup:
+            return None
         self._on_send_popup_clicked()
         return 'break'
 
@@ -1689,7 +1867,7 @@ class CaptureControlWindow:
 
         tk.Label(
             header,
-            text='Live Browser Stream',
+            text='Live Screen Stream',
             bg=Palette.BG,
             fg=Palette.TEXT,
             font=('Segoe UI', 18, 'bold'),
@@ -1738,6 +1916,7 @@ class CaptureControlWindow:
             justify=tk.LEFT,
             wraplength=1180,
         )
+        self._screen_share_hint_label = hint
         hint.grid(row=1, column=0, sticky='w', pady=(0, 12))
         container.bind('<Configure>', lambda event: hint.configure(wraplength=max(420, event.width - 80)), add='+')
 
@@ -1784,6 +1963,7 @@ class CaptureControlWindow:
             self._screen_share_window_image_bounds = None
             self._viewer_stop_button = None
             self._viewer_take_control_button = None
+            self._screen_share_hint_label = None
             self._set_remote_control_enabled(False)
             window.destroy()
 
@@ -2146,7 +2326,11 @@ class CaptureControlWindow:
 
 
     def _handle_screen_share_window_paste_shortcut(self, _event: tk.Event) -> str | None:
-        if not self._screen_share_active or not self._remote_control_enabled:
+        if (
+            not self._screen_share_active
+            or not self._remote_control_enabled
+            or not self._ui_capabilities.remote_paste
+        ):
             return None
 
         if self._pending_screen_share_paste is not None and not self._pending_screen_share_paste.done():
@@ -2162,8 +2346,13 @@ class CaptureControlWindow:
             self._screen_share_window_status.set('The local clipboard is empty. Copy some text first, then press Ctrl+V again.')
             return 'break'
 
-        self._screen_share_window_status.set(f'Sending {len(text)} clipboard character(s) to the focused field on the shared page...')
-        self._pending_screen_share_paste = self._controller.send_screen_share_paste(text)
+        self._screen_share_window_status.set(
+            f'Sending {len(text)} clipboard character(s) to the focused field on the shared screen...'
+        )
+        if self._ui_capabilities.browser_paste:
+            self._pending_screen_share_paste = self._controller.send_screen_share_paste(text)
+        else:
+            self._pending_screen_share_paste = self._controller.send_screen_share_key(action='type', text=text)
         self._pending_screen_share_paste.add_done_callback(self._on_screen_share_paste_finished)
         return 'break'
 
@@ -2207,6 +2396,7 @@ class CaptureControlWindow:
         self._screen_share_window_image_bounds = None
         self._viewer_stop_button = None
         self._viewer_take_control_button = None
+        self._screen_share_hint_label = None
         self._set_remote_control_enabled(False)
 
     def _set_screen_share_controls_active(self, active: bool) -> None:
@@ -2240,9 +2430,10 @@ class CaptureControlWindow:
                 self._viewer_take_control_button.state(['!disabled'])
             else:
                 self._viewer_take_control_button.state(['disabled'])
+        self._refresh_capability_ui()
 
     def _set_remote_control_enabled(self, enabled: bool) -> None:
-        self._remote_control_enabled = enabled and self._screen_share_active
+        self._remote_control_enabled = enabled and self._screen_share_active and self._ui_capabilities.remote_input
         if self._screen_share_window_label is not None:
             self._screen_share_window_label.configure(cursor='crosshair' if self._remote_control_enabled else 'arrow')
             if self._remote_control_enabled:
@@ -2586,34 +2777,96 @@ class CaptureControlWindow:
             )
 
         if connected_parts:
-            return 'Connected: ' + '; '.join(connected_parts) + '.'
+            prefix = 'Relay connected; ' if self._relay_transport_connected else ''
+            return prefix + 'Connected: ' + '; '.join(connected_parts) + '.'
+
+        if self._relay_transport_connected:
+            return f'Connected to relay {self._bridge_listen_url}. Waiting for extension or native client registration...'
 
         suffix = f' Last event: {last_event_message}' if last_event_message else ''
+        if self._relay_mode:
+            return f'Reconnecting to relay {self._bridge_listen_url}...{suffix}'
         return f'Listening on {self._bridge_listen_url}. Waiting for extension or native client registration...{suffix}'
+
+    def _prompt_relay_credentials(self, payload: dict) -> None:
+        if self._relay_login_in_progress:
+            return
+
+        self._relay_login_in_progress = True
+        try:
+            result = LoginDialog(
+                relay_url=str(payload.get('relay_url') or self._bridge_listen_url),
+                default_username=str(payload.get('username', '')),
+                error_message=str(payload.get('message', 'Relay authentication failed.')),
+                parent=self._root,
+            ).prompt()
+        finally:
+            self._relay_login_in_progress = False
+
+        if result.cancelled:
+            self._connection_status.set('Relay sign-in is required. The reconnect loop is paused until credentials are supplied.')
+            return
+
+        self._connection_status.set('Relay credentials updated. Reconnecting...')
+        future = self._controller.update_relay_credentials(
+            result.username,
+            result.password,
+            str(payload.get('session_id') or 'default'),
+        )
+
+        def finalize() -> None:
+            try:
+                future.result()
+            except Exception as error:  # noqa: BLE001
+                self._connection_status.set(f'Unable to resume relay connection: {error}')
+
+        future.add_done_callback(lambda _future: self._root.after(0, finalize))
 
     def _handle_controller_event(self, event_name: str, payload: dict) -> None:
         if event_name == 'server_started':
             debug_log('python-gui', 'Received GUI event.', event_name)
-            self._bridge_listen_url = f'ws://{payload["host"]}:{payload["port"]}'
+            if payload.get('mode') == 'relay':
+                self._relay_mode = True
+                self._bridge_listen_url = str(payload.get('url') or payload.get('host') or self._bridge_url)
+            else:
+                self._relay_mode = False
+                self._bridge_listen_url = f'ws://{payload["host"]}:{payload["port"]}'
             self._connection_status.set(self._format_connection_status())
+        elif event_name == 'relay_connected':
+            debug_log('python-gui', 'Received GUI event.', event_name)
+            self._relay_transport_connected = True
+            self._connection_status.set(self._format_connection_status())
+        elif event_name == 'relay_disconnected':
+            debug_log('python-gui', 'Received GUI event.', payload)
+            self._relay_transport_connected = False
+            self._extension_connection_details = None
+            self._native_connection_details = None
+            self._update_capabilities()
+            self._connection_status.set(self._format_connection_status(payload.get('message')))
+        elif event_name == 'relay_auth_failed':
+            debug_log('python-gui', 'Received GUI event.', payload)
+            self._relay_transport_connected = False
+            self._connection_status.set(self._format_connection_status(payload.get('message')))
+            self._root.after_idle(lambda details=dict(payload): self._prompt_relay_credentials(details))
         elif event_name == 'client_connected':
             debug_log('python-gui', 'Received GUI event.', event_name)
             self._extension_connection_details = dict(payload)
+            self._update_capabilities()
             self._connection_status.set(self._format_connection_status())
         elif event_name == 'client_disconnected':
             debug_log('python-gui', 'Received GUI event.', event_name)
             self._extension_connection_details = None
+            self._update_capabilities()
             self._connection_status.set(self._format_connection_status(payload.get('message')))
         elif event_name == 'native_input_connected':
             debug_log('python-gui', 'Received GUI event.', event_name)
-            capabilities = payload.get('capabilities') or []
-            self._native_screen_capture_available = 'screen-capture' in capabilities
             self._native_connection_details = dict(payload)
+            self._update_capabilities()
             self._connection_status.set(self._format_connection_status())
         elif event_name == 'native_input_disconnected':
             debug_log('python-gui', 'Received GUI event.', event_name)
-            self._native_screen_capture_available = False
             self._native_connection_details = None
+            self._update_capabilities()
             self._connection_status.set(self._format_connection_status(payload.get('message')))
         elif event_name == 'capture_failed':
             debug_log('python-gui', 'Received GUI event.', payload)
@@ -2647,6 +2900,11 @@ class CaptureControlWindow:
             self._screen_share_window_status.set(str(payload.get('message', 'Screen share stream ended.')))
             self._set_screen_share_controls_active(False)
             self._close_screen_share_window()
+        elif event_name == 'screen_share_stream_interrupted':
+            debug_log('python-gui', 'Received GUI event.', payload)
+            message = str(payload.get('message', 'Screen share stream interrupted; reconnecting...'))
+            self._screen_share_status.set(message)
+            self._screen_share_window_status.set(message)
         elif event_name == 'file_transfer_status':
             debug_log('python-gui', 'Received GUI event.', payload)
             self._file_transfer_status.set(str(payload.get('message', 'Popup file delivery started.')))

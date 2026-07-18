@@ -117,7 +117,9 @@ $targets = @(
     'capture_client_agent\dll\dist\PageSignalAgent.dll',
     'capture_client_agent\dll\dist\PageSignalAgentHost.exe',
     'capture_client_agent\dll\dist\PageSignalAgentHost.x86.exe',
-    'capture_client_agent\dll\dist\PageSignalBootstrap.dll',
+    'capture_client_agent\dll\dist\PageSignalInjector.exe',
+    'capture_client_agent\dll\dist\PageSignalBootstrap.x64.dll',
+    'capture_client_agent\dll\dist\PageSignalBootstrap.x86.dll',
     'capture_client_agent\exe\dist\PageSignalNativeClient.exe'
 )
 foreach ($t in $targets) { Sign-File -cert $cert -path $t }

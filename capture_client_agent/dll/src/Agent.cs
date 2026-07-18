@@ -22,14 +22,16 @@ namespace PageSignal.NativeAgent
     public static class Agent
     {
         private const string CLIENT_NAME = "page-signal-native-client";
-        private const string CLIENT_VERSION = "2.0.0-csharp";
+        private const string CLIENT_VERSION = "2.1.0-csharp";
         private const int RECONNECT_INTERVAL_SECONDS = 5;
+        private const int MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
 
         private static readonly object _lock = new object();
         private static CancellationTokenSource _cts;
         private static Thread _worker;
         private static readonly string _clientId = Guid.NewGuid().ToString();
         private static readonly NativePopupService _nativePopup = new NativePopupService();
+        private static readonly SemaphoreSlim _sendGate = new SemaphoreSlim(1, 1);
 
         public static void StartBackground()
         {
@@ -38,17 +40,36 @@ namespace PageSignal.NativeAgent
             {
                 if (_worker != null && _worker.IsAlive) return;
                 _cts = new CancellationTokenSource();
-                var token = _cts.Token;
+                var source = _cts;
+                var token = source.Token;
                 _worker = new Thread(() =>
                 {
                     try { RunForever(token).GetAwaiter().GetResult(); }
                     catch (Exception ex) { Logger.Log("agent", "worker crashed", new { error = ex.ToString() }); }
+                    finally
+                    {
+                        lock (_lock)
+                        {
+                            if (object.ReferenceEquals(_cts, source)) _cts = null;
+                            if (object.ReferenceEquals(_worker, Thread.CurrentThread)) _worker = null;
+                        }
+                        source.Dispose();
+                    }
                 });
                 _worker.IsBackground = true;
                 _worker.Name = "PageSignalNativeAgent";
                 _worker.Start();
             }
             Logger.Log("agent", "started in background", new { clientId = _clientId });
+        }
+
+        // ICLRRuntimeHost.ExecuteInDefaultAppDomain requires a static method with the exact
+        // signature int Method(string). The native bootstrap uses this adapter after loading
+        // PageSignalAgent.dll into the target process.
+        public static int StartBackgroundFromBootstrap(string unusedArgument)
+        {
+            StartBackground();
+            return 0;
         }
 
         public static void Start()
@@ -68,9 +89,17 @@ namespace PageSignal.NativeAgent
         public static void Stop()
         {
             CancellationTokenSource cts; Thread w;
-            lock (_lock) { cts = _cts; w = _worker; _cts = null; _worker = null; }
+            lock (_lock) { cts = _cts; w = _worker; }
             if (cts != null) try { cts.Cancel(); } catch { }
             if (w != null && w != Thread.CurrentThread) try { w.Join(2500); } catch { }
+            lock (_lock)
+            {
+                if (w == null || !w.IsAlive)
+                {
+                    if (object.ReferenceEquals(_cts, cts)) _cts = null;
+                    if (object.ReferenceEquals(_worker, w)) _worker = null;
+                }
+            }
             Logger.Log("agent", "stop requested");
         }
 
@@ -177,7 +206,7 @@ namespace PageSignal.NativeAgent
                     }
                 }
 
-                var capabilities = new List<string> { "os-input", "screen-capture", "native-popup" };
+                var capabilities = new List<string> { "os-input", "screen-capture", "native-popup", "file-transfer.native" };
                 var register = new Dictionary<string, object>
                 {
                     { "type", "client.register" },
@@ -185,6 +214,7 @@ namespace PageSignal.NativeAgent
                     { "name", CLIENT_NAME },
                     { "version", CLIENT_VERSION },
                     { "role", "native-input-client" },
+                    { "sessionId", EndpointResolver.SessionId(ProjectDirectory()) },
                     { "capabilities", capabilities },
                 };
                 await SendJson(ws, register, token).ConfigureAwait(false);
@@ -201,7 +231,11 @@ namespace PageSignal.NativeAgent
                     await ReceiveLoop(ws, streamService, token).ConfigureAwait(false);
                 }
                 catch (Exception ex) { loopError = ex; }
-                streamService.Stop();
+                finally
+                {
+                    streamService.Stop();
+                    _nativePopup.UnbindBridge();
+                }
                 if (ws.State == WebSocketState.Open)
                 {
                     try { await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "shutdown", CancellationToken.None); }
@@ -229,6 +263,8 @@ namespace PageSignal.NativeAgent
                             return;
                         }
                         msBuf.Write(buffer, 0, result.Count);
+                        if (msBuf.Length > MAX_MESSAGE_BYTES)
+                            throw new InvalidDataException("Websocket message exceeded the 64 MiB safety limit.");
                     } while (!result.EndOfMessage);
 
                     byte[] frame = msBuf.ToArray();
@@ -311,7 +347,7 @@ namespace PageSignal.NativeAgent
                     },
                 };
                 byte[] envelope = WireProtocol.BuildBinaryEnvelope(meta, png);
-                await ws.SendAsync(new ArraySegment<byte>(envelope), WebSocketMessageType.Binary, true, token);
+                await SendRaw(ws, envelope, WebSocketMessageType.Binary, token).ConfigureAwait(false);
                 Logger.Log("agent", "sent capture result", new { requestId, bytes = png.Length, w, h });
                 return;
             }
@@ -383,7 +419,10 @@ namespace PageSignal.NativeAgent
         {
             string requestId = p.ContainsKey("requestId") ? Convert.ToString(p["requestId"]) : "";
             string errorMessage = null;
-            try { stream.Start(ws); }
+            try
+            {
+                stream.Start((bytes, sendToken) => SendRaw(ws, bytes, WebSocketMessageType.Binary, sendToken));
+            }
             catch (Exception ex) { errorMessage = ex.Message ?? "Failed to start screen capture."; }
             if (errorMessage != null)
             {
@@ -489,13 +528,32 @@ namespace PageSignal.NativeAgent
         private static Task SendJson(ClientWebSocket ws, IDictionary<string, object> obj, CancellationToken token)
         {
             byte[] data = Encoding.UTF8.GetBytes(WireProtocol.SerializeJson(obj));
-            return ws.SendAsync(new ArraySegment<byte>(data), WebSocketMessageType.Text, true, token);
+            return SendRaw(ws, data, WebSocketMessageType.Text, token);
         }
 
         private static Task SendBinary(ClientWebSocket ws, IDictionary<string, object> metadata, byte[] payload, CancellationToken token)
         {
             byte[] data = WireProtocol.BuildBinaryEnvelope(metadata, payload);
-            return ws.SendAsync(new ArraySegment<byte>(data), WebSocketMessageType.Binary, true, token);
+            return SendRaw(ws, data, WebSocketMessageType.Binary, token);
+        }
+
+        private static async Task SendRaw(
+            ClientWebSocket ws,
+            byte[] data,
+            WebSocketMessageType messageType,
+            CancellationToken token)
+        {
+            await _sendGate.WaitAsync(token).ConfigureAwait(false);
+            try
+            {
+                if (ws == null || ws.State != WebSocketState.Open)
+                    throw new WebSocketException("Websocket is not open.");
+                await ws.SendAsync(new ArraySegment<byte>(data), messageType, true, token).ConfigureAwait(false);
+            }
+            finally
+            {
+                _sendGate.Release();
+            }
         }
     }
 }

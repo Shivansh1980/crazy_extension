@@ -14,12 +14,24 @@ from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Response  # type: ignore
 
 from capture_control_center.domain.models import ClientRegistration, ScreenshotResult, ScreenShareFrame
+from capture_control_center.infrastructure.wire_protocol import (
+    build_binary_envelope,
+    coerce_file_transfer_status,
+    coerce_popup_message,
+    coerce_popup_status,
+    coerce_screen_share_status,
+    parse_binary_envelope,
+)
 
 
 WEBSOCKET_SERVER_LOGGER = logging.getLogger('page_signal.local_websocket')
 WEBSOCKET_SERVER_LOGGER.addHandler(logging.NullHandler())
 WEBSOCKET_SERVER_LOGGER.propagate = False
 WEBSOCKET_SERVER_LOGGER.setLevel(logging.CRITICAL)
+
+ROLE_SCREEN_SHARE_STREAM = 'screen-share-stream'
+REGISTER_TIMEOUT_SECONDS = 15.0
+MAX_WEBSOCKET_MESSAGE_BYTES = 64 * 1024 * 1024
 
 
 def _is_websocket_upgrade(request: Any) -> bool:
@@ -76,8 +88,15 @@ class BridgeServer:
         self._lock = asyncio.Lock()
         self._event_callback: Callable[[str, dict[str, Any]], None] | None = None
         self._stream_connections: set[ServerConnection] = set()
+        self._bound_port = port
+
+    @property
+    def bound_port(self) -> int:
+        return self._bound_port
 
     async def start(self) -> None:
+        if self._server is not None:
+            return
         debug_log('python-bridge', 'Starting websocket bridge server.', {'host': self._host, 'port': self._port})
         self._server = await serve(
             self._handle_connection,
@@ -85,12 +104,15 @@ class BridgeServer:
             self._port,
             ping_interval=15,
             ping_timeout=15,
-            max_size=None,
+            max_size=MAX_WEBSOCKET_MESSAGE_BYTES,
             process_request=_process_bridge_http_request,
             logger=WEBSOCKET_SERVER_LOGGER,
         )
+        sockets = getattr(self._server, 'sockets', None) or []
+        if sockets:
+            self._bound_port = int(sockets[0].getsockname()[1])
         debug_log('python-bridge', 'running...')
-        self._emit('server_started', {'host': self._host, 'port': self._port})
+        self._emit('server_started', {'host': self._host, 'port': self._bound_port, 'mode': 'direct'})
 
     async def stop(self) -> None:
         debug_log('python-bridge', 'Stopping websocket bridge server.')
@@ -110,7 +132,11 @@ class BridgeServer:
         Prefers the native input client (capability ``os-input``) when connected; otherwise falls
         back to the Chrome extension. Caller MUST hold ``self._lock``.
         """
-        if self._native_input_connection is not None and self._native_input_registration is not None:
+        if (
+            self._native_input_connection is not None
+            and self._native_input_registration is not None
+            and 'os-input' in self._native_input_registration.capabilities
+        ):
             return self._native_input_connection, 'native-input-client'
         if self._extension_connection is not None and self._extension_registration is not None:
             return self._extension_connection, 'extension-client'
@@ -485,7 +511,7 @@ class BridgeServer:
 
             self._pending_file_upload_requests[request_id] = future
             try:
-                await connection.send(self._build_binary_envelope(metadata, file_bytes))
+                await connection.send(build_binary_envelope(metadata, file_bytes))
             except Exception:
                 self._pending_file_upload_requests.pop(request_id, None)
                 raise
@@ -500,23 +526,56 @@ class BridgeServer:
 
     async def _handle_connection(self, websocket: ServerConnection) -> None:
         debug_log('python-bridge', 'Incoming websocket connection received.')
+        registered = False
         try:
-            async for raw_message in websocket:
+            while True:
+                raw_message = await asyncio.wait_for(
+                    websocket.recv(),
+                    timeout=None if registered else REGISTER_TIMEOUT_SECONDS,
+                )
                 debug_log('python-bridge', 'Received websocket payload.', raw_message if isinstance(raw_message, str) else f'<binary:{len(raw_message)} bytes>')
                 if isinstance(raw_message, bytes):
+                    if not registered:
+                        await websocket.close(code=1002, reason='Register before sending binary data.')
+                        return
                     self._handle_binary_payload(raw_message)
                     continue
 
-                payload = json.loads(raw_message)
+                try:
+                    payload = json.loads(raw_message)
+                except (TypeError, json.JSONDecodeError):
+                    if not registered:
+                        await websocket.close(code=1002, reason='First frame must be valid client.register JSON.')
+                        return
+                    debug_log('python-bridge', 'Ignoring malformed JSON frame from registered client.')
+                    continue
+                if not isinstance(payload, dict):
+                    if not registered:
+                        await websocket.close(code=1002, reason='First frame must be a client.register object.')
+                        return
+                    debug_log('python-bridge', 'Ignoring non-object JSON frame from registered client.')
+                    continue
                 message_type = payload.get('type')
 
                 if message_type == 'client.register':
+                    if registered:
+                        await websocket.close(code=1002, reason='Client is already registered.')
+                        return
                     await self._register_client(websocket, payload)
+                    registered = True
                     continue
 
                 if message_type == 'screen-share.stream-register':
+                    if registered:
+                        await websocket.close(code=1002, reason='Client is already registered.')
+                        return
                     await self._register_stream_connection(websocket, payload)
+                    registered = True
                     continue
+
+                if not registered:
+                    await websocket.close(code=1002, reason='First frame must register the client.')
+                    return
 
                 if message_type == 'capture.result':
                     self._resolve_pending_request(payload)
@@ -543,11 +602,11 @@ class BridgeServer:
                     continue
 
                 if message_type == 'popup.status':
-                    self._emit('popup_status', self._coerce_popup_status(payload.get('status', {}), action='status'))
+                    self._emit('popup_status', coerce_popup_status(payload.get('status', {}), action='status'))
                     continue
 
                 if message_type == 'popup.message':
-                    self._emit('popup_message', self._coerce_popup_message(payload))
+                    self._emit('popup_message', coerce_popup_message(payload))
                     continue
 
                 if message_type == 'screen-share.result':
@@ -599,7 +658,7 @@ class BridgeServer:
                     continue
 
                 if message_type == 'screen-share.status':
-                    self._emit('screen_share_status', self._coerce_screen_share_status(payload.get('status', {})))
+                    self._emit('screen_share_status', coerce_screen_share_status(payload.get('status', {})))
                     continue
 
                 if message_type == 'file-transfer.result':
@@ -609,8 +668,17 @@ class BridgeServer:
                 if message_type == 'file-transfer.error':
                     self._reject_pending_file_upload_request(payload)
                     continue
+        except asyncio.TimeoutError:
+            debug_log('python-bridge', 'Client registration timed out.')
+            await websocket.close(code=1002, reason='Client registration timed out.')
         except ConnectionClosed:
             debug_log('python-bridge', 'Websocket connection closed by peer.')
+        except Exception as error:  # noqa: BLE001 - isolate a bad peer from the server
+            debug_log(
+                'python-bridge',
+                'Websocket connection handler failed; closing only this peer.',
+                {'error': str(error), 'traceback': traceback.format_exc()},
+            )
         finally:
             await self._handle_disconnect(websocket)
 
@@ -624,9 +692,16 @@ class BridgeServer:
             role=str(payload.get('role', 'extension-client')),
         )
 
+        if registration.role == ROLE_SCREEN_SHARE_STREAM or 'screen-share.stream' in capabilities:
+            async with self._lock:
+                self._stream_connections.add(websocket)
+            await websocket.send(json.dumps({'type': 'register.ack', 'role': ROLE_SCREEN_SHARE_STREAM}))
+            debug_log('python-bridge', 'Screen share stream client registered.', payload)
+            return
+
         is_native_input_client = (
             'os-input' in capabilities
-            or registration.role in ('native-input-client', 'native-client', 'desktop-agent')
+            or registration.role in ('native-input-client', 'native-client', 'native-file-client', 'desktop-agent')
         )
 
         replaced_connection = None
@@ -651,6 +726,8 @@ class BridgeServer:
         if replaced_connection is not None:
             await replaced_connection.close(code=1012, reason='A newer bridge connection replaced this session.')
 
+        await websocket.send(json.dumps({'type': 'register.ack', 'role': registration.role}))
+
         debug_log(
             'python-bridge',
             'Native-input client registered.' if is_native_input_client else 'Extension client registered.',
@@ -673,18 +750,21 @@ class BridgeServer:
                     'client_id': registration.client_id,
                     'name': registration.name,
                     'version': registration.version,
+                    'capabilities': list(capabilities),
                 },
             )
 
     async def _register_stream_connection(self, websocket: ServerConnection, payload: dict[str, Any]) -> None:
         async with self._lock:
             self._stream_connections.add(websocket)
+        await websocket.send(json.dumps({'type': 'register.ack', 'role': ROLE_SCREEN_SHARE_STREAM}))
         debug_log('python-bridge', 'Screen share stream client registered.', payload)
 
     async def _handle_disconnect(self, websocket: ServerConnection) -> None:
         removed_stream_connection = False
         extension_disconnected = False
         native_input_disconnected = False
+        screen_share_provider_disconnected = False
 
         async with self._lock:
             if websocket in self._stream_connections:
@@ -704,6 +784,7 @@ class BridgeServer:
             if websocket is self._screen_share_provider:
                 self._screen_share_provider = None
                 self._screen_share_provider_kind = 'none'
+                screen_share_provider_disconnected = True
 
         if extension_disconnected:
             disconnect_reason = 'The Chrome extension bridge disconnected.'
@@ -729,6 +810,12 @@ class BridgeServer:
             self._emit('native_input_disconnected', {'message': disconnect_reason})
 
         if removed_stream_connection:
+            self._emit(
+                'screen_share_stream_interrupted',
+                {'message': 'Screen share stream interrupted; waiting for the browser stream to reconnect.'},
+            )
+
+        if screen_share_provider_disconnected:
             self._emit('screen_share_stream_ended', {'message': 'Screen share stream disconnected.'})
 
     async def _clear_active_clients(self, message: str) -> None:
@@ -798,23 +885,12 @@ class BridgeServer:
                 future.set_exception(RuntimeError(message))
 
     def _handle_binary_payload(self, raw_message: bytes) -> None:
-        if len(raw_message) < 5:
+        decoded = parse_binary_envelope(raw_message)
+        if decoded is None:
             debug_log('python-bridge', 'Ignoring malformed binary payload.', {'length': len(raw_message)})
             return
-
-        metadata_length = int.from_bytes(raw_message[:4], byteorder='big', signed=False)
-        if metadata_length <= 0 or len(raw_message) < 4 + metadata_length:
-            debug_log('python-bridge', 'Ignoring binary payload with invalid metadata length.', {'length': len(raw_message), 'metadata_length': metadata_length})
-            return
-
-        try:
-            metadata = json.loads(raw_message[4 : 4 + metadata_length].decode('utf-8'))
-        except Exception as error:
-            debug_log('python-bridge', 'Ignoring binary payload with invalid JSON metadata.', str(error))
-            return
-
+        metadata, payload_bytes = decoded
         payload_type = metadata.get('type')
-        payload_bytes = raw_message[4 + metadata_length :]
 
         if payload_type == 'capture.result.binary':
             self._resolve_pending_binary_capture(metadata, payload_bytes)
@@ -985,7 +1061,7 @@ class BridgeServer:
         if future is None or future.done():
             return
 
-        result = self._coerce_popup_status(payload.get('status', {}), action=str(payload.get('action', 'updated')))
+        result = coerce_popup_status(payload.get('status', {}), action=str(payload.get('action', 'updated')))
         future.set_result(result)
         debug_log('python-bridge', 'Popup response resolved successfully.', {'request_id': request_id, **result})
 
@@ -1005,7 +1081,7 @@ class BridgeServer:
         if future is None or future.done():
             return
 
-        result = self._coerce_screen_share_status(payload.get('status', {}))
+        result = coerce_screen_share_status(payload.get('status', {}))
         future.set_result(result)
         debug_log('python-bridge', 'Screen share response resolved successfully.', {'request_id': request_id, **result})
         self._emit('screen_share_status', result)
@@ -1026,7 +1102,7 @@ class BridgeServer:
         if future is None or future.done():
             return
 
-        result = self._coerce_screen_share_status(payload.get('status', {}))
+        result = coerce_screen_share_status(payload.get('status', {}))
         future.set_result(result)
         debug_log('python-bridge', 'Screen share stop response resolved successfully.', {'request_id': request_id, **result})
         self._emit('screen_share_status', result)
@@ -1138,7 +1214,7 @@ class BridgeServer:
         if future is None or future.done():
             return
 
-        result = self._coerce_file_transfer_status(payload)
+        result = coerce_file_transfer_status(payload)
         future.set_result(result)
         debug_log('python-bridge', 'File upload response resolved successfully.', {'request_id': request_id, **result})
         self._emit('file_transfer_status', result)
@@ -1152,52 +1228,6 @@ class BridgeServer:
         message = str(payload.get('message', 'The native client reported an unknown file transfer error.'))
         future.set_exception(RuntimeError(message))
         debug_log('python-bridge', 'File upload response returned an error.', {'request_id': request_id, 'message': message})
-
-    def _coerce_popup_status(self, status: dict[str, Any], action: str) -> dict[str, Any]:
-        return {
-            'exists': bool(status.get('exists')),
-            'state': str(status.get('state', 'unknown')),
-            'tab_id': int(status['tabId']) if isinstance(status.get('tabId'), int) else None,
-            'page_url': status.get('pageUrl') if isinstance(status.get('pageUrl'), str) and status.get('pageUrl') else None,
-            'updated_at': str(status.get('updatedAt', '')),
-            'text_length': int(status.get('textLength', 0)),
-            'action': action,
-        }
-
-    def _coerce_popup_message(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return {
-            'text': str(payload.get('text', '')),
-            'page_url': payload.get('pageUrl') if isinstance(payload.get('pageUrl'), str) and payload.get('pageUrl') else None,
-            'tab_id': int(payload['tabId']) if isinstance(payload.get('tabId'), int) else None,
-            'sent_at': str(payload.get('sentAt', '')),
-        }
-
-    def _coerce_screen_share_status(self, status: dict[str, Any]) -> dict[str, Any]:
-        return {
-            'state': str(status.get('state', 'idle')),
-            'active': bool(status.get('active')),
-            'viewer_window_id': int(status['viewerWindowId']) if isinstance(status.get('viewerWindowId'), int) else None,
-            'source_label': status.get('sourceLabel') if isinstance(status.get('sourceLabel'), str) and status.get('sourceLabel') else None,
-            'updated_at': str(status.get('updatedAt', '')),
-            'message': str(status.get('message', 'Screen share is idle.')),
-        }
-
-    def _coerce_file_transfer_status(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return {
-            'file_name': str(payload.get('fileName', 'unknown')),
-            'saved_path': str(payload.get('savedPath', '')),
-            'byte_count': int(payload.get('byteCount', 0)),
-            'downloaded_at': str(payload.get('downloadedAt', '')),
-            'message': str(payload.get('message', 'File saved on the client.')),
-        }
-
-    def _build_binary_envelope(self, metadata: dict[str, Any], payload_bytes: bytes) -> bytes:
-        metadata_bytes = json.dumps(metadata).encode('utf-8')
-        envelope = bytearray(4 + len(metadata_bytes) + len(payload_bytes))
-        envelope[0:4] = len(metadata_bytes).to_bytes(4, byteorder='big', signed=False)
-        envelope[4 : 4 + len(metadata_bytes)] = metadata_bytes
-        envelope[4 + len(metadata_bytes) :] = payload_bytes
-        return bytes(envelope)
 
     def _emit(self, event_name: str, payload: dict[str, Any]) -> None:
         if self._event_callback is not None:

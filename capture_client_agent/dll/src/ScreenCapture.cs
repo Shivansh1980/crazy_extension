@@ -220,7 +220,7 @@ namespace PageSignal.NativeAgent
         private readonly object _lock = new object();
         private CancellationTokenSource _cts;
         private Task _task;
-        private ClientWebSocket _ws;
+        private Func<byte[], CancellationToken, Task> _sendBinary;
         private int _sequence;
 
         public bool Active
@@ -233,16 +233,17 @@ namespace PageSignal.NativeAgent
         public int Width { get; private set; }
         public int Height { get; private set; }
 
-        public void Start(ClientWebSocket ws)
+        public void Start(Func<byte[], CancellationToken, Task> sendBinary)
         {
             lock (_lock)
             {
                 if (_task != null && !_task.IsCompleted) return;
+                if (sendBinary == null) throw new ArgumentNullException("sendBinary");
                 int w, h;
                 ScreenCapture.GetPrimarySize(out w, out h);
                 Width = Math.Min(w, MAX_WIDTH);
                 Height = (int)Math.Round(h * (Width / (double)w));
-                _ws = ws;
+                _sendBinary = sendBinary;
                 _sequence = 0;
                 _cts = new CancellationTokenSource();
                 var token = _cts.Token;
@@ -254,7 +255,7 @@ namespace PageSignal.NativeAgent
         {
             CancellationTokenSource cts;
             Task task;
-            lock (_lock) { cts = _cts; task = _task; _cts = null; _task = null; _ws = null; }
+            lock (_lock) { cts = _cts; task = _task; _cts = null; _task = null; _sendBinary = null; }
             if (cts != null) try { cts.Cancel(); } catch { }
             if (task != null) try { task.Wait(2000); } catch { }
         }
@@ -285,9 +286,9 @@ namespace PageSignal.NativeAgent
 
         private async Task CaptureAndSendAsync(CancellationToken token)
         {
-            ClientWebSocket ws;
-            lock (_lock) { ws = _ws; }
-            if (ws == null || ws.State != WebSocketState.Open) return;
+            Func<byte[], CancellationToken, Task> sendBinary;
+            lock (_lock) { sendBinary = _sendBinary; }
+            if (sendBinary == null) return;
 
             int w, h;
             byte[] jpeg = ScreenCapture.CaptureFullScreenshotJpeg(JPEG_QUALITY, MAX_WIDTH, out w, out h);
@@ -309,8 +310,7 @@ namespace PageSignal.NativeAgent
                 { "sourceLabel", SOURCE_LABEL },
             };
             byte[] envelope = WireProtocol.BuildBinaryEnvelope(meta, jpeg);
-            await ws.SendAsync(new ArraySegment<byte>(envelope), WebSocketMessageType.Binary, true, token)
-                .ConfigureAwait(false);
+            await sendBinary(envelope, token).ConfigureAwait(false);
         }
     }
 }

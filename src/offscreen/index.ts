@@ -7,7 +7,9 @@ import { debugError, debugLog, debugWarn } from '../shared/debug';
 import { normalizeWebSocketUrl, resolveBridgeEndpoint, type ResolvedBridgeEndpoint } from '../shared/bridgeUrlResolver';
 import {
   BRIDGE_CLIENT_NAME,
+  BRIDGE_CONNECT_TIMEOUT_MS,
   BRIDGE_RECONNECT_INTERVAL_MS,
+  BRIDGE_RECONNECT_MAX_INTERVAL_MS,
   BRIDGE_RESOLVER_REFRESH_FAILURE_THRESHOLD,
   DEFAULT_WEBSOCKET_RESOLVER_URL,
   DEFAULT_WEBSOCKET_SECONDARY_RESOLVER_URL,
@@ -339,9 +341,7 @@ class ExtensionBridgeClient {
     debugLog('offscreen', 'Loaded bridge settings.', settings);
     const settingsChanged =
       this.currentSettings === null ||
-      this.currentSettings.websocketUrl !== settings.websocketUrl ||
-      this.currentSettings.websocketResolverUrl !== settings.websocketResolverUrl ||
-      this.currentSettings.enabled !== settings.enabled;
+      this.connectionSettingsKey(this.currentSettings) !== this.connectionSettingsKey(settings);
     const shouldReplaceExistingSocket = forceReconnect || settingsChanged;
 
     this.currentSettings = settings;
@@ -364,7 +364,25 @@ class ExtensionBridgeClient {
       return;
     }
 
-    await this.connect(settings, settingsChanged);
+    try {
+      await this.connect(settings, settingsChanged);
+    } catch (error) {
+      this.consecutiveConnectionFailures += 1;
+      if (this.resolvedEndpoint) {
+        this.recordFailedAttempt(this.resolvedEndpoint.source);
+      }
+      const messageText = error instanceof Error ? error.message : 'Bridge connection setup failed.';
+      const retryDelayMs = this.reconnectDelayMs();
+      await this.updateStatus({
+        state: 'disconnected',
+        updatedAt: new Date().toISOString(),
+        message: `Bridge connection setup failed: ${messageText}. Retrying in ${Math.ceil(retryDelayMs / 1_000)} seconds.`,
+        lastFileName: null,
+        targetUrl: this.resolvedTargetUrl ?? settings.websocketUrl
+      });
+      this.scheduleReconnect(retryDelayMs);
+      throw error;
+    }
   }
 
   private async connect(settings: ExtensionSettings, settingsChanged: boolean): Promise<void> {
@@ -393,8 +411,20 @@ class ExtensionBridgeClient {
     const socket = new WebSocket(normalizedEndpoint.targetUrl);
     socket.binaryType = 'arraybuffer';
     this.socket = socket;
+    const connectTimeoutHandle = window.setTimeout(() => {
+      if (generation === this.connectionGeneration && socket.readyState === WebSocket.CONNECTING) {
+        debugWarn('offscreen', 'WebSocket handshake timed out.', {
+          targetUrl: normalizedEndpoint.targetUrl,
+          timeoutMs: BRIDGE_CONNECT_TIMEOUT_MS
+        });
+        socket.close(4001, 'Bridge connection timed out');
+      }
+    }, BRIDGE_CONNECT_TIMEOUT_MS);
+
+    const clearConnectTimeout = () => window.clearTimeout(connectTimeoutHandle);
 
     socket.addEventListener('open', () => {
+      clearConnectTimeout();
       if (generation !== this.connectionGeneration) {
         socket.close();
         return;
@@ -408,15 +438,27 @@ class ExtensionBridgeClient {
       debugLog('offscreen', 'running...');
       debugLog('offscreen', 'WebSocket connection opened.', normalizedEndpoint.targetUrl);
 
-      this.send({
+      const registrationSent = this.send({
         type: 'client.register',
         clientId: this.clientId,
         name: BRIDGE_CLIENT_NAME,
         version: __EXTENSION_VERSION__,
         role: 'extension-client',
         sessionId: settings.sessionId || 'default',
-        capabilities: ['capture.full-page', 'screen-share.preview']
+        capabilities: [
+          'capture.full-page',
+          'clipboard.write',
+          'popup.browser',
+          'file-transfer.browser',
+          'screen-share.preview',
+          'screen-share.input',
+          'screen-share.paste'
+        ]
       });
+      if (!registrationSent) {
+        socket.close();
+        return;
+      }
       this.flushPendingBridgeMessages();
       void this.publishPopupStatus();
       void this.publishPopupMessageHistory();
@@ -448,6 +490,7 @@ class ExtensionBridgeClient {
     });
 
     socket.addEventListener('close', (event) => {
+      clearConnectTimeout();
       if (generation !== this.connectionGeneration) {
         return;
       }
@@ -474,14 +517,15 @@ class ExtensionBridgeClient {
 
       const retryHint = this.buildReconnectHint();
 
+      const retryDelayMs = this.reconnectDelayMs();
       void this.updateStatus({
         state: 'disconnected',
         updatedAt: new Date().toISOString(),
-        message: `Bridge connection closed. Retrying ${endpoint.targetUrl} in 5 seconds. Failure count: ${this.consecutiveConnectionFailures}.${retryHint}`,
+        message: `Bridge connection closed. Retrying in ${Math.ceil(retryDelayMs / 1_000)} seconds. Failure count: ${this.consecutiveConnectionFailures}.${retryHint}`,
         lastFileName: null,
         targetUrl: endpoint.targetUrl
       });
-      this.scheduleReconnect();
+      this.scheduleReconnect(retryDelayMs);
     });
   }
 
@@ -1340,27 +1384,37 @@ class ExtensionBridgeClient {
     }
   }
 
-  private send(message: BridgeOutboundMessage): void {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+  private send(message: BridgeOutboundMessage): boolean {
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
       debugWarn('offscreen', 'Skipping websocket send because socket is not open.', message.type);
-      return;
+      return false;
     }
 
-    debugLog('offscreen', 'Sending websocket message.', message.type);
-    this.socket.send(JSON.stringify(message));
+    try {
+      debugLog('offscreen', 'Sending websocket message.', message.type);
+      socket.send(JSON.stringify(message));
+      return true;
+    } catch (error) {
+      debugWarn('offscreen', 'Websocket send failed; preserving the message for reconnect.', {
+        type: message.type,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      try {
+        socket.close();
+      } catch {
+        // The close event or the existing reconnect timer owns recovery.
+      }
+      return false;
+    }
   }
 
   private sendOrQueueBridgeMessage(message: BridgeOutboundMessage): void {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-      debugLog('offscreen', 'Queueing bridge message until websocket is open.', message.type);
-      this.pendingBridgeMessages.push(message);
-      if (this.pendingBridgeMessages.length > 20) {
-        this.pendingBridgeMessages.splice(0, this.pendingBridgeMessages.length - 20);
-      }
+    if (this.send(message)) {
       return;
     }
 
-    this.send(message);
+    this.enqueuePendingBridgeMessage(message);
   }
 
   private sendOrQueueBinaryCaptureResult(requestId: string, capturedPage: CapturedPage): void {
@@ -1370,19 +1424,15 @@ class ExtensionBridgeClient {
       capturedPage,
     };
 
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-      debugLog('offscreen', 'Queueing binary capture result until websocket is open.', {
-        requestId,
-        fileName: capturedPage.fileName,
-      });
-      this.pendingBridgeMessages.push(queuedMessage);
-      if (this.pendingBridgeMessages.length > 20) {
-        this.pendingBridgeMessages.splice(0, this.pendingBridgeMessages.length - 20);
-      }
+    if (this.sendBinaryCaptureResult(requestId, capturedPage)) {
       return;
     }
 
-    this.sendBinaryCaptureResult(requestId, capturedPage);
+    debugLog('offscreen', 'Queueing binary capture result until websocket is open.', {
+      requestId,
+      fileName: capturedPage.fileName,
+    });
+    this.enqueuePendingBridgeMessage(queuedMessage);
   }
 
   private flushPendingBridgeMessages(): void {
@@ -1390,25 +1440,51 @@ class ExtensionBridgeClient {
       return;
     }
 
-    const queuedMessages = [...this.pendingBridgeMessages];
-    this.pendingBridgeMessages = [];
-    for (const message of queuedMessages) {
-      if (message.type === 'capture.result.binary') {
-        this.sendBinaryCaptureResult(message.requestId, message.capturedPage);
-        continue;
+    while (this.pendingBridgeMessages.length > 0) {
+      const message = this.pendingBridgeMessages[0];
+      if (!message) {
+        return;
       }
-
-      this.send(message);
+      const sent = message.type === 'capture.result.binary'
+        ? this.sendBinaryCaptureResult(message.requestId, message.capturedPage)
+        : this.send(message);
+      if (!sent) {
+        return;
+      }
+      this.pendingBridgeMessages.shift();
     }
   }
 
-  private sendBinaryCaptureResult(requestId: string, capturedPage: CapturedPage): void {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+  private enqueuePendingBridgeMessage(message: QueuedBridgeMessage): void {
+    if (message.type === 'popup.status' || message.type === 'screen-share.status') {
+      const existingIndex = this.pendingBridgeMessages.findIndex((candidate) => candidate.type === message.type);
+      if (existingIndex >= 0) {
+        this.pendingBridgeMessages.splice(existingIndex, 1);
+      }
+    }
+    this.pendingBridgeMessages.push(message);
+    if (this.pendingBridgeMessages.length > 20) {
+      const dropped = this.pendingBridgeMessages.shift();
+      debugWarn('offscreen', 'Bridge recovery queue reached its limit; dropping the oldest message.', dropped?.type);
+    }
+  }
+
+  private sendBinaryCaptureResult(requestId: string, capturedPage: CapturedPage): boolean {
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
       debugWarn('offscreen', 'Skipping binary capture send because socket is not open.', requestId);
-      return;
+      return false;
     }
 
-    const imageBytes = this.base64ToBytes(capturedPage.base64Data);
+    let imageBytes: Uint8Array;
+    try {
+      imageBytes = this.base64ToBytes(capturedPage.base64Data);
+    } catch (error) {
+      const messageText = error instanceof Error ? error.message : 'Captured image data could not be encoded.';
+      debugError('offscreen', 'Unable to encode binary capture result.', { requestId, error: messageText });
+      this.send({ type: 'capture.error', requestId, message: messageText });
+      return true;
+    }
     const metadataBytes = new TextEncoder().encode(
       JSON.stringify({
         type: 'capture.result.binary',
@@ -1435,11 +1511,26 @@ class ExtensionBridgeClient {
       bytes: imageBytes.length,
       metadataBytes: metadataBytes.length,
     });
-    this.socket.send(envelope.buffer);
+    try {
+      socket.send(envelope.buffer);
+      return true;
+    } catch (error) {
+      debugWarn('offscreen', 'Binary capture send failed; preserving it for reconnect.', {
+        requestId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      try {
+        socket.close();
+      } catch {
+        // Reconnect is driven by the close event or an existing retry timer.
+      }
+      return false;
+    }
   }
 
   private sendPopupFileUpload(metadata: PopupFileBinaryMessage, fileBytes: Uint8Array): void {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
       throw new Error('The desktop bridge is not connected. Reconnect the GUI bridge before sending files from the popup.');
     }
 
@@ -1456,7 +1547,16 @@ class ExtensionBridgeClient {
       pageUrl: metadata.pageUrl,
       tabId: metadata.tabId,
     });
-    this.socket.send(envelope.buffer);
+    try {
+      socket.send(envelope.buffer);
+    } catch (error) {
+      try {
+        socket.close();
+      } catch {
+        // Reconnect is driven by the close event.
+      }
+      throw new Error(`The desktop bridge disconnected while sending ${metadata.fileName}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   private base64ToBytes(base64Data: string): Uint8Array {
@@ -1583,16 +1683,34 @@ class ExtensionBridgeClient {
     }
   }
 
-  private scheduleReconnect(): void {
+  private scheduleReconnect(delayMs = this.reconnectDelayMs()): void {
     if (this.reconnectTimer !== null) {
       return;
     }
 
-    debugLog('offscreen', 'Scheduling reconnect.', BRIDGE_RECONNECT_INTERVAL_MS);
+    debugLog('offscreen', 'Scheduling reconnect.', delayMs);
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null;
-      void this.start(true);
-    }, BRIDGE_RECONNECT_INTERVAL_MS);
+      void this.start(true).catch((error) => {
+        debugWarn('offscreen', 'Scheduled bridge reconnect failed; another retry remains scheduled.', error);
+      });
+    }, delayMs);
+  }
+
+  private reconnectDelayMs(): number {
+    const exponent = Math.max(0, Math.min(6, this.consecutiveConnectionFailures - 1));
+    return Math.min(BRIDGE_RECONNECT_INTERVAL_MS * (2 ** exponent), BRIDGE_RECONNECT_MAX_INTERVAL_MS);
+  }
+
+  private connectionSettingsKey(settings: ExtensionSettings): string {
+    return JSON.stringify({
+      enabled: settings.enabled,
+      websocketUrl: settings.websocketUrl,
+      websocketResolverUrl: settings.websocketResolverUrl,
+      connectionMode: settings.connectionMode,
+      relayUrl: settings.relayUrl,
+      sessionId: settings.sessionId
+    });
   }
 
   private clearReconnectTimer(): void {
@@ -1739,10 +1857,7 @@ class ExtensionBridgeClient {
     }
 
     if (this.nextEndpointMode === 'relay') {
-      // Relay also failed: cycle back to pastebin (auto) or stick (relay-only).
-      if (settings?.connectionMode === 'relay') {
-        return; // stay in relay mode; relay client retries on its own.
-      }
+      // Relay also failed in auto mode; relay-only mode is handled above.
       this.nextEndpointMode = 'pastebin';
       this.localRetryAttempts = 0;
       return;
@@ -1946,6 +2061,17 @@ class ExtensionBridgeClient {
         }
       });
     }
+
+    window.addEventListener('online', () => {
+      if (!this.currentSettings?.enabled || this.socket?.readyState === WebSocket.OPEN) {
+        return;
+      }
+      debugLog('offscreen', 'Browser returned online; retrying the bridge immediately.');
+      this.clearReconnectTimer();
+      void this.start(true).catch((error) => {
+        debugWarn('offscreen', 'Immediate reconnect after browser online event failed.', error);
+      });
+    });
   }
 }
 

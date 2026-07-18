@@ -1,76 +1,102 @@
-# PageSignal Live Relay (`live_server.py`)
+# Page Signal live relay
 
-A single-file, hostable WebSocket relay that pairs the **Capture Control GUI** (Python Tk) with the **Chrome extension** (and optional native input/screen-capture client) when a direct localhost / ngrok / Pastebin tunnel is unavailable.
+`live_server.py` pairs one authenticated Control Center with extension, native,
+and browser-stream peers when localhost connectivity is not available.
 
-It is the "live" path of the system. The "direct" path (GUI listens locally on `127.0.0.1:8765`) keeps working unchanged.
-
-## Quick start (Docker)
+## Quick start with Docker
 
 ```sh
 cp .env.example .env
-# Generate a bcrypt hash and paste it into .env as RELAY_PASSWORD_HASH:
 docker run --rm -v "$PWD:/work" -w /work python:3.13-slim sh -c \
-  "pip install -q bcrypt && python live_server.py hash-password 'mypassword'"
+  "pip install -q bcrypt && python live_server.py hash-password 'change-me'"
 docker compose up -d
 docker compose logs -f relay
 ```
 
-The relay listens on `:8765` (override via `RELAY_HOST_PORT`).
+Place the generated hash in `.env` as `RELAY_PASSWORD_HASH` before starting
+the container.
 
-## Quick start (bare metal)
+## Bare-metal start
 
 ```sh
 python -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python live_server.py hash-password 'mypassword'   # copy into .env
+.venv/bin/python live_server.py hash-password 'change-me'
 .venv/bin/python live_server.py
 ```
+
+On Windows, use `.venv\Scripts\python.exe` instead.
 
 ## Configuration
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `RELAY_HOST` | `0.0.0.0` | Bind address |
-| `RELAY_PORT` | `8765` | TCP port |
-| `RELAY_USERNAME` | *(required)* | Operator username |
-| `RELAY_PASSWORD_HASH` | *(required)* | bcrypt hash of the password |
-| `SESSION_ID` | `default` | Logical session bucket (must match GUI + extension) |
-| `RELAY_ALLOW_PLAIN_WS` | `1` | Allow plaintext `ws://`. Set to `0` in production behind TLS. |
+| `RELAY_HOST` | `0.0.0.0` | Listen address |
+| `RELAY_PORT` | `8765` | Listen port |
+| `RELAY_USERNAME` | required | Control Center login name |
+| `RELAY_PASSWORD_HASH` | required | bcrypt password hash |
+| `SESSION_ID` | `default` | Session shared by all peers |
+| `RELAY_ALLOW_PLAIN_WS` | `true` | Permit plaintext WebSockets |
 
-## Endpoints
+Use TLS termination and `wss://` for remote deployments. Set
+`RELAY_ALLOW_PLAIN_WS=0` when plaintext transport must be rejected.
 
-| Path | Purpose |
-| --- | --- |
-| `/` (any path, WS upgrade) | WebSocket relay |
-| `/healthz`, `/_health`, `/ping` | HTTP `200 OK` for load-balancer probes |
+Health probes are available at `/healthz`, `/_health`, and `/ping`.
 
-## Wire protocol
+## Roles
 
-1. Server sends `server.hello` immediately on connect.
-2. Client must respond with `client.register` JSON within 15 s. The first frame must be ≤ 16 KiB.
-   - GUI: `{type, role:'control-gui', sessionId, username, password, ...}`
-   - Peer: `{type, role:'extension-client'|'native-input-client', sessionId, capabilities, ...}`
-3. Server replies with `register.ack` (or `register.error` + close).
-4. The GUI receives one `peer.connected` per already-connected peer. Joining peers receive `gui.connected` if a GUI is already paired (and vice-versa) so they can re-publish their state.
-5. All other frames (text + binary) are forwarded opaquely. JSON frames may carry an optional `_target` field (`extension-client`, `native-input-client`, or absent for broadcast).
+| Role | Authentication | Purpose |
+| --- | --- | --- |
+| `control-gui` | username, password, session ID | Control Center transport |
+| `extension-client` | session ID | Main extension connection |
+| `native-input-client` | session ID | Python/C# native agent |
+| `screen-share-stream` | session ID | Independent browser frame stream |
 
-## Production hardening
+Only one peer per role is active in a session. A newer connection replaces the
+older connection of the same role. The stream role is distinct, so reconnecting
+browser frames never changes extension presence in the GUI. Legacy native role
+names are normalized to `native-input-client` for compatibility.
 
-- Run behind Caddy / Nginx with TLS (`wss://`). Set `RELAY_ALLOW_PLAIN_WS=0`.
-- Mount the container with a read-only filesystem and `--cap-drop=ALL` (compose can be extended).
-- Rotate the password by re-generating the hash and restarting.
-- Failed-auth IPs are throttled (5 failures / 15 min).
-- Each frame is bounded to 64 MiB (websockets `max_size`).
+## Protocol
 
-## Testing locally with the GUI and extension
+1. The relay sends `server.hello`.
+2. The client sends `client.register` within 15 seconds and 16 KiB.
+3. The relay replies with `register.ack` or `register.error` and closes.
+4. The GUI receives `peer.connected` snapshots; peers receive `gui.connected`
+   so they can republish current popup/screen state.
+5. Business text and binary frames are routed without modification.
 
-1. Start the relay (steps above). Note the printed listen address.
-2. In the workspace `.env` (the one read by `capture_control_center/app.py`):
-   ```
-   MODE=relay
-   RELAY_URL=ws://127.0.0.1:8765
-   RELAY_USERNAME=<same as relay>
-   SESSION_ID=default
-   ```
-3. Launch the GUI: `python -m capture_control_center.app` and authenticate in the modal dialog.
-4. In the Chrome extension's Options page, set Connection mode = **Relay**, Relay URL = `ws://127.0.0.1:8765`, Session id = `default`, then click **Apply & reconnect**.
+GUI messages may include `_target` in JSON or binary-envelope metadata. The
+relay applies the same role filter to both forms, preventing a targeted file
+upload from being broadcast to every peer.
+
+## Reliability and security
+
+- WebSocket messages are capped at 64 MiB.
+- Registration and authentication have finite timeouts.
+- Failed GUI logins are limited per source host, not ephemeral source port.
+- Five failures within 15 minutes pause further attempts for that host.
+- Passwords are checked with bcrypt and removed from forwarded registration
+  snapshots.
+- A malformed business frame is isolated to that forwarding attempt.
+- Peer responses are not persisted while the GUI is disconnected. The GUI
+  fails in-flight work promptly and reconnects; side-effecting commands are not
+  replayed automatically.
+
+## Local integration test
+
+Configure the workspace `.env`:
+
+```env
+MODE=relay
+RELAY_URL=ws://127.0.0.1:8765
+RELAY_USERNAME=operator
+SESSION_ID=default
+```
+
+Set the extension Options page to the same relay URL and session ID. Start the
+relay, launch `start_gui.bat`, enter the password, and then load/start the
+extension or native agent.
+
+The automated relay authentication, role, routing, credential-correction, and
+transport-loss flows run as part of `verify.bat`.

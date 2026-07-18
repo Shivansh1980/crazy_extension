@@ -7,7 +7,9 @@
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "dev": "node build.mjs --watch",
     "gui": ".venv\\Scripts\\python.exe -m capture_control_center.app",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": ".venv\\Scripts\\python.exe -m unittest discover -s tests -v",
+    "verify": "verify.bat"
   },
   "keywords": [
     "chrome-extension",
@@ -21,7 +23,7 @@
   "devDependencies": {
     "@types/chrome": "^0.1.40",
     "@types/node": "^25.6.0",
-    "esbuild": "^0.28.0",
+    "esbuild": "^0.28.1",
     "typescript": "^6.0.3"
   }
 }

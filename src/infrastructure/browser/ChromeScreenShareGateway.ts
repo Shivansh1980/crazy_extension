@@ -36,6 +36,9 @@ export class ChromeScreenShareGateway {
       focused: true,
       state: 'maximized',
     });
+    if (!createdWindow) {
+      throw new ExtensionError('Chrome did not return a screen share popup window.');
+    }
 
     this.viewerWindowId = typeof createdWindow.id === 'number' ? createdWindow.id : null;
     this.latestStatus = {

@@ -30,7 +30,7 @@ export class ChromeOffscreenBridgeRuntime implements BridgeRuntime {
     // bridge-start is idempotent: offscreen will only open a new socket if the existing one
     // is closed. Crucially, this does NOT force-replace a healthy socket, so callers like the
     // popup file send can safely call this without dropping any in-flight binary frames.
-    await chrome.runtime.sendMessage({ type: 'bridge-start' }).catch(() => undefined);
+    await this.sendBridgeMessage('bridge-start');
   }
 
   async reconnect(): Promise<void> {
@@ -39,8 +39,7 @@ export class ChromeOffscreenBridgeRuntime implements BridgeRuntime {
       throw new ExtensionError('This browser does not support extension runtime messaging required for bridge reconnect.');
     }
 
-    await chrome.runtime.sendMessage({ type: 'bridge-start' }).catch(() => undefined);
-    await chrome.runtime.sendMessage({ type: 'bridge-reconnect' }).catch(() => undefined);
+    await this.sendBridgeMessage('bridge-reconnect');
   }
 
   private async createDocument(): Promise<void> {
@@ -50,6 +49,9 @@ export class ChromeOffscreenBridgeRuntime implements BridgeRuntime {
     }
 
     try {
+      if (typeof chrome.offscreen.hasDocument === 'function' && await chrome.offscreen.hasDocument()) {
+        return;
+      }
       await chrome.offscreen.createDocument({
         url: OFFSCREEN_DOCUMENT_PATH,
         reasons: [chrome.offscreen.Reason.BLOBS, chrome.offscreen.Reason.CLIPBOARD],
@@ -57,9 +59,37 @@ export class ChromeOffscreenBridgeRuntime implements BridgeRuntime {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : '';
-      if (!message.includes('Only a single offscreen document may be created')) {
+      const normalizedMessage = message.toLowerCase();
+      if (!normalizedMessage.includes('single offscreen') && !normalizedMessage.includes('already exists')) {
         throw new ExtensionError(message || 'Unable to create the offscreen bridge document.');
       }
     }
+  }
+
+  private async sendBridgeMessage(type: 'bridge-start' | 'bridge-reconnect'): Promise<void> {
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      try {
+        const response = await chrome.runtime.sendMessage({ type });
+        if (!response?.ok) {
+          throw new ExtensionError(response?.message ?? `The offscreen document rejected ${type}.`);
+        }
+        return;
+      } catch (error) {
+        lastError = error;
+        const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+        const listenerIsStarting = message.includes('receiving end does not exist') || message.includes('message port closed');
+        if (!listenerIsStarting || attempt === 5) {
+          break;
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, attempt * 100));
+      }
+    }
+
+    if (lastError instanceof ExtensionError) {
+      throw lastError;
+    }
+    const message = lastError instanceof Error ? lastError.message : String(lastError ?? '');
+    throw new ExtensionError(message || `Unable to deliver ${type} to the offscreen bridge.`);
   }
 }

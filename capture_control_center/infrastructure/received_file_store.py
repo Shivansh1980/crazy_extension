@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from capture_control_center.domain.models import ReceivedClientFile
+from capture_control_center.infrastructure.file_names import build_unique_path, sanitize_file_name
 
 
 class ReceivedFileStore:
@@ -33,7 +34,7 @@ class ReceivedFileStore:
         safe_name = self._sanitize_file_name(file_name)
 
         with self._lock:
-            file_path = self._build_unique_path(safe_name)
+            file_path = build_unique_path(self._files_directory, safe_name)
             file_path.write_bytes(file_bytes)
             record = ReceivedClientFile(
                 file_name=file_name,
@@ -86,24 +87,8 @@ class ReceivedFileStore:
         temp_path.write_text(json.dumps(self._records, indent=2), encoding='utf-8')
         temp_path.replace(self._index_path)
 
-    def _build_unique_path(self, safe_name: str) -> Path:
-        candidate = self._files_directory / safe_name
-        if not candidate.exists():
-            return candidate
-
-        stem = candidate.stem or 'client-file'
-        suffix = candidate.suffix
-        counter = 2
-        while True:
-            next_candidate = self._files_directory / f'{stem}-{counter}{suffix}'
-            if not next_candidate.exists():
-                return next_candidate
-            counter += 1
-
     def _sanitize_file_name(self, file_name: str) -> str:
-        cleaned = ''.join(character if character.isalnum() or character in {'-', '_', '.', ' '} else '-' for character in file_name).strip()
-        cleaned = cleaned.lstrip('.')
-        return cleaned or 'client-upload.bin'
+        return sanitize_file_name(file_name, 'client-upload.bin')
 
     def _serialize_record(self, record: ReceivedClientFile) -> dict[str, Any]:
         return {
@@ -121,9 +106,15 @@ class ReceivedFileStore:
         if not isinstance(file_path, str) or not file_path:
             return None
 
+        resolved_path = Path(file_path).resolve(strict=False)
+        try:
+            resolved_path.relative_to(self._files_directory.resolve(strict=False))
+        except ValueError:
+            return None
+
         return ReceivedClientFile(
             file_name=str(payload.get('file_name', Path(file_path).name)),
-            file_path=Path(file_path),
+            file_path=resolved_path,
             mime_type=str(payload.get('mime_type', 'application/octet-stream')),
             byte_count=int(payload.get('byte_count', 0)),
             page_url=payload.get('page_url') if isinstance(payload.get('page_url'), str) and payload.get('page_url') else None,

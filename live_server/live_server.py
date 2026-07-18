@@ -98,7 +98,13 @@ def _plain_text_response(status_code: int, reason: str, body: bytes, upgrade: bo
 ROLE_CONTROL_GUI = 'control-gui'
 ROLE_EXTENSION_CLIENT = 'extension-client'
 ROLE_NATIVE_INPUT_CLIENT = 'native-input-client'
-PEER_ROLES: tuple[str, ...] = (ROLE_EXTENSION_CLIENT, ROLE_NATIVE_INPUT_CLIENT)
+ROLE_SCREEN_SHARE_STREAM = 'screen-share-stream'
+PEER_ROLES: tuple[str, ...] = (
+    ROLE_EXTENSION_CLIENT,
+    ROLE_NATIVE_INPUT_CLIENT,
+    ROLE_SCREEN_SHARE_STREAM,
+)
+LEGACY_NATIVE_ROLES = {'native-client', 'native-file-client', 'desktop-agent'}
 
 # Server-controlled fields of a register payload. We strip these before
 # forwarding the registration to the paired GUI so secrets never leak across.
@@ -342,11 +348,20 @@ class MessageRouter:
     @staticmethod
     def _extract_target_role(raw: str | bytes) -> str | None:
         if isinstance(raw, (bytes, bytearray)):
-            return None
-        try:
-            payload = json.loads(raw)
-        except (TypeError, ValueError):
-            return None
+            if len(raw) < 5:
+                return None
+            metadata_length = int.from_bytes(raw[:4], byteorder='big', signed=False)
+            if metadata_length <= 0 or metadata_length > 1024 * 1024 or len(raw) < 4 + metadata_length:
+                return None
+            try:
+                payload = json.loads(raw[4 : 4 + metadata_length].decode('utf-8'))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return None
+        else:
+            try:
+                payload = json.loads(raw)
+            except (TypeError, ValueError):
+                return None
         if not isinstance(payload, dict):
             return None
         target = payload.get('_target')
@@ -399,6 +414,7 @@ class ConnectionHandler:
 
     async def handle(self, websocket: ServerConnection) -> None:
         peer_address = self._peer_address(websocket)
+        rate_limit_key = self._peer_host(websocket)
         LOGGER.info('Inbound connection from %s', peer_address)
 
         await self._send_hello(websocket, gui_paired=False)
@@ -418,16 +434,16 @@ class ConnectionHandler:
                 return
 
             if role == ROLE_CONTROL_GUI:
-                if self._rate_limiter.is_blocked(peer_address):
+                if self._rate_limiter.is_blocked(rate_limit_key):
                     await self._send_register_error(websocket, 'Too many failed attempts. Try again later.')
                     return
                 username = str(register_payload.get('username') or '')
                 password = str(register_payload.get('password') or '')
                 if not self._auth.verify(username, password):
-                    self._rate_limiter.record_failure(peer_address)
+                    self._rate_limiter.record_failure(rate_limit_key)
                     await self._send_register_error(websocket, 'Invalid credentials.')
                     return
-                self._rate_limiter.reset(peer_address)
+                self._rate_limiter.reset(rate_limit_key)
                 peer = Peer(role=ROLE_CONTROL_GUI, websocket=websocket, registration=self._sanitize_register(register_payload))
                 session = await self._registry.get_or_create(session_id)
                 previous = await self._registry.attach_gui(session, peer)
@@ -451,10 +467,14 @@ class ConnectionHandler:
                         {'type': 'gui.connected', 'sessionId': session_id, 'message': 'Control GUI paired.'},
                     )
                 LOGGER.info('GUI authenticated and paired (session=%s).', session_id)
-            elif role in PEER_ROLES or not role:
+            elif role in PEER_ROLES or role in LEGACY_NATIVE_ROLES or not role:
                 # Default unknown roles to extension-client to stay forwards-compatible
                 # with future client revisions.
-                effective_role = role if role in PEER_ROLES else ROLE_EXTENSION_CLIENT
+                effective_role = (
+                    ROLE_NATIVE_INPUT_CLIENT
+                    if role in LEGACY_NATIVE_ROLES
+                    else role if role in PEER_ROLES else ROLE_EXTENSION_CLIENT
+                )
                 peer = Peer(role=effective_role, websocket=websocket, registration=self._sanitize_register(register_payload))
                 session = await self._registry.get_or_create(session_id)
                 previous = await self._registry.attach_peer(session, peer)
@@ -578,6 +598,14 @@ class ConnectionHandler:
         try:
             host, port, *_ = websocket.remote_address  # type: ignore[misc]
             return f'{host}:{port}'
+        except Exception:  # noqa: BLE001
+            return 'unknown'
+
+    @staticmethod
+    def _peer_host(websocket: ServerConnection) -> str:
+        try:
+            host, *_ = websocket.remote_address  # type: ignore[misc]
+            return str(host)
         except Exception:  # noqa: BLE001
             return 'unknown'
 

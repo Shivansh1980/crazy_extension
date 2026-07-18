@@ -1490,8 +1490,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'screen-share-stream-endpoint-get') {
     void (async () => {
       try {
-        const runStatus = await runStatusRepository.get();
-        sendResponse({ ok: true, targetUrl: runStatus.targetUrl });
+        const [runStatus, settings] = await Promise.all([
+          runStatusRepository.get(),
+          settingsRepository.get()
+        ]);
+        const fallbackTarget = settings.connectionMode === 'relay' && settings.relayUrl
+          ? settings.relayUrl
+          : settings.websocketUrl;
+        sendResponse({
+          ok: true,
+          targetUrl: runStatus.targetUrl ?? fallbackTarget,
+          sessionId: settings.sessionId
+        });
       } catch (error) {
         const messageText = error instanceof Error ? error.message : 'Screen share stream endpoint lookup failed.';
         debugError('background', 'Screen share stream endpoint lookup failed.', messageText);
@@ -1518,7 +1528,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           return !BLOCKED_PROTOCOL_PREFIXES.some((prefix) => tab.url!.startsWith(prefix));
         });
 
-        let targetTab = usable;
+        let targetTab: { id?: number; title?: string; url?: string } | undefined = usable;
         if (!targetTab) {
           const fallback = await activeTabGateway.getActiveCapturableTab();
           if (fallback?.id) {
@@ -1534,9 +1544,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           throw new Error('This Chrome build does not expose chrome.tabCapture. Update Chrome to use the silent capture flow.');
         }
 
+        const targetTabId = targetTab.id;
         const streamId: string = await new Promise((resolve, reject) => {
           chrome.tabCapture.getMediaStreamId(
-            { consumerTabId, targetTabId: targetTab!.id! },
+            { consumerTabId, targetTabId },
             (id?: string) => {
               const runtimeError = chrome.runtime.lastError;
               if (runtimeError) {
@@ -1553,12 +1564,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
 
         // Remember the captured tab so click/keyboard input is routed there.
-        latestScreenShareOverlayTabId = targetTab.id;
+        latestScreenShareOverlayTabId = targetTabId;
 
         sendResponse({
           ok: true,
           streamId,
-          targetTabId: targetTab.id,
+          targetTabId,
           sourceLabel: targetTab.title || targetTab.url || 'Browser tab'
         });
       } catch (error) {

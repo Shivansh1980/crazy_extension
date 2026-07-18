@@ -1,9 +1,18 @@
 var __getOwnPropNames = Object.getOwnPropertyNames;
-var __esm = (fn, res) => function __init() {
-  return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+var __esm = (fn, res, err) => function __init() {
+  if (err) throw err[0];
+  try {
+    return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+  } catch (e) {
+    throw err = [e], e;
+  }
 };
 var __commonJS = (cb, mod) => function __require() {
-  return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
+  try {
+    return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
+  } catch (e) {
+    throw mod = 0, e;
+  }
 };
 
 // src/shared/constants.ts
@@ -106,7 +115,7 @@ function normalizeOptionalWebSocketUrl(value) {
   return toWebSocketUrl(value, "");
 }
 function normalizeResolverUrl(value) {
-  const trimmed = value.trim();
+  const trimmed = typeof value === "string" ? value.trim() : "";
   if (!trimmed) {
     return "";
   }
@@ -139,7 +148,7 @@ function extractPastebinId(pathname) {
   return pathSegments[0] ?? null;
 }
 function toWebSocketUrl(value, fallback) {
-  const trimmed = value.trim();
+  const trimmed = typeof value === "string" ? value.trim() : "";
   if (!trimmed) {
     return fallback;
   }
@@ -202,12 +211,15 @@ var init_ChromeSettingsRepository = __esm({
         return nextValue;
       }
       normalize(settings) {
+        const fileNamePrefix = typeof settings.fileNamePrefix === "string" ? settings.fileNamePrefix.trim() : "";
+        const requestTimeout = Number(settings.requestTimeoutMs);
+        const resolverUrl = typeof settings.websocketResolverUrl === "string" && settings.websocketResolverUrl.trim() ? settings.websocketResolverUrl : DEFAULT_WEBSOCKET_RESOLVER_URL;
         return {
-          enabled: Boolean(settings.enabled),
+          enabled: typeof settings.enabled === "boolean" ? settings.enabled : DEFAULT_SETTINGS.enabled,
           websocketUrl: normalizeWebSocketUrl(settings.websocketUrl),
-          websocketResolverUrl: normalizeResolverUrl(DEFAULT_WEBSOCKET_RESOLVER_URL),
-          fileNamePrefix: settings.fileNamePrefix.trim() || DEFAULT_SETTINGS.fileNamePrefix,
-          requestTimeoutMs: Math.max(1e3, Math.round(settings.requestTimeoutMs || DEFAULT_SETTINGS.requestTimeoutMs)),
+          websocketResolverUrl: normalizeResolverUrl(resolverUrl),
+          fileNamePrefix: fileNamePrefix || DEFAULT_SETTINGS.fileNamePrefix,
+          requestTimeoutMs: Number.isFinite(requestTimeout) ? Math.min(12e4, Math.max(1e3, Math.round(requestTimeout))) : DEFAULT_SETTINGS.requestTimeoutMs,
           connectionMode: normalizeConnectionMode(settings.connectionMode),
           relayUrl: normalizeRelayUrl(settings.relayUrl),
           sessionId: normalizeSessionId(settings.sessionId)
@@ -222,7 +234,6 @@ var require_options = __commonJS({
   "src/options/index.ts"() {
     init_ChromeRunStatusRepository();
     init_ChromeSettingsRepository();
-    init_constants();
     var settingsRepository = new ChromeSettingsRepository();
     var runStatusRepository = new ChromeRunStatusRepository();
     var form = document.querySelector("#settings-form");
@@ -252,7 +263,7 @@ var require_options = __commonJS({
       }
       enabledInput.checked = settings.enabled;
       websocketUrlInput.value = settings.websocketUrl;
-      websocketResolverUrlInput.value = DEFAULT_WEBSOCKET_RESOLVER_URL;
+      websocketResolverUrlInput.value = settings.websocketResolverUrl;
       fileNamePrefixInput.value = settings.fileNamePrefix;
       requestTimeoutInput.value = String(settings.requestTimeoutMs);
       if (connectionModeInput) connectionModeInput.value = settings.connectionMode;
@@ -277,7 +288,7 @@ var require_options = __commonJS({
       return {
         enabled: enabledInput.checked,
         websocketUrl: websocketUrlInput.value,
-        websocketResolverUrl: DEFAULT_WEBSOCKET_RESOLVER_URL,
+        websocketResolverUrl: websocketResolverUrlInput?.value ?? "",
         fileNamePrefix: fileNamePrefixInput.value,
         requestTimeoutMs: Number(requestTimeoutInput.value),
         connectionMode: connectionModeInput?.value ?? "auto",
@@ -293,8 +304,13 @@ var require_options = __commonJS({
       try {
         const settings = await settingsRepository.save(patch);
         renderSettings(settings);
-        await chrome.runtime.sendMessage({ type: "reconnect-bridge" });
+        const response = await chrome.runtime.sendMessage({ type: "reconnect-bridge" });
+        if (!response?.ok) {
+          throw new Error(response?.message ?? "The extension could not restart the bridge.");
+        }
         renderStatus(await runStatusRepository.get());
+      } catch (error) {
+        renderTransientError(error);
       } finally {
         applyReconnectButton.disabled = false;
       }
@@ -305,8 +321,13 @@ var require_options = __commonJS({
       }
       reconnectButton.disabled = true;
       try {
-        await chrome.runtime.sendMessage({ type: "reconnect-bridge" });
+        const response = await chrome.runtime.sendMessage({ type: "reconnect-bridge" });
+        if (!response?.ok) {
+          throw new Error(response?.message ?? "The extension could not reconnect the bridge.");
+        }
         renderStatus(await runStatusRepository.get());
+      } catch (error) {
+        renderTransientError(error);
       } finally {
         reconnectButton.disabled = false;
       }
@@ -327,7 +348,16 @@ var require_options = __commonJS({
         void runStatusRepository.get().then(renderStatus);
       }
     });
-    void initialize();
+    function renderTransientError(error) {
+      if (statusState) {
+        statusState.dataset.state = "error";
+        statusState.textContent = "error";
+      }
+      if (statusMessage) {
+        statusMessage.textContent = error instanceof Error ? error.message : "The bridge operation failed.";
+      }
+    }
+    void initialize().catch(renderTransientError);
   }
 });
 export default require_options();

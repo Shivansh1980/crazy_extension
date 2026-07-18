@@ -1,20 +1,29 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 
-from capture_client_agent.client import BackgroundCaptureClient
+from capture_client_agent.client import BackgroundCaptureClient, CLIENT_VERSION
 from capture_client_agent.dpi_awareness import ensure_per_monitor_v2
 from capture_control_center.debug import debug_log
 
 
 def main() -> None:
+    if '--version' in sys.argv:
+        print(f'PageSignalNativeClient {CLIENT_VERSION}')
+        return
+
     # Mark this process as PerMonitorV2 DPI aware *before* importing/using any
     # screen-capture or input library, so coordinates and pixels match what the
     # user actually sees on HiDPI / scaled displays.
     ensure_per_monitor_v2()
 
-    project_directory = Path.cwd()
+    project_directory = (
+        Path(sys.executable).resolve().parent
+        if getattr(sys, 'frozen', False)
+        else Path.cwd()
+    )
     debug_log(
         'client-agent',
         'Starting native client agent.',

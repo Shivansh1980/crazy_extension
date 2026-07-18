@@ -1,290 +1,150 @@
-# PageSignal native agent — DLL build
+# C# native agent and process injector
 
-This folder contains a third packaging of the PageSignal native client (alongside
-the Python module and PyInstaller EXE that already live in
-[capture_client_agent](../)). It is a **managed C# DLL** plus a small host /
-injector EXE, so the agent can be **loaded into another running process** rather
-than only run as a standalone program.
+This directory contains the managed native agent, a graphical Windows process
+injector, architecture-specific injector hosts, and native CLR bootstraps.
 
-The C# implementation mirrors the Python client's behaviour:
+## Portable outputs
 
-| Capability | Source of truth (Python) | C# port |
-|---|---|---|
-| Bridge resolver chain (Pastebin → GitHub raw → local `server_url.txt` → localhost) | [client.py](../client.py) | [src/Resolver.cs](src/Resolver.cs) |
-| WebSocket connect + `client.register` + dispatch loop | [client.py](../client.py) | [src/Agent.cs](src/Agent.cs) |
-| Full‑screen PNG capture (`capture.request` → `capture.result.binary`) | [screen_capture.py](../screen_capture.py) | [src/ScreenCapture.cs](src/ScreenCapture.cs) |
-| 10 FPS JPEG screen-share streaming (`screen-share.start` / `.stop` / `.frame.binary`) | [screen_capture.py](../screen_capture.py) | [src/ScreenCapture.cs](src/ScreenCapture.cs) |
-| OS mouse + keyboard (`screen-share.input`, `screen-share.key`) | [input_dispatcher.py](../input_dispatcher.py) | [src/InputDispatcher.cs](src/InputDispatcher.cs) |
-| Native popup text/file exchange (`popup.*`, `file-transfer.*`) | [../native_popup.py](../native_popup.py) | [src/NativePopup.cs](src/NativePopup.cs) |
-| 4‑byte big‑endian length-prefixed binary envelopes | [client.py](../client.py) | [src/WireProtocol.cs](src/WireProtocol.cs) |
-
-> **Note** — the C# screen-share streamer sends full keyframes at 10 FPS instead
-> of the Python implementation's dirty-region partial frames. The wire format is
-> identical, so the bridge / GUI handle both transparently.
-
-The resolver cycle runs forever: Pastebin once, GitHub raw once, then the local
-bridge 5 times with a 5 s delay after each failed connection. After the fifth
-local failure it starts over at Pastebin.
-
-## Layout
-
-```
-dll/
-├── build.bat                       Compile script (uses Framework csc.exe — no VS needed)
-├── dist/                           Build output (both bitnesses)
-│   ├── PageSignalAgent.dll         Managed agent (AnyCPU — same DLL works in x64/x86 hosts)
-│   ├── PageSignalAgentHost.exe     x64 host / injector (primary on 64-bit Windows)
-│   └── PageSignalAgentHost.x86.exe x86 host / injector (used to reach 32-bit targets)
-└── src/
-    ├── Agent.cs                    Public entry: Agent.Start / StartBackground / Stop
-    ├── Resolver.cs                 Endpoint discovery
-    ├── WireProtocol.cs             Binary envelope + JSON helpers
-    ├── ScreenCapture.cs            PNG/JPEG capture + streaming task
-    ├── InputDispatcher.cs          SendInput-based mouse/keyboard
-    ├── NativePopup.cs              WinForms topmost popup for native text/file exchange
-    ├── Logger.cs                   Optional debug log (PAGESIGNAL_DEBUG=1)
-    ├── Injector.cs                 PageSignalAgentHost.exe entry point + injector
-    └── bootstrap.cpp               (optional) C++ CLR-bootstrap shim — see “True injection”
+```text
+dll\dist\PageSignalInjector.exe
+dll\dist\PageSignalAgent.dll
+dll\dist\PageSignalAgentHost.exe
+dll\dist\PageSignalAgentHost.x86.exe
+dll\dist\PageSignalBootstrap.x64.dll
+dll\dist\PageSignalBootstrap.x86.dll
 ```
 
-## Architecture support — x86 and x64
+Keep all six files together when copying the injector to another PC.
+`PageSignalInjector.exe` is AnyCPU: it runs as x86 on 32-bit Windows and x64 on
+64-bit Windows. It detects each selected process and automatically launches the
+matching host with the matching bootstrap DLL.
 
-The build produces **both** bitnesses out of the box:
+The portable package targets Windows 10/11 x86 or x64 with .NET Framework 4.x.
+ARM64-native, protected, anti-cheat, DRM, secure-desktop, and system-protected
+processes are not supported.
 
-| Artifact | Bitness | Used for |
-|---|---|---|
-| `PageSignalAgentHost.exe`      | x64 (Amd64) | Running the agent + injecting into x64 targets |
-| `PageSignalAgentHost.x86.exe`  | x86         | Injecting into 32-bit targets (legacy apps, games, some browsers' helpers) |
-| `PageSignalAgent.dll`          | AnyCPU (MSIL) | Same managed DLL is loaded by either bitness |
+## Graphical injector
 
-Windows requires the injecting process to **match the bitness of the target**
-(`CreateRemoteThread` cannot cross the WoW64 boundary). The host handles this
-for you:
+From the repository root:
 
-- The injector inspects the target with `IsWow64Process`.
-- On a mismatch it **automatically re-launches the sibling host** (`x86` ↔ `x64`)
-  next to it and forwards `inject <pid> <dll>`. The child's exit code is returned
-  verbatim.
-- If the sibling EXE isn't present, you get exit code `12` and a hint to copy /
-  rebuild the missing variant.
+```bat
+start_injector.bat
+```
 
-Keep both EXEs side-by-side in `dist\`; that's all that's needed for transparent
-dual-arch operation.
+Or open `dll\dist\PageSignalInjector.exe` directly. The window provides:
 
-## Robustness notes
+- a searchable list of running processes;
+- process name, PID, architecture, window title, session, start time, and path;
+- automatic refresh every five seconds;
+- x86/x64 host and bootstrap selection;
+- one-click injection;
+- an administrator retry when Windows denies access;
+- clear errors for unsupported or exited processes.
 
-- **PerMonitorV2 DPI awareness**: both host EXEs ship with an embedded
-  [`app.manifest`](src/app.manifest) declaring `PerMonitorV2,PerMonitor`, and
-  `Agent.StartBackground` additionally calls `SetProcessDpiAwarenessContext`
-  as a belt-and-braces fallback (matters when the managed DLL is **injected**
-  into a third-party EXE whose own manifest takes precedence). Result:
-  screen-capture pixel dimensions and pointer coordinates match the user's
-  *physical* display on HiDPI / scaled monitors instead of getting silently
-  virtualised by the system DPI scaler.
-- **`SeDebugPrivilege`** is enabled at host startup (best-effort). When you run
-  the host from an **elevated** prompt this lets the injector reach elevated and
-  cross-session targets that would otherwise refuse `OpenProcess`.
-- **Distinct exit codes** on failure: `4` DLL not found, `5` `OpenProcess`,
-  `6` `LoadLibraryW` resolve, `7` `VirtualAllocEx`, `8` `WriteProcessMemory`,
-  `9` `CreateRemoteThread`, `10` remote `LoadLibraryW` returned NULL,
-  `11` one or more PIDs failed during `--all`, `12` arch mismatch with no
-  sibling host available.
-- **Resource hygiene**: every Win32 handle and remote allocation is released in
-  a `try/finally`, including when the remote thread call fails.
-- **`--wait[=seconds]`** polls until the named process appears (default 60s),
-  useful for hooking apps right after launch.
-- **`--all`** loops over every running match and reports a non-zero exit if any
-  individual injection failed.
+Select a trusted process and choose **Inject PageSignal**. A successful load
+starts `PageSignal.NativeAgent.Agent` inside that process; the agent then
+registers with the Control Center as `native-input-client` and follows the same
+reconnect plan as the standalone native client.
 
-## Robust screen capture
-
-The C# `BitBlt` path (in [src/ScreenCapture.cs](src/ScreenCapture.cs)) is now
-invoked with the `SRCCOPY | CAPTUREBLT` flag combination so **layered /
-transparent windows** (notification toasts, tooltips, some IME popups) are
-included in the capture instead of being silently dropped by GDI+.
-
-A cheap pixel-grid sample (`LooksAllBlack`) checks every captured frame; when
-GDI is defeated by hardware-accelerated content (videos, games,
-GPU-rasterized Chrome) it logs a clear warning so operators know to switch to
-the Python agent (which has the DXGI Desktop Duplication fallback via
-`dxcam` — see [../README.md](../README.md#robust-screen-capture-no-more-black-frames-on-videos--games)).
-
-Things the C# host **cannot** capture in any user-mode code path — these are
-deliberate Windows protections, not bugs:
-`SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` windows, DRM-protected
-video (Widevine/PlayReady), the UAC secure desktop, and other-session
-windows. Only a kernel driver bypasses these.
+Run only one native implementation per session. The Python EXE, normal C# host,
+and injected DLL are alternative owners of the same native role.
 
 ## Build
 
-Open any cmd / PowerShell prompt and run:
-
-```powershell
-cd capture_client_agent\dll
-.\build.bat
-```
-
-Requirements (already present on a typical Windows 10/11 dev box):
-
-- `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe` (.NET Framework 4.x, x64)
-- `C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe`   (.NET Framework 4.x, x86)
-- `System.Web.Extensions.dll` (ships with the framework — used for JSON)
-
-Both `csc.exe` variants ship in-box on Windows; the build script will warn and
-skip the x86 host if Framework (32-bit) isn't present, but you'll lose the
-ability to inject into 32-bit processes.
-
-No Visual Studio, no .NET SDK, no NuGet packages.
-
-## Code signing (optional, free, self-signed)
-
-Fresh installs may trigger SmartScreen / AV "unknown publisher" warnings the
-first time `PageSignalAgentHost.exe` runs. Eliminate them on managed machines
-with a **self-signed code-signing cert** — no Windows SDK, no `signtool`, no
-paid certificate authority required:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File capture_client_agent\sign.ps1
-```
-
-What the script does (idempotent — safe to re-run):
-
-1. Creates (or reuses) a SHA-256 RSA-2048 cert `CN=PageSignal Self-Signed` in
-   `Cert:\CurrentUser\My`, valid 5 years.
-2. Signs every built artifact in `dll/dist/` and `exe/dist/` with
-   `Set-AuthenticodeSignature -HashAlgorithm SHA256 -IncludeChain All` plus a
-   public RFC-3161 timestamp from DigiCert (so signatures stay valid after the
-   cert expires).
-3. Enrols the cert into `CurrentUser\TrustedPublisher` and `CurrentUser\Root`
-   so Windows trusts the chain. The Root install pops a one-time Windows
-   security dialog — click **Yes** to make `Get-AuthenticodeSignature` report
-   `Status = Valid`. If you click No the binaries are still signed and
-   timestamped (`Status = UnknownError`); re-run and accept later to fix.
-
-Deploy the same cert to other machines without re-running the script:
-
-```powershell
-Export-Certificate -Cert (Get-Item Cert:\CurrentUser\My\<thumbprint>) -FilePath PageSignal-SelfSigned.cer
-# then on each target machine:
-Import-Certificate -FilePath PageSignal-SelfSigned.cer -CertStoreLocation Cert:\CurrentUser\TrustedPublisher
-Import-Certificate -FilePath PageSignal-SelfSigned.cer -CertStoreLocation Cert:\CurrentUser\Root
-```
-
-> Self-signed certs work **only on machines that trust them**. They are perfect
-> for internal / kiosk / dev fleets but do **not** replace an EV / OV cert for
-> anonymous public distribution.
-
-## Use cases
-
-### 1. Run as a normal foreground agent
-
-Drop-in replacement for the Python module / PyInstaller EXE:
-
-```powershell
-.\dist\PageSignalAgentHost.exe          # or "run"
-```
-
-Press Ctrl+C to stop. Set `$env:PAGESIGNAL_DEBUG = "1"` first to enable
-diagnostic logging at `%TEMP%\PageSignalNativeAgent.log`.
-
-### 2. Inject the agent into another process
-
-You can target by **PID** or by **process name** (with or without `.exe`):
-
-```powershell
-# By PID
-.\dist\PageSignalAgentHost.exe inject 12345
-
-# By name — picks the most recently started match
-.\dist\PageSignalAgentHost.exe inject notepad.exe
-.\dist\PageSignalAgentHost.exe inject notepad
-
-# Inject into every running instance with that name
-.\dist\PageSignalAgentHost.exe inject chrome --all
-
-# Wait up to 30s for the process to appear, then inject
-.\dist\PageSignalAgentHost.exe inject MyGame.exe --wait=30
-
-# List running processes (optionally filter by name substring)
-.\dist\PageSignalAgentHost.exe list
-.\dist\PageSignalAgentHost.exe list chrome
-```
-
-The optional second positional argument is the **DLL to inject** (defaults to
-`PageSignalBootstrap.dll` next to the host EXE):
-
-```powershell
-.\dist\PageSignalAgentHost.exe inject notepad.exe .\dist\PageSignalBootstrap.dll
-```
-
-The injector performs the standard `OpenProcess` →
-`VirtualAllocEx` → `WriteProcessMemory` → `CreateRemoteThread(LoadLibraryW)`
-sequence, enables `SeDebugPrivilege` on startup, and verifies that host/target
-architectures match before touching the remote process. On a mismatch it tries
-to re-launch its sibling-bitness host (`PageSignalAgentHost.exe` ↔
-`PageSignalAgentHost.x86.exe`) automatically; you only need to keep both files
-in the same folder. The third positional argument tells it *which* DLL to load:
-
-- **Native target process (notepad, explorer, a game, anything)** — the target
-  has no CLR, so loading `PageSignalAgent.dll` directly does nothing useful.
-  Pass the **CLR-bootstrap shim** instead (see next section).
-- **Managed (.NET Framework) target process** — the CLR is already up and
-  `LoadLibrary` of the managed DLL will trigger `_CorDllMain`. After loading,
-  start the agent by re-injecting a tiny call into
-  `PageSignal.NativeAgent.Agent.StartBackground` (use any managed-injector
-  technique, e.g. an extra remote thread that calls into your own initializer).
-
-The host requires the **same or higher privileges than the target process**
-(use an elevated prompt for elevated/service targets). Architecture matching is
-handled automatically as long as both `PageSignalAgentHost.exe` (x64) and
-`PageSignalAgentHost.x86.exe` (x86) live in the same folder — which is what
-`build.bat` produces by default.
-
-### 3. True injection into arbitrary native processes
-
-Genuine cross-process injection of a managed DLL into a *native* host needs a
-small C++ shim that:
-
-1. Boots the .NET Framework 4.x CLR via `mscoree` (`CLRCreateInstance` →
-   `ICLRMetaHost::GetRuntime("v4.0.30319")` → `ICLRRuntimeHost::Start`).
-2. Calls `ExecuteInDefaultAppDomain` on `PageSignal.NativeAgent.Agent.StartBackground`.
-
-The complete source for that shim is provided as
-[`src/bootstrap.cpp`](src/bootstrap.cpp). It is **not compiled by `build.bat`**
-because no MSVC compiler was available on the build machine. Compile it from a
-"x64 Native Tools Command Prompt for VS 2022" with:
-
 ```bat
-cl /LD /EHsc /O2 src\bootstrap.cpp /Fe:dist\PageSignalBootstrap.dll mscoree.lib
+capture_client_agent\dll\build.bat
 ```
 
-Then inject the shim — it will pull `PageSignalAgent.dll` from the same folder:
+The build uses the .NET Framework compilers included with Windows for the
+managed DLL, AnyCPU UI, and x64/x86 hosts. When Visual Studio C++ build tools are
+available, it rebuilds both CLR bootstrap DLLs. Otherwise it validates and uses
+the reviewed prebuilt bootstrap files already in `dist`.
 
-```powershell
-.\dist\PageSignalAgentHost.exe inject <PID> .\dist\PageSignalBootstrap.dll
-```
+The build finishes by running the graphical injector's non-interactive
+`--self-test`, which verifies the complete architecture-specific package.
 
-## Public API (callable from any .NET host)
+## Runtime behavior
+
+The native agent:
+
+1. Searches upward for `.env` and applies process-environment overrides.
+2. Builds a direct/relay/auto endpoint plan.
+3. Opens a bounded WebSocket handshake and registers its capabilities.
+4. Handles capture, screen stream, OS input, popup, and file messages.
+5. Serializes every WebSocket send through one semaphore.
+6. Stops stream tasks and unbinds popup callbacks when a socket closes.
+7. Repeats the endpoint plan until `Agent.Stop()` or process termination.
+
+The public managed entry points are:
 
 ```csharp
-using PageSignal.NativeAgent;
-
-Agent.StartBackground();   // spawns a worker thread, returns immediately
-// ... do other work ...
-Agent.Stop();
+PageSignal.NativeAgent.Agent.StartBackground();
+PageSignal.NativeAgent.Agent.Start();
+PageSignal.NativeAgent.Agent.Stop();
 ```
 
-Architecture must match the target process. With both prebuilt hosts present in
-`dist\`, the injector relays automatically. If you embed the agent in a
-third-party EXE, build it for the bitness that matches the host you intend to
-run in (`/platform:x64`, `/platform:x86`, or leave the default `anycpu` for
-libraries that are loaded into either).
+`StartBackgroundFromBootstrap(string)` is the signature-compatible adapter used
+by `ICLRRuntimeHost.ExecuteInDefaultAppDomain`; normal callers should use the
+three methods above.
 
-## Limitations vs. the Python client
+## How injection starts the managed agent
 
-- Screen-share streaming sends full keyframes only (no partial dirty-region
-  frames). Bandwidth is higher; protocol is unchanged.
-- Multi-monitor capture grabs the primary display only (the Python client does
-  the same).
-- File reception is intentionally not implemented (the Chrome extension owns it,
-  same as the Python agent).
+The selected architecture-specific host performs a `LoadLibraryW` injection
+using only the required process rights. The matching native bootstrap then:
+
+1. starts or attaches to .NET Framework CLR v4 inside the target;
+2. loads `PageSignalAgent.dll` from the portable injector directory;
+3. invokes `StartBackgroundFromBootstrap` outside the loader lock;
+4. returns while the managed agent reconnects in its background thread.
+
+Loading `PageSignalAgent.dll` directly with `LoadLibraryW` is not supported;
+the native bootstrap is required for arbitrary native target processes.
+
+## CLI compatibility
+
+The existing command line remains available for automation:
+
+```bat
+PageSignalAgentHost.exe ui
+PageSignalAgentHost.exe list chrome
+PageSignalAgentHost.exe inject 12345
+PageSignalAgentHost.exe inject notepad.exe --wait=30
+PageSignalAgentHost.exe inject chrome --all
+PageSignalAgentHost.exe run
+```
+
+When no DLL path is supplied, the host chooses
+`PageSignalBootstrap.x64.dll` or `PageSignalBootstrap.x86.dll` from the target
+architecture. An architecture mismatch delegates to the sibling host.
+
+## Security boundary
+
+Injection uses `OpenProcess`, `VirtualAllocEx`, `WriteProcessMemory`, and
+`CreateRemoteThread`. Antivirus products may classify an unsigned injector as
+potentially unwanted software. Do not bypass endpoint protection. Sign and
+allow-list reviewed artifacts through the normal organizational process, or use
+the non-injection `run` mode.
+
+Only inject software you own or are explicitly authorized to test. The tool
+does not attempt to bypass protected-process, anti-cheat, DRM, or secure-desktop
+controls.
+
+## Verification
+
+`verify.bat` compiles every managed/native artifact, runs the injector package
+self-test, executes the x64 host help smoke, and validates x86 artifacts
+statically. Executing the x86 injector remains opt-in because endpoint
+protection may block unsigned injection tooling:
+
+```bat
+verify.bat --x86-runtime
+```
+
+Use that option only on an approved disposable test machine.
+
+## Capture limits
+
+The C# path uses GDI capture with layered-window support. Hardware-only or
+protected content can still produce black frames. Use the Python client for
+DXGI fallback. No user-mode implementation can bypass DRM, secure desktop,
+display-affinity protections, or another user's protected session.

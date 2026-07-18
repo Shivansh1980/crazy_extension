@@ -137,14 +137,18 @@ class ScreenCaptureService:
         return summary
 
     async def stop(self) -> None:
-        if not self.active:
+        task = self._task
+        if task is None:
             return
-        assert self._task is not None
         self._stop_event.set()
         try:
-            await asyncio.wait_for(self._task, timeout=2.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            self._task.cancel()
+            await asyncio.wait_for(task, timeout=2.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         finally:
             self._task = None
             self._websocket = None

@@ -81,23 +81,22 @@ def main() -> None:
     debug_log('python-app', 'Starting Capture Control Center.', {'mode': mode})
     working_directory = Path.cwd()
 
-    loop = asyncio.new_event_loop()
-    server_thread = threading.Thread(target=_run_loop, args=(loop,), daemon=True)
-    server_thread.start()
-    debug_log('python-app', 'Async event loop thread started.')
-
     image_store = ImageStore(working_directory)
     received_file_store = ReceivedFileStore(working_directory)
 
     if mode == 'relay':
-        bridge, bridge_url = _start_relay_mode(env, loop)
+        bridge, bridge_url = _create_relay_mode(env)
     else:
-        bridge, bridge_url = _start_direct_mode(env, loop)
+        bridge, bridge_url = _create_direct_mode(env)
 
     if bridge is None:
-        debug_log('python-app', 'Bridge initialisation cancelled. Shutting down.')
-        loop.call_soon_threadsafe(loop.stop)
+        debug_log('python-app', 'Bridge initialisation cancelled.')
         return
+
+    loop = asyncio.new_event_loop()
+    server_thread = threading.Thread(target=_run_loop, args=(loop,), daemon=True)
+    server_thread.start()
+    debug_log('python-app', 'Async event loop thread started.')
 
     controller = CaptureController(
         bridge_server=bridge,
@@ -106,29 +105,56 @@ def main() -> None:
         loop=loop,
     )
 
-    configure_tk_environment()
-    import tkinter as tk
-
-    root = tk.Tk()
-    window = CaptureControlWindow(
-        root=root,
-        controller=controller,
-        images_directory=image_store.images_directory,
-        client_uploads_directory=received_file_store.files_directory,
-        bridge_url=bridge_url,
-    )
-
-    def handle_close() -> None:
-        debug_log('python-app', 'Shutdown requested from GUI.')
-        controller.stop()
+    start_future = asyncio.run_coroutine_threadsafe(bridge.start(), loop)
+    try:
+        start_future.result(timeout=10)
+    except Exception:
+        start_future.cancel()
         loop.call_soon_threadsafe(loop.stop)
-        root.destroy()
+        server_thread.join(timeout=5)
+        if not server_thread.is_alive():
+            loop.close()
+        raise
 
-    root.protocol('WM_DELETE_WINDOW', handle_close)
-    root.mainloop()
+    root = None
+    shutdown_started = False
+    try:
+        configure_tk_environment()
+        import tkinter as tk
+
+        root = tk.Tk()
+        CaptureControlWindow(
+            root=root,
+            controller=controller,
+            images_directory=image_store.images_directory,
+            client_uploads_directory=received_file_store.files_directory,
+            bridge_url=bridge_url,
+        )
+
+        def handle_close() -> None:
+            nonlocal shutdown_started
+            if shutdown_started:
+                return
+            shutdown_started = True
+            debug_log('python-app', 'Shutdown requested from GUI.')
+            controller.stop()
+            loop.call_soon_threadsafe(loop.stop)
+            root.destroy()
+
+        root.protocol('WM_DELETE_WINDOW', handle_close)
+        root.mainloop()
+    finally:
+        if not shutdown_started:
+            controller.stop()
+            loop.call_soon_threadsafe(loop.stop)
+        server_thread.join(timeout=5)
+        if not server_thread.is_alive():
+            loop.close()
+        else:
+            debug_log('python-app', 'Async event loop thread did not stop before process exit.')
 
 
-def _start_direct_mode(env: dict[str, str], loop: asyncio.AbstractEventLoop):
+def _create_direct_mode(env: dict[str, str]):
     host = env.get('BRIDGE_HOST', '127.0.0.1')
     try:
         port = int(env.get('BRIDGE_PORT', '8765'))
@@ -136,11 +162,10 @@ def _start_direct_mode(env: dict[str, str], loop: asyncio.AbstractEventLoop):
         port = 8765
     debug_log('python-app', 'Direct mode bridge.', {'host': host, 'port': port})
     bridge_server = BridgeServer(host=host, port=port)
-    asyncio.run_coroutine_threadsafe(bridge_server.start(), loop).result(timeout=5)
     return bridge_server, f'ws://{host}:{port}'
 
 
-def _start_relay_mode(env: dict[str, str], loop: asyncio.AbstractEventLoop):
+def _create_relay_mode(env: dict[str, str]):
     relay_url = normalize_websocket_url(env.get('RELAY_URL', '').strip())
     session_id = env.get('SESSION_ID', '').strip() or 'default'
     default_username = env.get('RELAY_USERNAME', '').strip()
@@ -162,7 +187,6 @@ def _start_relay_mode(env: dict[str, str], loop: asyncio.AbstractEventLoop):
         relay_url=relay_url,
         credentials_provider=provide_credentials,
     )
-    asyncio.run_coroutine_threadsafe(bridge.start(), loop).result(timeout=5)
     return bridge, relay_url
 
 

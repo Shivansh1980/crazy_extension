@@ -6,16 +6,16 @@ export interface ResolvedBridgeEndpoint {
   resolverUrl: string | null;
 }
 
-export function normalizeWebSocketUrl(value: string, fallback = DEFAULT_WEBSOCKET_URL): string {
+export function normalizeWebSocketUrl(value: unknown, fallback = DEFAULT_WEBSOCKET_URL): string {
   return toWebSocketUrl(value, fallback);
 }
 
-export function normalizeOptionalWebSocketUrl(value: string): string {
+export function normalizeOptionalWebSocketUrl(value: unknown): string {
   return toWebSocketUrl(value, '');
 }
 
-export function normalizeResolverUrl(value: string): string {
-  const trimmed = value.trim();
+export function normalizeResolverUrl(value: unknown): string {
+  const trimmed = typeof value === 'string' ? value.trim() : '';
   if (!trimmed) {
     return '';
   }
@@ -137,8 +137,8 @@ function tryExtractFromJson(payload: string): string | null {
   }
 }
 
-function toWebSocketUrl(value: string, fallback: string): string {
-  const trimmed = value.trim();
+function toWebSocketUrl(value: unknown, fallback: string): string {
+  const trimmed = typeof value === 'string' ? value.trim() : '';
   if (!trimmed) {
     return fallback;
   }

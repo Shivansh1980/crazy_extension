@@ -2,7 +2,6 @@ import type { CaptureRunStatus } from '../domain/models/CaptureRunStatus';
 import type { ConnectionMode, ExtensionSettings } from '../domain/models/ExtensionSettings';
 import { ChromeRunStatusRepository } from '../infrastructure/storage/ChromeRunStatusRepository';
 import { ChromeSettingsRepository } from '../infrastructure/storage/ChromeSettingsRepository';
-import { DEFAULT_WEBSOCKET_RESOLVER_URL } from '../shared/constants';
 
 const settingsRepository = new ChromeSettingsRepository();
 const runStatusRepository = new ChromeRunStatusRepository();
@@ -38,7 +37,7 @@ function renderSettings(settings: ExtensionSettings): void {
 
   enabledInput.checked = settings.enabled;
   websocketUrlInput.value = settings.websocketUrl;
-  websocketResolverUrlInput.value = DEFAULT_WEBSOCKET_RESOLVER_URL;
+  websocketResolverUrlInput.value = settings.websocketResolverUrl;
   fileNamePrefixInput.value = settings.fileNamePrefix;
   requestTimeoutInput.value = String(settings.requestTimeoutMs);
   if (connectionModeInput) connectionModeInput.value = settings.connectionMode;
@@ -66,7 +65,7 @@ function readFormPatch(): Partial<ExtensionSettings> | null {
   return {
     enabled: enabledInput.checked,
     websocketUrl: websocketUrlInput.value,
-    websocketResolverUrl: DEFAULT_WEBSOCKET_RESOLVER_URL,
+    websocketResolverUrl: websocketResolverUrlInput?.value ?? '',
     fileNamePrefix: fileNamePrefixInput.value,
     requestTimeoutMs: Number(requestTimeoutInput.value),
     connectionMode: (connectionModeInput?.value ?? 'auto') as ConnectionMode,
@@ -86,8 +85,13 @@ async function applyAndReconnect(event?: SubmitEvent): Promise<void> {
     const settings = await settingsRepository.save(patch);
     renderSettings(settings);
     // Save + force a clean reconnect using the new settings.
-    await chrome.runtime.sendMessage({ type: 'reconnect-bridge' });
+    const response = await chrome.runtime.sendMessage({ type: 'reconnect-bridge' });
+    if (!response?.ok) {
+      throw new Error(response?.message ?? 'The extension could not restart the bridge.');
+    }
     renderStatus(await runStatusRepository.get());
+  } catch (error) {
+    renderTransientError(error);
   } finally {
     applyReconnectButton.disabled = false;
   }
@@ -101,8 +105,13 @@ async function reconnectBridge(): Promise<void> {
   reconnectButton.disabled = true;
 
   try {
-    await chrome.runtime.sendMessage({ type: 'reconnect-bridge' });
+    const response = await chrome.runtime.sendMessage({ type: 'reconnect-bridge' });
+    if (!response?.ok) {
+      throw new Error(response?.message ?? 'The extension could not reconnect the bridge.');
+    }
     renderStatus(await runStatusRepository.get());
+  } catch (error) {
+    renderTransientError(error);
   } finally {
     reconnectButton.disabled = false;
   }
@@ -130,4 +139,14 @@ chrome.storage?.onChanged?.addListener((changes, areaName) => {
   }
 });
 
-void initialize();
+function renderTransientError(error: unknown): void {
+  if (statusState) {
+    statusState.dataset.state = 'error';
+    statusState.textContent = 'error';
+  }
+  if (statusMessage) {
+    statusMessage.textContent = error instanceof Error ? error.message : 'The bridge operation failed.';
+  }
+}
+
+void initialize().catch(renderTransientError);

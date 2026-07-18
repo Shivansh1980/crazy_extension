@@ -16,6 +16,7 @@ type ScreenShareViewerReadyResponse = {
 type ScreenShareStreamEndpointResponse = {
   ok: boolean;
   targetUrl?: string | null;
+  sessionId?: string;
   message?: string;
 };
 
@@ -42,6 +43,10 @@ let frameSequence = 0;
 let frameEncodeInFlight = false;
 let streamSocket: WebSocket | null = null;
 let streamSocketReady: Promise<void> | null = null;
+let streamReconnectTimer: number | null = null;
+let streamReconnectAttempt = 0;
+let streamSocketGeneration = 0;
+let streamStopRequested = true;
 let currentSourceLabel = 'Browser tab';
 const streamCanvas = document.createElement('canvas');
 // 0 = unknown, 1 = WebP works, -1 = WebP unsupported (use JPEG).
@@ -49,6 +54,9 @@ let webpSupportProbe = 0;
 let lastFrameHash = 0;
 let lastFrameSentAtMs = 0;
 const FRAME_HEARTBEAT_MS = 5_000;
+const STREAM_SOCKET_CONNECT_TIMEOUT_MS = 12_000;
+const STREAM_RECONNECT_MAX_DELAY_MS = 15_000;
+const STREAM_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 
 async function initialize(): Promise<void> {
   if (!previewElement || !statusElement || !stopButton || !startButton) {
@@ -100,6 +108,8 @@ async function beginStartFlow(): Promise<void> {
   }
 
   isStarting = true;
+  streamStopRequested = false;
+  clearStreamReconnectTimer();
   syncControls();
   renderStatus('Requesting tab capture stream id from background...');
 
@@ -157,6 +167,9 @@ async function beginStartFlow(): Promise<void> {
     renderStatus('Streaming to the Python desktop app. Use the Stop Sharing button on the client page to end the session.');
   } catch (error) {
     const message = toShareErrorMessage(error);
+    streamStopRequested = true;
+    releaseCaptureResources();
+    closeStreamSocket();
     await chrome.runtime.sendMessage({
       type: 'screen-share-viewer-status',
       status: {
@@ -175,20 +188,10 @@ async function beginStartFlow(): Promise<void> {
 }
 
 function stopShare(message: string): void {
-  stopFramePump();
-  stopFrameReaderLoop();
+  streamStopRequested = true;
+  clearStreamReconnectTimer();
+  releaseCaptureResources();
   closeStreamSocket();
-
-  if (activeStream) {
-    for (const track of activeStream.getTracks()) {
-      track.stop();
-    }
-    activeStream = null;
-  }
-
-  if (previewElement) {
-    previewElement.srcObject = null;
-  }
 
   renderStatus(message);
   syncControls();
@@ -202,6 +205,22 @@ function stopShare(message: string): void {
       message,
     },
   }).catch(() => undefined);
+}
+
+function releaseCaptureResources(): void {
+  stopFramePump();
+  stopFrameReaderLoop();
+
+  if (activeStream) {
+    for (const track of activeStream.getTracks()) {
+      track.stop();
+    }
+    activeStream = null;
+  }
+
+  if (previewElement) {
+    previewElement.srcObject = null;
+  }
 }
 
 function renderStatus(message: string): void {
@@ -235,7 +254,7 @@ async function ensureStreamSocket(): Promise<void> {
       throw new Error(response?.message ?? 'No websocket target is available for screen share streaming.');
     }
 
-    await openStreamSocket(response.targetUrl);
+    await openStreamSocket(response.targetUrl, response.sessionId || 'default');
   })();
 
   try {
@@ -245,15 +264,27 @@ async function ensureStreamSocket(): Promise<void> {
   }
 }
 
-async function openStreamSocket(targetUrl: string): Promise<void> {
+async function openStreamSocket(targetUrl: string, sessionId: string): Promise<void> {
   const websocketTargetUrl = normalizeOptionalWebSocketUrl(targetUrl);
   if (!websocketTargetUrl) {
     throw new Error(`Invalid websocket target for screen share streaming: ${targetUrl}`);
   }
 
   await new Promise<void>((resolve, reject) => {
+    const generation = ++streamSocketGeneration;
     const socket = new WebSocket(websocketTargetUrl);
+    streamSocket = socket;
     let settled = false;
+    const timeoutHandle = window.setTimeout(() => {
+      finalizeFailure(new Error(`The screen share stream connection timed out after ${STREAM_SOCKET_CONNECT_TIMEOUT_MS / 1_000} seconds.`));
+      try {
+        socket.close(4001, 'Screen stream connection timed out');
+      } catch {
+        // The failure is already reported through the rejected promise.
+      }
+    }, STREAM_SOCKET_CONNECT_TIMEOUT_MS);
+
+    const clearConnectTimeout = () => window.clearTimeout(timeoutHandle);
 
     const finalizeFailure = (error: Error) => {
       if (settled) {
@@ -261,7 +292,15 @@ async function openStreamSocket(targetUrl: string): Promise<void> {
       }
 
       settled = true;
-      streamSocket = null;
+      clearConnectTimeout();
+      if (streamSocket === socket) {
+        streamSocket = null;
+      }
+      try {
+        socket.close();
+      } catch {
+        // The rejected promise is the authoritative failure signal.
+      }
       reject(error);
     };
 
@@ -270,17 +309,47 @@ async function openStreamSocket(targetUrl: string): Promise<void> {
         return;
       }
 
-      settled = true;
+      clearConnectTimeout();
+      if (generation !== streamSocketGeneration || streamStopRequested) {
+        settled = true;
+        socket.close(1000, 'Screen share no longer active');
+        reject(new Error('The screen share was stopped while the stream socket was connecting.'));
+        return;
+      }
+
       streamSocket = socket;
-      socket.send(
-        JSON.stringify({
-          type: 'screen-share.stream-register',
-          clientId: crypto.randomUUID(),
-          name: 'screen-share-viewer',
-          version: __EXTENSION_VERSION__,
-        })
-      );
+      try {
+        socket.send(
+          JSON.stringify({
+            type: 'client.register',
+            role: 'screen-share-stream',
+            clientId: crypto.randomUUID(),
+            name: 'screen-share-viewer',
+            version: __EXTENSION_VERSION__,
+            sessionId,
+            capabilities: ['screen-share.stream'],
+          })
+        );
+      } catch (error) {
+        finalizeFailure(error instanceof Error ? error : new Error('Unable to register the screen stream socket.'));
+        return;
+      }
+      settled = true;
       resolve();
+    });
+
+    socket.addEventListener('message', (event) => {
+      if (typeof event.data !== 'string') {
+        return;
+      }
+      try {
+        const payload = JSON.parse(event.data) as { type?: string };
+        if (payload.type === 'register.ack') {
+          streamReconnectAttempt = 0;
+        }
+      } catch {
+        // Stream sockets do not consume business messages.
+      }
     });
 
     socket.addEventListener('error', () => {
@@ -288,6 +357,7 @@ async function openStreamSocket(targetUrl: string): Promise<void> {
     });
 
     socket.addEventListener('close', () => {
+      clearConnectTimeout();
       if (!settled) {
         finalizeFailure(new Error('The screen share stream connection closed before it was ready.'));
         return;
@@ -295,12 +365,16 @@ async function openStreamSocket(targetUrl: string): Promise<void> {
 
       if (streamSocket === socket) {
         streamSocket = null;
+        if (generation === streamSocketGeneration && !streamStopRequested && activeStream) {
+          scheduleStreamReconnect('The screen stream connection was interrupted.');
+        }
       }
     });
   });
 }
 
 function closeStreamSocket(): void {
+  streamSocketGeneration += 1;
   if (!streamSocket) {
     return;
   }
@@ -311,6 +385,55 @@ function closeStreamSocket(): void {
     socket.close(1000, 'Screen share stopped');
   } catch {
     // Best-effort close only.
+  }
+}
+
+function scheduleStreamReconnect(reason: string): void {
+  if (streamReconnectTimer !== null || streamStopRequested || !activeStream) {
+    return;
+  }
+
+  const exponent = Math.min(5, streamReconnectAttempt);
+  const delayMs = Math.min(1_000 * (2 ** exponent), STREAM_RECONNECT_MAX_DELAY_MS);
+  streamReconnectAttempt += 1;
+  renderStatus(`${reason} Reconnecting in ${Math.ceil(delayMs / 1_000)} seconds...`);
+  void chrome.runtime.sendMessage({
+    type: 'screen-share-viewer-status',
+    status: {
+      state: 'active',
+      active: true,
+      sourceLabel: currentSourceLabel,
+      updatedAt: new Date().toISOString(),
+      message: `${reason} Reconnecting automatically.`,
+    },
+  }).catch(() => undefined);
+
+  streamReconnectTimer = window.setTimeout(() => {
+    streamReconnectTimer = null;
+    void ensureStreamSocket()
+      .then(() => {
+        renderStatus('Streaming to the Python desktop app.');
+        return chrome.runtime.sendMessage({
+          type: 'screen-share-viewer-status',
+          status: {
+            state: 'active',
+            active: true,
+            sourceLabel: currentSourceLabel,
+            updatedAt: new Date().toISOString(),
+            message: 'Screen stream reconnected automatically.',
+          },
+        });
+      })
+      .catch((error) => {
+        scheduleStreamReconnect(`Reconnect failed: ${toShareErrorMessage(error)}`);
+      });
+  }, delayMs);
+}
+
+function clearStreamReconnectTimer(): void {
+  if (streamReconnectTimer !== null) {
+    window.clearTimeout(streamReconnectTimer);
+    streamReconnectTimer = null;
   }
 }
 
@@ -334,7 +457,14 @@ function stopFramePump(): void {
 }
 
 async function pushNextFrame(): Promise<void> {
-  if (frameEncodeInFlight || !activeStream || !streamSocket || streamSocket.readyState !== WebSocket.OPEN) {
+  const socket = streamSocket;
+  if (frameEncodeInFlight || !activeStream || !socket || socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
+  // Keep latency bounded on slow links. The next frame is more useful than a
+  // growing backlog of stale frames; keyframes and heartbeats restore state.
+  if (socket.bufferedAmount > STREAM_MAX_BUFFERED_BYTES) {
     return;
   }
 
@@ -412,7 +542,20 @@ async function pushNextFrame(): Promise<void> {
     view.setUint32(0, metadataBytes.length);
     envelope.set(metadataBytes, 4);
     envelope.set(imageBytes, 4 + metadataBytes.length);
-    streamSocket.send(envelope.buffer);
+    if (streamSocket !== socket || socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    try {
+      socket.send(envelope.buffer);
+    } catch (error) {
+      try {
+        socket.close();
+      } catch {
+        // The reconnect scheduler below is the recovery path.
+      }
+      scheduleStreamReconnect(`Frame delivery failed: ${toShareErrorMessage(error)}`);
+      return;
+    }
     lastFrameHash = frameHash;
     lastFrameSentAtMs = nowMs;
   } finally {
@@ -522,10 +665,10 @@ function computeFrameHash(bytes: Uint8Array): number {
   hash = Math.imul(hash ^ length, 0x01000193);
   const stride = Math.max(1, Math.floor(length / 512));
   for (let i = 0; i < length; i += stride) {
-    hash = Math.imul(hash ^ bytes[i], 0x01000193);
+    hash = Math.imul(hash ^ (bytes[i] ?? 0), 0x01000193);
   }
   // Always fold in the tail so trailing changes are caught.
-  hash = Math.imul(hash ^ bytes[length - 1], 0x01000193);
+  hash = Math.imul(hash ^ (bytes[length - 1] ?? 0), 0x01000193);
   return hash >>> 0;
 }
 

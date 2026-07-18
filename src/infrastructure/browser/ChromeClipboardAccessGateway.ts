@@ -66,86 +66,36 @@ export class ChromeClipboardAccessGateway {
 
 function enableClipboardAccessInPage(): FrameClipboardAccessEnableResult {
   const stateKey = '__pageSignalClipboardAccessState';
+  const styleElementId = 'page-signal-clipboard-access-style';
+  const popupHostId = 'page-signal-capture-popup-host';
+  const legacyProtectedHandlerProps = [
+    'oncopy',
+    'oncut',
+    'onpaste',
+    'onbeforecopy',
+    'onbeforecut',
+    'onbeforepaste',
+    'onselectstart',
+    'oncontextmenu',
+    'ondragstart'
+  ];
   const win = window as Window & {
-    [stateKey]?: {
-      installed: boolean;
-      observerInstalled: boolean;
-      captureInterceptorsInstalled: boolean;
-      rootPropsProtected: boolean;
-      domReadyListenerInstalled: boolean;
-      styleElementId: string;
-      protectedEventTypes: string[];
-      protectedHandlerProps: string[];
-      popupHostId: string;
-    };
+    [stateKey]?: Record<string, unknown>;
   };
 
-  const state =
-    win[stateKey] ??
-    (win[stateKey] = {
-      installed: false,
-      observerInstalled: false,
-      captureInterceptorsInstalled: false,
-      rootPropsProtected: false,
-      domReadyListenerInstalled: false,
-      styleElementId: 'page-signal-clipboard-access-style',
-      popupHostId: 'page-signal-capture-popup-host',
-      protectedEventTypes: [
-        'copy',
-        'cut',
-        'paste',
-        'beforecopy',
-        'beforecut',
-        'beforepaste',
-        'selectstart',
-        'contextmenu'
-      ],
-      protectedHandlerProps: [
-        'oncopy',
-        'oncut',
-        'onpaste',
-        'onbeforecopy',
-        'onbeforecut',
-        'onbeforepaste',
-        'onselectstart',
-        'oncontextmenu',
-        'ondragstart'
-      ]
-    });
-
-  const alreadyInstalled = state.installed;
+  const existingState = win[stateKey];
+  const legacyStateDetected = Boolean(
+    existingState &&
+      existingState.installed === true &&
+      existingState.compatibilityMode !== 'passive'
+  );
+  const alreadyInstalled = Boolean(
+    existingState &&
+      existingState.installed === true &&
+      existingState.compatibilityMode === 'passive'
+  );
   const methodsApplied: string[] = [];
   const methodsFailed: string[] = [];
-  const protectedEventTypes = new Set(state.protectedEventTypes);
-  const protectedShortcutKeys = new Set(['a', 'c', 'v', 'x', 'insert']);
-
-  const isClipboardShortcutEvent = (event: Event): boolean => {
-    if (!(event instanceof KeyboardEvent)) {
-      return false;
-    }
-
-    const key = event.key.toLowerCase();
-    if ((event.ctrlKey || event.metaKey) && !event.altKey && protectedShortcutKeys.has(key)) {
-      return true;
-    }
-
-    return event.shiftKey && key === 'insert';
-  };
-
-  const isProtectedEvent = (event: Event): boolean => protectedEventTypes.has(event.type) || isClipboardShortcutEvent(event);
-
-  const isInsidePopup = (target: EventTarget | null): boolean => {
-    if (!(target instanceof Node)) {
-      return false;
-    }
-
-    const rootNode = target.getRootNode();
-    if (rootNode instanceof ShadowRoot && rootNode.host instanceof HTMLElement && rootNode.host.id === state.popupHostId) {
-      return true;
-    }
-
-    return target instanceof Element && Boolean(target.closest(`#${state.popupHostId}`));
-  };
 
   const applyMethod = (name: string, action: () => void): void => {
     try {
@@ -156,226 +106,70 @@ function enableClipboardAccessInPage(): FrameClipboardAccessEnableResult {
     }
   };
 
-  const protectRootHandlerProps = (): void => {
-    if (state.rootPropsProtected) {
-      return;
-    }
+  const removeLegacyStyleOverride = (): void => {
+    document.getElementById(styleElementId)?.remove();
+  };
 
-    const targets = [window, document, document.documentElement, document.body].filter(
-      (target): target is Window | Document | HTMLElement => target !== null && target !== undefined
-    );
+  const releaseLegacyRootHandlerProps = (): void => {
+    const targets: Array<Window | Document | HTMLElement> = [window, document];
+    if (document.documentElement) {
+      targets.push(document.documentElement);
+    }
+    if (document.body) {
+      targets.push(document.body);
+    }
 
     for (const target of targets) {
-      for (const prop of state.protectedHandlerProps) {
+      for (const prop of legacyProtectedHandlerProps) {
+        const descriptor = Object.getOwnPropertyDescriptor(target, prop);
+        if (!descriptor?.configurable || typeof descriptor.get !== 'function' || typeof descriptor.set !== 'function') {
+          continue;
+        }
+
+        let descriptorValue: unknown;
         try {
-          (target as Record<string, unknown>)[prop] = null;
+          descriptorValue = descriptor.get.call(target);
         } catch {
-          // Ignore assignment failures on host objects.
+          descriptorValue = undefined;
         }
 
-        try {
-          const descriptor = Object.getOwnPropertyDescriptor(target, prop);
-          if (descriptor?.configurable === false) {
-            continue;
-          }
-
-          Object.defineProperty(target, prop, {
-            configurable: true,
-            enumerable: descriptor?.enumerable ?? false,
-            get: () => null,
-            set: () => undefined,
-          });
-        } catch {
-          // Ignore descriptor protection failures.
+        if (descriptorValue === null) {
+          delete (target as unknown as Record<string, unknown>)[prop];
         }
       }
     }
-
-    state.rootPropsProtected = true;
   };
 
-  const ensureStyleOverride = (): void => {
-    const container = document.head ?? document.documentElement;
-    if (!container) {
-      throw new Error('No document container is available for stylesheet injection.');
-    }
-
-    let styleElement = document.getElementById(state.styleElementId) as HTMLStyleElement | null;
-    if (!styleElement) {
-      styleElement = document.createElement('style');
-      styleElement.id = state.styleElementId;
-      container.appendChild(styleElement);
-    }
-
-    styleElement.textContent = `
-      html, body, body * {
-        user-select: text !important;
-        -webkit-user-select: text !important;
-        -webkit-touch-callout: default !important;
-      }
-      input, textarea, [contenteditable], [role="textbox"] {
-        caret-color: auto !important;
-        -webkit-user-modify: read-write !important;
-      }
-      input[disabled], textarea[disabled] {
-        pointer-events: auto !important;
-        opacity: 1 !important;
-      }
-    `;
-  };
-
-  const cleanupElement = (element: Element): void => {
-    if (!(element instanceof HTMLElement)) {
+  const neutralizeLegacyState = (): void => {
+    if (!existingState) {
       return;
     }
 
-    for (const prop of state.protectedHandlerProps) {
-      if (element.hasAttribute(prop)) {
-        element.removeAttribute(prop);
-      }
-
-      try {
-        (element as Record<string, unknown>)[prop] = null;
-      } catch {
-        // Ignore host property assignment failures.
-      }
-    }
-
-    element.style.setProperty('user-select', 'text', 'important');
-    element.style.setProperty('-webkit-user-select', 'text', 'important');
-    element.style.setProperty('-webkit-touch-callout', 'default', 'important');
-
-    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
-      element.disabled = false;
-      element.readOnly = false;
-      element.removeAttribute('disabled');
-      element.removeAttribute('readonly');
-      return;
-    }
-
-    if (element.getAttribute('role') === 'textbox' || element.hasAttribute('contenteditable')) {
-      if (element.getAttribute('contenteditable') === 'false' || !element.isContentEditable) {
-        element.setAttribute('contenteditable', 'plaintext-only');
-      }
-    }
+    // Older builds read these arrays from the shared state object during DOM cleanup. Emptying
+    // them is a best-effort way to reduce further mutation damage until the page is refreshed.
+    existingState.protectedEventTypes = [];
+    existingState.protectedHandlerProps = [];
   };
 
-  const refreshDocumentNodes = (root: ParentNode | Element | Document = document): void => {
-    const selector = [
-      'input',
-      'textarea',
-      '[contenteditable]',
-      '[contenteditable="false"]',
-      '[role="textbox"]',
-      ...state.protectedHandlerProps.map((prop) => `[${prop}]`)
-    ].join(',');
+  if (legacyStateDetected) {
+    applyMethod('legacy-style-cleanup', removeLegacyStyleOverride);
+    applyMethod('legacy-root-handler-cleanup', releaseLegacyRootHandlerProps);
+    applyMethod('legacy-state-neutralized', neutralizeLegacyState);
+  }
 
-    const elements = new Set<Element>();
-    if (root instanceof Document) {
-      if (root.documentElement) {
-        elements.add(root.documentElement);
-      }
-      if (root.body) {
-        elements.add(root.body);
-      }
-    } else if (root instanceof Element) {
-      elements.add(root);
-    }
-
-    if ('querySelectorAll' in root) {
-      for (const element of root.querySelectorAll(selector)) {
-        elements.add(element);
-      }
-    }
-
-    for (const element of elements) {
-      cleanupElement(element);
-    }
+  win[stateKey] = {
+    installed: true,
+    compatibilityMode: 'passive',
+    styleElementId,
+    popupHostId,
+    updatedAt: new Date().toISOString()
   };
 
-  const ensureCaptureInterceptors = (): void => {
-    if (state.captureInterceptorsInstalled) {
-      return;
-    }
-
-    const intercept = (event: Event): void => {
-      if (!isProtectedEvent(event) || isInsidePopup(event.target)) {
-        return;
-      }
-
-      event.stopImmediatePropagation();
-      event.stopPropagation();
-    };
-
-    window.addEventListener('copy', intercept, true);
-    window.addEventListener('cut', intercept, true);
-    window.addEventListener('paste', intercept, true);
-    window.addEventListener('beforecopy', intercept, true);
-    window.addEventListener('beforecut', intercept, true);
-    window.addEventListener('beforepaste', intercept, true);
-    window.addEventListener('selectstart', intercept, true);
-    window.addEventListener('contextmenu', intercept, true);
-    window.addEventListener('keydown', intercept, true);
-    state.captureInterceptorsInstalled = true;
-  };
-
-  const ensureMutationObserver = (): void => {
-    if (state.observerInstalled || !document.documentElement) {
-      return;
-    }
-
-    const observer = new MutationObserver((mutations) => {
-      for (const mutation of mutations) {
-        if (mutation.type === 'attributes' && mutation.target instanceof Element) {
-          cleanupElement(mutation.target);
-        }
-
-        for (const node of mutation.addedNodes) {
-          if (node instanceof Element) {
-            refreshDocumentNodes(node);
-          }
-        }
-      }
-    });
-
-    observer.observe(document.documentElement, {
-      subtree: true,
-      childList: true,
-      attributes: true,
-      attributeFilter: [...state.protectedHandlerProps, 'disabled', 'readonly', 'style', 'contenteditable']
-    });
-
-    state.observerInstalled = true;
-  };
-
-  const ensureDomReadyRefresh = (): void => {
-    if (state.domReadyListenerInstalled) {
-      return;
-    }
-
-    document.addEventListener(
-      'DOMContentLoaded',
-      () => {
-        try {
-          refreshDocumentNodes(document);
-          protectRootHandlerProps();
-        } catch {
-          // Ignore late DOM refresh failures.
-        }
-      },
-      { capture: true, once: true }
-    );
-    state.domReadyListenerInstalled = true;
-  };
-
-  applyMethod('style-override', ensureStyleOverride);
-  applyMethod('root-handler-protection', protectRootHandlerProps);
-  applyMethod('dom-cleanup', () => refreshDocumentNodes(document));
-  applyMethod('capture-interceptors', ensureCaptureInterceptors);
-  applyMethod('mutation-observer', ensureMutationObserver);
-  applyMethod('dom-ready-refresh', ensureDomReadyRefresh);
-
-  state.installed = true;
+  // Intentionally do not add copy/paste/keydown listeners, override page handlers, edit
+  // contenteditable state, or mutate disabled/readOnly fields. The extension only needs the
+  // offscreen document for GUI-driven clipboard writes; page-level paste must remain owned by
+  // the site so rich paste flows such as ChatGPT images continue to work.
+  applyMethod('passive-page-compatibility', () => undefined);
 
   return {
     pageUrl: location.href,

@@ -28,8 +28,12 @@ if not exist "requirements.txt" (
   exit /b 1
 )
 
-REM --- Locate a Python interpreter to bootstrap the venv -------------------
+REM --- Reuse the repo venv, or locate Python to create it ------------------
 set "PYTHON_BOOTSTRAP="
+if exist ".venv\Scripts\python.exe" set "PYTHON_BOOTSTRAP=.venv\Scripts\python.exe"
+
+if defined PYTHON_BOOTSTRAP goto :python_found
+
 where py >nul 2>nul
 if not errorlevel 1 set "PYTHON_BOOTSTRAP=py -3"
 
@@ -43,6 +47,7 @@ if not defined PYTHON_BOOTSTRAP (
   exit /b 1
 )
 
+:python_found
 REM --- Verify the interpreter is actually >= 3.11 --------------------------
 %PYTHON_BOOTSTRAP% -c "import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)" >nul 2>nul
 if errorlevel 1 (
@@ -67,24 +72,18 @@ if not exist "%VENV_PYTHON%" (
   exit /b 1
 )
 
-REM --- Install / upgrade build dependencies --------------------------------
-echo Ensuring Python dependencies are installed...
-"%VENV_PYTHON%" -m pip install --upgrade pip setuptools wheel
-if errorlevel 1 (
-  echo Failed to upgrade pip / setuptools / wheel.
-  exit /b 1
-)
+REM --- Install runtime/build dependencies only when needed -----------------
+call "%CD%\start_gui.bat" --setup-only
+if errorlevel 1 exit /b 1
 
-"%VENV_PYTHON%" -m pip install -r requirements.txt
+"%VENV_PYTHON%" -c "import PyInstaller; v=tuple(int(x) for x in PyInstaller.__version__.split('.')[:2]); raise SystemExit(0 if v[0] == 6 and v[1] in range(6, 1000) else 1)" >nul 2>nul
 if errorlevel 1 (
-  echo Failed to install runtime dependencies from requirements.txt.
-  exit /b 1
-)
-
-"%VENV_PYTHON%" -m pip install "pyinstaller>=6.6,<7"
-if errorlevel 1 (
-  echo Failed to install PyInstaller.
-  exit /b 1
+  echo Installing PyInstaller...
+  "%VENV_PYTHON%" -m pip install --disable-pip-version-check "pyinstaller>=6.6,<7"
+  if errorlevel 1 (
+    echo Failed to install PyInstaller.
+    exit /b 1
+  )
 )
 
 REM --- Sanity-check that critical imports actually load --------------------
@@ -149,6 +148,13 @@ if not defined EXE_SIZE (
 )
 if %EXE_SIZE% LSS 1000000 (
   echo Produced executable is suspiciously small ^(%EXE_SIZE% bytes^). Build likely failed.
+  exit /b 1
+)
+
+echo Smoke-checking the generated executable...
+"capture_client_agent\exe\dist\PageSignalNativeClient.exe" --version
+if errorlevel 1 (
+  echo The generated executable failed its startup smoke check.
   exit /b 1
 )
 
